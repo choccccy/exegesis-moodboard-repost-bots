@@ -1,0 +1,16 @@
+# Secrets (generated from .env.tmpl via `op inject`)
+.env
+
+# Persistent data volume (db, attachments, logs)
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store

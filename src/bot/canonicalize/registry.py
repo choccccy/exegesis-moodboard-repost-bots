@@ -1,0 +1,163 @@
+"""Per-domain canonicalization rules + a default tracker-stripping fallback.
+
+Add a new domain by writing a handler that takes the parsed URL parts and returns
+a (canonical_url, domain_family) tuple, then registering it in ``_HANDLERS``.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+# Query params that never change *what* a resource is — safe to strip everywhere.
+TRACKING_PARAMS: frozenset[str] = frozenset(
+    {
+        "si", "fbclid", "gclid", "dclid", "yclid", "msclkid",
+        "igshid", "igsh", "ref_src", "ref_url", "ref", "source",
+        "mc_cid", "mc_eid", "spm", "scwid", "share_id",
+        "feature", "ab_channel",  # youtube share noise
+        "s", "t",  # twitter/x share params (YouTube handled specially)
+    }
+)
+# utm_* are always tracking.
+_UTM_RE = re.compile(r"^utm_", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class CanonResult:
+    canonical_url: str
+    domain_family: str
+
+
+def _strip_tracking(query: str, *, keep: frozenset[str] = frozenset()) -> str:
+    pairs = parse_qsl(query, keep_blank_values=True)
+    cleaned = [
+        (k, v)
+        for k, v in pairs
+        if k in keep or (not _UTM_RE.match(k) and k not in TRACKING_PARAMS)
+    ]
+    return urlencode(cleaned)
+
+
+def _host(netloc: str) -> str:
+    return netloc.split("@")[-1].split(":")[0].lower()
+
+
+def _family_from_host(host: str) -> str | None:
+    h = host[4:] if host.startswith("www.") else host
+    parts = h.split(".")
+    for fam, domains in _DOMAIN_FAMILIES.items():
+        if any(h == d or h.endswith("." + d) for d in domains):
+            return fam
+    # crude second-level guess for the unknown-domain default
+    return None
+
+
+# host substrings -> family
+_DOMAIN_FAMILIES: dict[str, list[str]] = {
+    "bluesky": ["bsky.app", "bsky.social"],
+    "reddit": ["reddit.com", "redd.it"],
+    "twitter": ["twitter.com", "x.com", "fxtwitter.com", "fixupx.com", "vxtwitter.com", "nitter.net"],
+    "artstation": ["artstation.com", "artstn.co"],
+    "deviantart": ["deviantart.com", "fav.me"],
+    "wikipedia": ["wikipedia.org"],
+    "instagram": ["instagram.com", "ddinstagram.com", "instagramez.com"],
+    "youtube": ["youtube.com", "youtu.be", "youtube-nocookie.com"],
+}
+
+
+# --- per-domain handlers ----------------------------------------------------
+
+
+def _canon_bluesky(scheme, host, path, query) -> tuple[str, str]:
+    # bsky.app/profile/<handle-or-did>/post/<rkey> — drop all query.
+    return urlunsplit(("https", "bsky.app", path.rstrip("/"), "", "")), "bluesky"
+
+
+def _canon_reddit(scheme, host, path, query) -> tuple[str, str]:
+    # Collapse old./new./np./m. and amp variants to canonical www.reddit.com.
+    return urlunsplit(("https", "www.reddit.com", path.rstrip("/"), "", "")), "reddit"
+
+
+def _canon_twitter(scheme, host, path, query) -> tuple[str, str]:
+    # Normalize to twitter.com (project preference); mirrors are fetch-only.
+    return urlunsplit(("https", "twitter.com", path.rstrip("/"), "", "")), "twitter"
+
+
+def _canon_artstation(scheme, host, path, query) -> tuple[str, str]:
+    return urlunsplit(("https", "www.artstation.com", path.rstrip("/"), "", "")), "artstation"
+
+
+def _canon_deviantart(scheme, host, path, query) -> tuple[str, str]:
+    # Preserve the host (deviantart usernames are subdomains) but strip query.
+    return urlunsplit(("https", host, path.rstrip("/"), "", "")), "deviantart"
+
+
+def _canon_wikipedia(scheme, host, path, query) -> tuple[str, str]:
+    # Convert mobile (xx.m.wikipedia.org) to desktop canonical (xx.wikipedia.org).
+    desktop = host.replace(".m.wikipedia.org", ".wikipedia.org")
+    return urlunsplit(("https", desktop, path, "", "")), "wikipedia"
+
+
+def _canon_instagram(scheme, host, path, query) -> tuple[str, str]:
+    # Normalize mirror hosts to instagram.com and ensure trailing slash on /p/.
+    segments = [s for s in path.split("/") if s]
+    if len(segments) >= 2 and segments[0] in {"p", "reel", "tv"}:
+        path = f"/{segments[0]}/{segments[1]}/"
+    return urlunsplit(("https", "www.instagram.com", path, "", "")), "instagram"
+
+
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _canon_youtube(scheme, host, path, query) -> tuple[str, str]:
+    params = dict(parse_qsl(query, keep_blank_values=True))
+    video_id: str | None = None
+    if host.endswith("youtu.be"):
+        video_id = path.lstrip("/").split("/")[0] or None
+    elif path == "/watch":
+        video_id = params.get("v")
+    elif path.startswith(("/shorts/", "/embed/", "/live/")):
+        video_id = path.split("/")[2] if len(path.split("/")) > 2 else None
+
+    # Preserve an intentional timestamp; drop playlists/trackers.
+    ts = params.get("t") or params.get("start")
+    if video_id and _YT_ID_RE.match(video_id):
+        q = urlencode({"t": ts}) if ts else ""
+        return urlunsplit(("https", "youtu.be", f"/{video_id}", q, "")), "youtube"
+    # Not a recognizable video URL (channel/playlist page): keep host, strip trackers.
+    keep = frozenset({"t", "start"})
+    return urlunsplit(("https", host, path, _strip_tracking(query, keep=keep), "")), "youtube"
+
+
+_HANDLERS = {
+    "bluesky": _canon_bluesky,
+    "reddit": _canon_reddit,
+    "twitter": _canon_twitter,
+    "artstation": _canon_artstation,
+    "deviantart": _canon_deviantart,
+    "wikipedia": _canon_wikipedia,
+    "instagram": _canon_instagram,
+    "youtube": _canon_youtube,
+}
+
+
+def canonicalize(url: str) -> CanonResult:
+    """Return the canonical form of ``url`` plus its domain family.
+
+    Unknown domains keep their structure but have tracking params stripped.
+    """
+    url = url.strip()
+    parts = urlsplit(url if "://" in url else f"https://{url}")
+    host = _host(parts.netloc)
+    family = _family_from_host(host)
+
+    if family and family in _HANDLERS:
+        canonical, fam = _HANDLERS[family](parts.scheme, host, parts.path, parts.query)
+        return CanonResult(canonical_url=canonical, domain_family=fam)
+
+    # Default: force https, strip trackers, keep everything else.
+    cleaned_query = _strip_tracking(parts.query)
+    canonical = urlunsplit(("https", parts.netloc.lower(), parts.path, cleaned_query, ""))
+    return CanonResult(canonical_url=canonical, domain_family="other")

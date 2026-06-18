@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: bluesky-repost-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Container-internal paths (volumes mounted below). Override of .env values
+      # so the same .env works on host and in-container.
+      DATA_DIR: /data
+      DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
+    volumes:
+      - bot-data:/data
+    # The bot is a long-running gateway client; no ports are exposed.
+
+volumes:
+  # Named volume holds db/, attachments/ and logs/ — survives container rebuilds.
+  bot-data:
