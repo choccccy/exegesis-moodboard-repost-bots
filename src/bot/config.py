@@ -24,6 +24,9 @@ class BoardConfig(BaseModel):
     # When true, every submission must get an explicit graphic yes/no before it
     # can become ready_to_queue. Set false per board to skip the graphic prompt.
     require_graphic_classification: bool = True
+    # Bluesky handle for this board's account (e.g. "robot-posting.bsky.social").
+    # App password is supplied separately via BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>.
+    bluesky_handle: str | None = None
 
 
 class Settings(BaseSettings):
@@ -54,6 +57,15 @@ class Settings(BaseSettings):
     catchup_lookback_hours: int = Field(168, alias="CATCHUP_LOOKBACK_HOURS")
     catchup_max_messages: int = Field(500, alias="CATCHUP_MAX_MESSAGES")
 
+    # Per-board Bluesky app passwords. Named BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>
+    # where BOARD_NAME_UPPER is the board name uppercased with hyphens replaced by underscores.
+    # e.g. board "robot-posting" -> BSKY_APP_PASSWORD_ROBOT_POSTING
+    bsky_app_password_robot_posting: str | None = Field(None, alias="BSKY_APP_PASSWORD_ROBOT_POSTING")
+    bsky_app_password_robot_fucking: str | None = Field(None, alias="BSKY_APP_PASSWORD_ROBOT_FUCKING")
+    bsky_app_password_weird_wheels: str | None = Field(None, alias="BSKY_APP_PASSWORD_WEIRD_WHEELS")
+    bsky_app_password_doohickey_posting: str | None = Field(None, alias="BSKY_APP_PASSWORD_DOOHICKEY_POSTING")
+    bsky_app_password_nerd_tv: str | None = Field(None, alias="BSKY_APP_PASSWORD_NERD_TV")
+
     @field_validator("boards_json")
     @classmethod
     def _validate_boards_json(cls, value: str) -> str:
@@ -69,6 +81,11 @@ class Settings(BaseSettings):
         return next(
             (b for b in self.boards if b.discord_channel_id == channel_id), None
         )
+
+    def bsky_password_for(self, board_name: str) -> str | None:
+        """Look up the app password for a board by its name."""
+        key = board_name.lower().replace("-", "_")
+        return getattr(self, f"bsky_app_password_{key}", None)
 
     @property
     def attachments_dir(self) -> str:

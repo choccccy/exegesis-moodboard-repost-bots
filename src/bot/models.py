@@ -96,6 +96,9 @@ class Submission(Base):
     image_requests: Mapped[list["ImageRequest"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
+    publish_attempts: Mapped[list["PublishAttempt"]] = relationship(
+        back_populates="submission", cascade="all, delete-orphan"
+    )
 
 
 class SubmissionLink(Base):
@@ -182,6 +185,23 @@ class ImageRequest(_RequestMixin, Base):
 
     submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
     submission: Mapped["Submission"] = relationship(back_populates="image_requests")
+
+
+class PublishAttempt(Base):
+    """Audit log of every Bluesky post attempt for a submission."""
+
+    __tablename__ = "publish_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    success: Mapped[bool] = mapped_column(Boolean)
+    # AT URI and CID returned by the Bluesky API on success.
+    at_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    at_cid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    submission: Mapped["Submission"] = relationship(back_populates="publish_attempts")
 
 
 class SubmissionThread(Base):

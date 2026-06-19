@@ -31,11 +31,13 @@ from ..models import (
     Board,
     ContentLabelRequest,
     ImageRequest,
+    PublishAttempt,
     SourceRequest,
     Submission,
     SubmissionLink,
     SubmissionThread,
 )
+from .. import publish as publisher
 from ..moderation import (
     GRAPHIC_NO_EMOJI,
     GRAPHIC_YES_EMOJI,
@@ -136,7 +138,7 @@ async def handle_reaction(
     if thread is None:
         log.warning("could not create/resolve thread for submission %s", submission.id)
         return
-    await recompute_and_request(session, submission, destination=thread)
+    await recompute_and_request(session, submission, settings=settings, destination=thread)
 
 
 async def _ensure_thread(
@@ -296,6 +298,7 @@ async def handle_reaction_removed(
         AttachmentAltTextRequest,
         ContentLabelRequest,
         ImageRequest,
+        PublishAttempt,
         SubmissionLink,
         Attachment,
     ):
@@ -344,7 +347,7 @@ async def handle_label_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     # The reaction is on a message in the thread, so `channel` is the thread.
-    await recompute_and_request(session, submission, destination=channel)
+    await recompute_and_request(session, submission, settings=settings, destination=channel)
 
 
 def _reaction_authorized(
@@ -598,6 +601,7 @@ async def recompute_and_request(
     session: AsyncSession,
     submission: Submission,
     *,
+    settings: Settings,
     destination: discord.abc.Messageable,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
@@ -654,18 +658,72 @@ async def recompute_and_request(
             ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
         )
 
-    if (
-        new_state == SubmissionState.READY_TO_QUEUE
-        and old_state != SubmissionState.READY_TO_QUEUE.value
-    ):
+    _already_done = (
+        SubmissionState.READY_TO_QUEUE.value,
+        SubmissionState.QUEUED.value,
+        SubmissionState.PUBLISHED.value,
+        SubmissionState.PUBLISH_FAILED.value,
+    )
+    if new_state == SubmissionState.READY_TO_QUEUE and old_state not in _already_done:
         await destination.send(replies.ready_confirmation())
-        # Separate verification-preview message (easy to remove later) projecting
-        # the submission onto the Bluesky post record it would become.
         preview = await _build_post_preview(session, submission, atts, links)
         await destination.send(replies.format_post_preview(preview))
-        log.info("submission %s is ready_to_queue", submission.id)
+        log.info("submission %s is ready_to_queue, attempting publish", submission.id)
+        await _attempt_publish(session, settings, submission, atts, links, destination)
 
     return new_state
+
+
+async def _attempt_publish(
+    session: AsyncSession,
+    settings: Settings,
+    submission: Submission,
+    atts: list[Attachment],
+    links: list[SubmissionLink],
+    destination: discord.abc.Messageable,
+) -> None:
+    """Publish to Bluesky and record the result. Fires once per ready transition."""
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    if not board_cfg or not board_cfg.bluesky_handle:
+        log.info(
+            "submission %s ready but board has no bluesky_handle - skipping publish",
+            submission.id,
+        )
+        return
+
+    password = settings.bsky_password_for(board_cfg.name)
+    if not password:
+        log.warning(
+            "submission %s ready but no app password for board %s - skipping publish",
+            submission.id, board_cfg.name,
+        )
+        return
+
+    result = await publisher.publish_submission(
+        submission=submission,
+        links=links,
+        attachments=atts,
+        board_cfg=board_cfg,
+        password=password,
+    )
+    session.add(
+        PublishAttempt(
+            submission_id=submission.id,
+            success=result.success,
+            at_uri=result.at_uri,
+            at_cid=result.at_cid,
+            error=result.error,
+        )
+    )
+    if result.success and result.at_uri:
+        submission.state = SubmissionState.PUBLISHED.value
+        bsky_url = publisher.at_uri_to_url(result.at_uri)
+        await destination.send(replies.published_notice(bsky_url))
+        log.info("submission %s published: %s", submission.id, result.at_uri)
+    else:
+        submission.state = SubmissionState.PUBLISH_FAILED.value
+        await destination.send(replies.publish_failed_notice(result.error))
+        log.error("submission %s publish failed: %s", submission.id, result.error)
 
 
 async def _build_post_preview(
@@ -757,7 +815,7 @@ async def handle_reply(
         return True  # we replied with a nudge; leave request open
 
     # Replies arrive in the submission's thread, so post follow-ups right there.
-    await recompute_and_request(session, submission, destination=message.channel)
+    await recompute_and_request(session, submission, settings=settings, destination=message.channel)
     return True
 
 
@@ -803,6 +861,8 @@ async def _apply_answer(
                     domain_family=res.domain_family,
                 )
             )
+        await session.flush()  # assign link IDs before resolving
+        await _resolve_links(session, submission, settings, http_client)
 
     elif isinstance(req, AttachmentAltTextRequest):
         body = (message.content or "").strip()

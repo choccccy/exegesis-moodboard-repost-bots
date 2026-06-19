@@ -49,6 +49,14 @@ def reaction_removed() -> str:
     return "🦋 removed, deleting prospective post"
 
 
+def published_notice(bsky_url: str) -> str:
+    return f"posted to Bluesky: {bsky_url}"
+
+
+def publish_failed_notice(error: str | None) -> str:
+    return f"publish failed: {error or 'unknown error'}"
+
+
 def thread_name(submission_id: int) -> str:
     # Discord caps thread names at 100 chars; this stays well under.
     return f"🦋 submission {submission_id}"
@@ -67,7 +75,7 @@ def thread_anchor(
         f"source: {source_url}",
     ]
     if curator_mentions:
-        lines.append(f"{' '.join(curator_mentions)} — help curate this repost")
+        lines.append(f"{' '.join(curator_mentions)} - help curate this repost")
     return "\n".join(lines)
 
 

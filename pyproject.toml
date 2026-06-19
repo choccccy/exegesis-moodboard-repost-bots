@@ -1,7 +1,7 @@
 [project]
 name = "bluesky-repost-bot"
 version = "0.1.0"
-description = "Source-first Discord -> Bluesky moodboard repost bot (Milestone 1: Discord ingestion)"
+description = "Source-first Discord -> Bluesky moodboard repost bot"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.13",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "atproto>=0.0.55",
 ]
 
 [project.optional-dependencies]
