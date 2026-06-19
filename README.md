@@ -105,7 +105,7 @@ data/               mounted volume (db/, attachments/, logs/) - gitignored
 
 ## Roadmap
 
-- **M2** - authenticate one Bluesky account; publish eligible non-Bluesky items (canonical URL + uploaded images + alt text).
-- **M3** - Bluesky-native reposts; multi-link reply threads.
+- **M2** - authenticate one Bluesky account; publish eligible non-Bluesky items (canonical URL + uploaded images + alt text). ✓
+- **M3** - Bluesky-native reposts; multi-link reply threads. ✓
 - **M4** - platform-specific metadata resolvers; graphic-content labeling.
 - **M5** - Matrix ingestion adapter (same user rules).

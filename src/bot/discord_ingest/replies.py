@@ -28,8 +28,8 @@ def alt_text_request(mention: str, filename: str) -> str:
 
 def graphic_request(mention: str) -> str:
     return (
-        f"{mention} react {GRAPHIC_YES_EMOJI} if this should be marked graphic, "
-        f"{GRAPHIC_NO_EMOJI} if not"
+        f"{mention} react {GRAPHIC_YES_EMOJI} if this contains graphic/gore content, "
+        f"{GRAPHIC_NO_EMOJI} if it's safe"
     )
 
 
@@ -49,8 +49,19 @@ def reaction_removed() -> str:
     return "🦋 removed, deleting prospective post"
 
 
+def cannot_remove_published(bsky_url: str) -> str:
+    return (
+        f"this post has already been published to Bluesky: {bsky_url}\n"
+        "removing the 🦋 won't un-publish it - contact an admin if you need it taken down"
+    )
+
+
 def published_notice(bsky_url: str) -> str:
     return f"posted to Bluesky: {bsky_url}"
+
+
+def reposted_notice(bsky_url: str) -> str:
+    return f"reposted to Bluesky: {bsky_url}"
 
 
 def publish_failed_notice(error: str | None) -> str:

@@ -288,6 +288,25 @@ async def handle_reaction_removed(
     if submission is None:
         return  # nothing to undo
 
+    # Block removal of already-published submissions to prevent duplicate posts.
+    if submission.state == SubmissionState.PUBLISHED.value:
+        thread = await _resolve_thread_by_id(channel, submission.thread_id) if submission.thread_id else None
+        if thread is not None:
+            attempt = await session.scalar(
+                select(PublishAttempt)
+                .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
+                .order_by(PublishAttempt.attempted_at.desc())
+            )
+            board_cfg = settings.board_for_channel(channel_id)
+            if attempt and attempt.bsky_url:
+                bsky_url = attempt.bsky_url
+            elif attempt and attempt.at_uri:
+                bsky_url = publisher.at_uri_to_url(attempt.at_uri, board_cfg.bluesky_handle if board_cfg else None)
+            else:
+                bsky_url = "Bluesky"
+            await thread.send(replies.cannot_remove_published(bsky_url))
+        return
+
     sub_id = submission.id
     thread_id = submission.thread_id
     remove_submission_dir(settings.attachments_dir, board.id, sub_id)
@@ -712,13 +731,17 @@ async def _attempt_publish(
             success=result.success,
             at_uri=result.at_uri,
             at_cid=result.at_cid,
+            bsky_url=result.bsky_url,
             error=result.error,
         )
     )
     if result.success and result.at_uri:
         submission.state = SubmissionState.PUBLISHED.value
-        bsky_url = publisher.at_uri_to_url(result.at_uri)
-        await destination.send(replies.published_notice(bsky_url))
+        bsky_url = result.bsky_url or publisher.at_uri_to_url(result.at_uri)
+        if result.is_repost:
+            await destination.send(replies.reposted_notice(bsky_url))
+        else:
+            await destination.send(replies.published_notice(bsky_url))
         log.info("submission %s published: %s", submission.id, result.at_uri)
     else:
         submission.state = SubmissionState.PUBLISH_FAILED.value

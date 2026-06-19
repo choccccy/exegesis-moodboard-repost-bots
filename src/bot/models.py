@@ -199,6 +199,8 @@ class PublishAttempt(Base):
     # AT URI and CID returned by the Bluesky API on success.
     at_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     at_cid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Human-readable bsky.app URL for the published content (handle-based, not DID).
+    bsky_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     submission: Mapped["Submission"] = relationship(back_populates="publish_attempts")

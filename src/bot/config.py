@@ -27,6 +27,9 @@ class BoardConfig(BaseModel):
     # Bluesky handle for this board's account (e.g. "robot-posting.bsky.social").
     # App password is supplied separately via BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>.
     bluesky_handle: str | None = None
+    # Hashtags appended to every post from this board (no leading #).
+    # Start with the channel name; extend after analyzing tag performance.
+    tags: list[str] = Field(default_factory=list)
 
 
 class Settings(BaseSettings):
