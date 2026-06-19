@@ -1,3 +1,9 @@
+https://bsky.app/profile/robots.exegesis.space
+https://bsky.app/profile/xxx-robots.exegesis.space
+https://bsky.app/profile/vehicles.exegesis.space
+https://bsky.app/profile/doohickeys.exegesis.space
+https://bsky.app/profile/tv.exegesis.space
+
 # Discord → Bluesky Repost Bot
 
 A source-first bot that turns curated Discord moodboard posts into Bluesky reposts
