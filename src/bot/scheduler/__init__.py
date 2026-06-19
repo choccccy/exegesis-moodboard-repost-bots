@@ -23,7 +23,7 @@ async def run_housekeeping(settings: Settings, stop: asyncio.Event) -> None:
         ok = has_free_space(settings.data_dir, settings.storage_min_free_mb)
         if not ok:
             log.warning(
-                "storage below %s MB floor at %s — new attachment downloads will be blocked",
+                "storage below %s MB floor at %s - new attachment downloads will be blocked",
                 settings.storage_min_free_mb,
                 settings.data_dir,
             )

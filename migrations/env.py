@@ -25,10 +25,11 @@ if _db_url:
 
 def _ensure_sqlite_dir(url: str) -> None:
     # On a fresh volume the SQLite directory may not exist yet; create it so the
-    # entrypoint's `alembic upgrade head` succeeds on first run.
+    # entrypoint's `alembic upgrade head` succeeds on first run. The path after
+    # the "sqlite:///" marker is used verbatim (absolute or relative).
     marker = "sqlite:///"
     if url.startswith(marker):
-        path = "/" + url[len(marker):].lstrip("/")
+        path = url[len(marker):]
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)

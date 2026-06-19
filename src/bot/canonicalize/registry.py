@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-# Query params that never change *what* a resource is — safe to strip everywhere.
+# Query params that never change *what* a resource is - safe to strip everywhere.
 TRACKING_PARAMS: frozenset[str] = frozenset(
     {
         "si", "fbclid", "gclid", "dclid", "yclid", "msclkid",
@@ -71,7 +71,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
 
 
 def _canon_bluesky(scheme, host, path, query) -> tuple[str, str]:
-    # bsky.app/profile/<handle-or-did>/post/<rkey> — drop all query.
+    # bsky.app/profile/<handle-or-did>/post/<rkey> - drop all query.
     return urlunsplit(("https", "bsky.app", path.rstrip("/"), "", "")), "bluesky"
 
 

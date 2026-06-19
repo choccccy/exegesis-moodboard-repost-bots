@@ -1,4 +1,4 @@
-"""Matrix ingestion adapter (RESERVED — Milestone 5).
+"""Matrix ingestion adapter (RESERVED - Milestone 5).
 
 Must preserve the same user mental model as Discord: a reaction/equivalent means
 intent-to-submit, the bot asks for missing source URL / alt text in replies, and

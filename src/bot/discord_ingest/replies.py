@@ -1,10 +1,25 @@
-"""Procedural reply text. Utilitarian and dead-simple — never chatty."""
+"""Procedural reply text. Utilitarian and dead-simple - never chatty."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
 
 
 def source_request(mention: str) -> str:
     return f"{mention} reply to this message with the source URL"
+
+
+def image_request(mention: str) -> str:
+    return (
+        f"{mention} this link has no preview image, so the post would have no image. "
+        "reply to this message attaching an image to use"
+    )
+
+
+def image_not_found() -> str:
+    return "no image attached - reply again attaching at least one image"
 
 
 def alt_text_request(mention: str, filename: str) -> str:
@@ -12,16 +27,124 @@ def alt_text_request(mention: str, filename: str) -> str:
 
 
 def graphic_request(mention: str) -> str:
-    return f"{mention} reply to this message with whether this should be marked graphic (yes/no)"
+    return (
+        f"{mention} react {GRAPHIC_YES_EMOJI} if this should be marked graphic, "
+        f"{GRAPHIC_NO_EMOJI} if not"
+    )
 
 
 def ready_confirmation() -> str:
-    return "✓ all required info received — this submission is ready to queue"
+    return "✓ all required info received - this submission is ready to queue"
 
 
 def source_not_found() -> str:
-    return "couldn't find a URL in that reply — reply again with the source URL"
+    return "couldn't find a URL in that reply - reply again with the source URL"
 
 
 def graphic_not_understood() -> str:
     return "reply with a simple yes or no for graphic content"
+
+
+def reaction_removed() -> str:
+    return "🦋 removed, deleting prospective post"
+
+
+def thread_name(submission_id: int) -> str:
+    # Discord caps thread names at 100 chars; this stays well under.
+    return f"🦋 submission {submission_id}"
+
+
+def thread_anchor(
+    *, source_url: str, poster_mention: str, curator_mentions: list[str]
+) -> str:
+    """Top-of-thread message: anchors back to the source and pulls people in.
+
+    Mentioning the poster adds them to the private thread; curator role mentions
+    notify the (Manage-Threads-visible) curators.
+    """
+    lines = [
+        f"🦋 new submission from {poster_mention}",
+        f"source: {source_url}",
+    ]
+    if curator_mentions:
+        lines.append(f"{' '.join(curator_mentions)} — help curate this repost")
+    return "\n".join(lines)
+
+
+# Human labels + atproto $type per embed mode.
+_KIND_LABELS = {
+    "external": ("external link card", "app.bsky.embed.external"),
+    "images": ("image post", "app.bsky.embed.images"),
+    "record": ("Bluesky repost/quote", "app.bsky.embed.record"),
+    "empty": ("(no source yet)", "-"),
+}
+
+
+@dataclass
+class PostPreview:
+    """Projection of a submission onto the Bluesky post record it would become.
+
+    This is a verification preview, not the real publish (that's M2). ``links`` is
+    ordered (canonical_url, domain_family); ``images`` is uploaded (filename, alt).
+    """
+
+    kind: str  # external | images | record | empty
+    title: str | None
+    links: list[tuple[str, str]]
+    images: list[tuple[str, str | None]]
+    embed_title: str | None
+    embed_description: str | None
+    embed_has_thumb: bool
+    resolved_via: str | None = None
+    labels: list[str] = field(default_factory=list)
+    board_name: str = ""
+    nsfw: bool = False
+    graphic_status: str = "unknown"
+    image_satisfied: bool = True
+    image_source: str = "n/a"
+
+
+def format_post_preview(p: PostPreview) -> str:
+    human, atproto = _KIND_LABELS.get(p.kind, _KIND_LABELS["empty"])
+    primary = p.links[0][0] if p.links else None
+
+    lines: list[str] = ["🔎 **prospective Bluesky post**", ""]
+    lines.append(f"type:  {human} ({atproto})")
+
+    # text: source title (when known) followed by the primary canonical URL.
+    lines.append("text:")
+    if p.title:
+        lines.append(f"  {p.title}")
+    lines.append(f"  {primary}" if primary else "  (none)")
+
+    # embed block depends on the chosen mode.
+    if p.kind == "images":
+        lines.append(f"embed.images ({len(p.images)}/4):")
+        for i, (filename, alt) in enumerate(p.images, start=1):
+            alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
+            lines.append(f"  {i}. {filename} - alt: {alt_text}")
+    elif p.kind == "external":
+        lines.append("embed.external:")
+        lines.append(f"  uri:    {primary}")
+        lines.append(f"  title:  {p.embed_title or '(unresolved)'}")
+        lines.append(f"  desc:   {p.embed_description or '(none)'}")
+        lines.append(f"  thumb:  {'✓ image present' if p.embed_has_thumb else '⚠ MISSING'}")
+        lines.append(f"  via:    {p.resolved_via or 'none'}")
+    elif p.kind == "record":
+        lines.append("embed.record:")
+        lines.append(f"  uri:    {primary}  (native repost/quote of an existing post)")
+
+    labels = ", ".join(p.labels) if p.labels else "none"
+    lines.append(f"labels: {labels}  (board: {p.board_name}, {'NSFW' if p.nsfw else 'sfw'})")
+    lines.append(f"graphic: {p.graphic_status}")
+
+    # thread structure: first canonical link is the root, the rest become replies.
+    extra = max(len(p.links) - 1, 0)
+    lines.append("thread: " + (f"1 root + {extra} repl{'y' if extra == 1 else 'ies'}" if extra else "single post"))
+
+    lines.append(f"image check: {'✓' if p.image_satisfied else '⚠'} {p.image_source}")
+
+    text = "\n".join(lines)
+    if len(text) > 1900:  # Discord hard-caps messages at 2000 chars.
+        text = text[:1900] + "\n… (truncated)"
+    return text

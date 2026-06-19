@@ -20,7 +20,7 @@ async def amain() -> None:
     init_engine(settings.database_url)
 
     if not settings.boards:
-        log.warning("no boards configured (BOARDS_JSON is empty) — nothing will be watched")
+        log.warning("no boards configured (BOARDS_JSON is empty) - nothing will be watched")
 
     bot = RepostBot(settings)
     stop = asyncio.Event()

@@ -13,11 +13,16 @@ from datetime import datetime, timezone
 
 import discord
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..accessibility import initial_alt_text, is_image_attachment
-from ..asset_store import StorageFullError, download_attachment, submission_dir
+from ..asset_store import (
+    StorageFullError,
+    download_attachment,
+    remove_submission_dir,
+    submission_dir,
+)
 from ..canonicalize import canonicalize
 from ..config import BoardConfig, Settings
 from ..models import (
@@ -25,11 +30,19 @@ from ..models import (
     Attachment,
     Board,
     ContentLabelRequest,
+    ImageRequest,
     SourceRequest,
     Submission,
     SubmissionLink,
+    SubmissionThread,
 )
-from ..moderation import parse_graphic_answer
+from ..moderation import (
+    GRAPHIC_NO_EMOJI,
+    GRAPHIC_YES_EMOJI,
+    graphic_from_emoji,
+    parse_graphic_answer,
+)
+from ..resolve import resolve
 from ..state import (
     AltTextStatus,
     GraphicStatus,
@@ -101,6 +114,7 @@ async def handle_reaction(
     )
     created = submission is None
     if created:
+        cfg = settings.board_for_channel(message.channel.id)
         submission = Submission(
             board_id=board.id,
             source_discord_message_id=message.id,
@@ -108,13 +122,259 @@ async def handle_reaction(
             author_id=message.author.id,
             author_display=getattr(message.author, "display_name", str(message.author)),
             state=SubmissionState.INTENT_SUBMITTED.value,
+            graphic_classification_required=(
+                cfg.require_graphic_classification if cfg else True
+            ),
         )
         session.add(submission)
         await session.flush()  # assign submission.id
         await _ingest_content(session, submission, message, settings, http_client)
+        await _resolve_links(session, submission, settings, http_client)
         log.info("created submission %s for message %s", submission.id, message.id)
 
-    await recompute_and_request(session, submission, source_message=message)
+    thread = await _ensure_thread(session, settings, message, submission)
+    if thread is None:
+        log.warning("could not create/resolve thread for submission %s", submission.id)
+        return
+    await recompute_and_request(session, submission, destination=thread)
+
+
+async def _ensure_thread(
+    session: AsyncSession,
+    settings: Settings,
+    message: discord.Message,
+    submission: Submission,
+) -> discord.Thread | None:
+    """Get (or create) the per-submission *private* thread.
+
+    Reuse is keyed by a durable SubmissionThread mapping (survives 🦋 removal), so
+    re-reacting reuses the same thread without re-pinging curators.
+    """
+    mapping = await session.scalar(
+        select(SubmissionThread).where(
+            SubmissionThread.board_id == submission.board_id,
+            SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+        )
+    )
+    if mapping is not None:
+        existing = await _resolve_thread(message, mapping.thread_id)
+        if existing is not None:
+            submission.thread_id = mapping.thread_id
+            return existing
+
+    # Create a new private thread (no channel-visible "started a thread" system message).
+    try:
+        name = await _derive_thread_title(session, message, submission)
+        thread = await message.channel.create_thread(  # type: ignore[union-attr]
+            name=name,
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("private thread creation failed for message %s: %s", message.id, exc)
+        return None
+
+    await _post_thread_anchor(settings, message, submission, thread)
+
+    submission.thread_id = thread.id
+    if mapping is None:
+        session.add(
+            SubmissionThread(
+                board_id=submission.board_id,
+                source_discord_message_id=submission.source_discord_message_id,
+                thread_id=thread.id,
+            )
+        )
+    else:
+        mapping.thread_id = thread.id  # old thread was gone; remember the new one
+    return thread
+
+
+async def _post_thread_anchor(
+    settings: Settings,
+    message: discord.Message,
+    submission: Submission,
+    thread: discord.Thread,
+) -> None:
+    """Anchor the private thread: jump link + add the poster + ping curators."""
+    guild_id = message.guild.id if message.guild else 0
+    source_url = (
+        f"https://discord.com/channels/{guild_id}/{submission.channel_id}/"
+        f"{submission.source_discord_message_id}"
+    )
+    cfg = settings.board_for_channel(submission.channel_id)
+    curator_mentions = [f"<@&{rid}>" for rid in (cfg.curator_role_ids if cfg else [])]
+    text = replies.thread_anchor(
+        source_url=source_url,
+        poster_mention=f"<@{submission.author_id}>",  # mention adds them to the private thread
+        curator_mentions=curator_mentions,
+    )
+    try:
+        await thread.send(
+            text,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("could not post thread anchor for submission %s: %s", submission.id, exc)
+
+
+async def _derive_thread_title(
+    session: AsyncSession, message: discord.Message, submission: Submission
+) -> str:
+    """Name the thread after the resolved post title.
+
+    Prefers the title our resolver produced (oembed/opengraph/etc.; resolution
+    runs before the thread is created), then the Discord-generated embed title,
+    then a generic fallback.
+    """
+    primary = await session.scalar(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == submission.id)
+        .order_by(SubmissionLink.order_index)
+        .limit(1)
+    )
+    candidates: list[str | None] = [primary.resolved_title if primary else None]
+    for embed in message.embeds:
+        candidates.append(embed.title or (embed.author.name if embed.author else None))
+    for candidate in candidates:
+        if candidate and candidate.strip():
+            title = candidate.strip()
+            # Discord caps thread names at 100 chars.
+            return title if len(title) <= 100 else title[:99] + "…"
+    return replies.thread_name(submission.id)
+
+
+async def _resolve_thread(
+    message: discord.Message, thread_id: int
+) -> discord.Thread | None:
+    guild = message.guild
+    if guild is None:
+        return None
+    cached = guild.get_thread(thread_id)
+    if cached is not None:
+        return cached
+    try:
+        channel = await guild.fetch_channel(thread_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+    return channel if isinstance(channel, discord.Thread) else None
+
+
+async def handle_reaction_removed(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    """A 🦋 was removed: delete the prospective post so a re-react starts fresh.
+
+    Deletes the submission, its links/attachments/requests, and the downloaded
+    files, then posts a short notice. Re-adding 🦋 re-runs ingest via
+    handle_reaction (get-or-create will create a new submission).
+    """
+    board = await _board_for_channel(session, channel_id)
+    if board is None:
+        return
+    submission = await session.scalar(
+        select(Submission).where(
+            Submission.board_id == board.id,
+            Submission.source_discord_message_id == message_id,
+        )
+    )
+    if submission is None:
+        return  # nothing to undo
+
+    sub_id = submission.id
+    thread_id = submission.thread_id
+    remove_submission_dir(settings.attachments_dir, board.id, sub_id)
+    # Delete child rows, then the submission itself.
+    # (SQLite has no ON DELETE CASCADE here, so delete children explicitly.)
+    for model in (
+        SourceRequest,
+        AttachmentAltTextRequest,
+        ContentLabelRequest,
+        ImageRequest,
+        SubmissionLink,
+        Attachment,
+    ):
+        await session.execute(delete(model).where(model.submission_id == sub_id))
+    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    log.info("deleted submission %s after 🦋 removal on message %s", sub_id, message_id)
+
+    # Notice goes in the thread (never the main channel). The thread is kept and
+    # reused if the 🦋 is re-added, so we don't spam the channel with new threads.
+    thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
+    if thread is not None:
+        await thread.send(replies.reaction_removed())
+    else:
+        log.info("no thread to notify for removed submission %s", sub_id)
+
+
+async def handle_label_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    emoji: str,
+    member: discord.Member | None,
+    user_id: int,
+) -> None:
+    """A curator reacted ✅/❌ on a graphic-classification request message."""
+    req = await session.scalar(
+        select(ContentLabelRequest).where(ContentLabelRequest.bot_message_id == message_id)
+    )
+    if req is None or req.answered_at is not None:
+        return
+    status = graphic_from_emoji(emoji)
+    if status is None:
+        return
+
+    submission = await session.get(Submission, req.submission_id)
+    if submission is None:
+        return
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    if not _reaction_authorized(member, user_id, submission, board_cfg):
+        return
+
+    submission.graphic_status = status.value
+    req.answer = emoji
+    req.answered_by = user_id
+    req.answered_at = _now()
+    # The reaction is on a message in the thread, so `channel` is the thread.
+    await recompute_and_request(session, submission, destination=channel)
+
+
+def _reaction_authorized(
+    member: discord.Member | None,
+    user_id: int,
+    submission: Submission,
+    board_cfg: BoardConfig | None,
+) -> bool:
+    if user_id == submission.author_id:
+        return True
+    if member is None or board_cfg is None:
+        return False
+    role_ids = {r.id for r in member.roles}
+    return any(rid in role_ids for rid in board_cfg.curator_role_ids)
+
+
+async def _resolve_thread_by_id(
+    channel: discord.abc.Messageable, thread_id: int
+) -> discord.Thread | None:
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return None
+    cached = guild.get_thread(thread_id)
+    if cached is not None:
+        return cached
+    try:
+        resolved = await guild.fetch_channel(thread_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+    return resolved if isinstance(resolved, discord.Thread) else None
 
 
 async def _ingest_content(
@@ -124,7 +384,7 @@ async def _ingest_content(
     settings: Settings,
     http_client: httpx.AsyncClient,
 ) -> None:
-    """One-time parse of links + download of attachments for a new submission."""
+    """One-time parse of links + embed capture + attachment download."""
     for i, raw in enumerate(extract_urls(message.content)):
         res = canonicalize(raw)
         session.add(
@@ -137,74 +397,192 @@ async def _ingest_content(
             )
         )
 
-    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+    _capture_embed(submission, message)
+
     for att in message.attachments:
-        is_img = is_image_attachment(att.content_type, att.filename)
-        status, body = initial_alt_text(
-            is_image=is_img, discord_description=att.description
+        await _ingest_attachment(session, submission, att, settings, http_client)
+
+
+def _capture_embed(submission: Submission, message: discord.Message) -> None:
+    """Store the Discord-generated link embed's title/description/thumb.
+
+    Drives the external-embed preview and the at-least-one-image check. Embeds
+    populate a beat after posting, so this may be empty if 🦋 was very fast.
+    """
+    for embed in message.embeds:
+        thumb = (embed.thumbnail.url if embed.thumbnail else None) or (
+            embed.image.url if embed.image else None
         )
-        row = Attachment(
-            submission_id=submission.id,
-            discord_attachment_id=att.id,
-            filename=att.filename,
-            discord_url=att.url,
-            mime=att.content_type,
-            width=att.width,
-            height=att.height,
-            spoiler=att.is_spoiler(),
-            is_image=is_img,
-            alt_text_status=status.value,
-            alt_text_body=body,
+        if embed.title or embed.description or thumb:
+            submission.embed_title = embed.title
+            submission.embed_description = embed.description
+            submission.embed_thumb_url = thumb
+            return
+
+
+async def _resolve_links(
+    session: AsyncSession,
+    submission: Submission,
+    settings: Settings,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Resolve per-link metadata and download each thumbnail to the volume.
+
+    The primary (first) link falls back to the Discord-captured embed when our
+    own fetch comes up empty.
+    """
+    links = list(
+        (
+            await session.scalars(
+                select(SubmissionLink)
+                .where(SubmissionLink.submission_id == submission.id)
+                .order_by(SubmissionLink.order_index)
+            )
+        ).all()
+    )
+    for idx, link in enumerate(links):
+        is_primary = idx == 0
+        meta = await resolve(
+            link.canonical_url,
+            link.domain_family,
+            client=http_client,
+            fallback_title=submission.embed_title if is_primary else None,
+            fallback_description=submission.embed_description if is_primary else None,
+            fallback_image_url=submission.embed_thumb_url if is_primary else None,
         )
-        session.add(row)
-        await session.flush()  # assign row.id for logging / future linkage
-        try:
-            path = await download_attachment(
-                url=att.url,
-                dest_dir=dest,
-                filename=f"{row.id}_{att.filename}",
-                data_dir=settings.data_dir,
-                min_free_mb=settings.storage_min_free_mb,
-                client=http_client,
-            )
-            row.local_path = path
-            row.downloaded_at = _now()
-        except StorageFullError:
-            log.warning(
-                "storage full: attachment %s for submission %s not downloaded",
-                att.id,
-                submission.id,
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            log.warning("failed to download attachment %s: %s", att.id, exc)
+        link.resolved_title = meta.title
+        link.resolved_description = meta.description
+        link.resolved_image_url = meta.image_url
+        link.resolved_via = meta.via
+        if meta.image_url:
+            dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+            try:
+                link.resolved_image_path = await download_attachment(
+                    url=meta.image_url,
+                    dest_dir=dest,
+                    filename=f"thumb_{link.id}",
+                    data_dir=settings.data_dir,
+                    min_free_mb=settings.storage_min_free_mb,
+                    client=http_client,
+                )
+            except (StorageFullError, httpx.HTTPError, OSError) as exc:
+                log.info("thumbnail download failed for link %s: %s", link.id, exc)
+
+
+async def _ingest_attachment(
+    session: AsyncSession,
+    submission: Submission,
+    att: discord.Attachment,
+    settings: Settings,
+    http_client: httpx.AsyncClient,
+) -> Attachment:
+    """Persist one Discord attachment row and download its bytes to the volume."""
+    is_img = is_image_attachment(att.content_type, att.filename)
+    status, body = initial_alt_text(is_image=is_img, discord_description=att.description)
+    row = Attachment(
+        submission_id=submission.id,
+        discord_attachment_id=att.id,
+        filename=att.filename,
+        discord_url=att.url,
+        mime=att.content_type,
+        width=att.width,
+        height=att.height,
+        spoiler=att.is_spoiler(),
+        is_image=is_img,
+        alt_text_status=status.value,
+        alt_text_body=body,
+    )
+    session.add(row)
+    await session.flush()  # assign row.id
+    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+    try:
+        path = await download_attachment(
+            url=att.url,
+            dest_dir=dest,
+            filename=f"{row.id}_{att.filename}",
+            data_dir=settings.data_dir,
+            min_free_mb=settings.storage_min_free_mb,
+            client=http_client,
+        )
+        row.local_path = path
+        row.downloaded_at = _now()
+    except StorageFullError:
+        log.warning(
+            "storage full: attachment %s for submission %s not downloaded",
+            att.id, submission.id,
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("failed to download attachment %s: %s", att.id, exc)
+    return row
 
 
 # --- readiness evaluation + procedural requests -----------------------------
 
 
+def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool) -> str:
+    """Choose the Bluesky embed mode this submission would use."""
+    first_family = links[0].domain_family if links else None
+    if first_family == "bluesky":
+        return "record"  # native repost/quote
+    if has_uploaded_image:
+        return "images"
+    if links:
+        return "external"
+    return "empty"
+
+
+def _primary_link(links: list[SubmissionLink]) -> SubmissionLink | None:
+    return links[0] if links else None
+
+
+def _image_status(
+    kind: str, atts: list[Attachment], links: list[SubmissionLink]
+) -> tuple[bool, str]:
+    """Whether the at-least-one-image need is met, and where the image comes from."""
+    uploaded = [a for a in atts if a.is_image]
+    if kind == "record":
+        return True, "n/a (Bluesky repost preserves original)"
+    if uploaded:
+        return True, f"{len(uploaded)} uploaded image(s)"
+    primary = _primary_link(links)
+    if primary and primary.resolved_image_path:
+        return True, f"external embed thumbnail (via {primary.resolved_via})"
+    return False, "no image - post would have none"
+
+
 async def _snapshot(
     session: AsyncSession, submission: Submission
-) -> tuple[SubmissionSnapshot, list[Attachment]]:
-    links = (
-        await session.scalars(
-            select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
-        )
-    ).all()
-    atts = (
-        await session.scalars(
-            select(Attachment).where(Attachment.submission_id == submission.id)
-        )
-    ).all()
-    image_statuses = [
-        AltTextStatus(a.alt_text_status) for a in atts if a.is_image
-    ]
+) -> tuple[SubmissionSnapshot, list[Attachment], list[SubmissionLink]]:
+    links = list(
+        (
+            await session.scalars(
+                select(SubmissionLink)
+                .where(SubmissionLink.submission_id == submission.id)
+                .order_by(SubmissionLink.order_index)
+            )
+        ).all()
+    )
+    atts = list(
+        (
+            await session.scalars(
+                select(Attachment).where(Attachment.submission_id == submission.id)
+            )
+        ).all()
+    )
+    has_uploaded_image = any(a.is_image for a in atts)
+    kind = _determine_kind(links, has_uploaded_image)
+    primary = _primary_link(links)
+    has_embed_image = bool(primary.resolved_image_path) if primary else False
+    image_statuses = [AltTextStatus(a.alt_text_status) for a in atts if a.is_image]
     snap = SubmissionSnapshot(
         has_canonical_link=len(links) > 0,
         image_alt_statuses=image_statuses,
         graphic_status=GraphicStatus(submission.graphic_status),
         graphic_classification_required=submission.graphic_classification_required,
+        needs_image=kind in ("images", "external"),
+        has_image=has_uploaded_image or has_embed_image,
     )
-    return snap, list(atts)
+    return snap, atts, links
 
 
 async def _has_open_request(session: AsyncSession, model, submission_id: int, **extra) -> bool:
@@ -220,23 +598,30 @@ async def recompute_and_request(
     session: AsyncSession,
     submission: Submission,
     *,
-    source_message: discord.Message,
+    destination: discord.abc.Messageable,
 ) -> SubmissionState:
-    """Re-evaluate state and post any still-missing requests (idempotently)."""
+    """Re-evaluate state and post any still-missing requests (idempotently).
+
+    All procedural messages go into ``destination`` (the submission's thread).
+    """
     old_state = submission.state
-    snap, atts = await _snapshot(session, submission)
+    snap, atts, links = await _snapshot(session, submission)
     new_state = evaluate_state(snap)
     submission.state = new_state.value
     gaps = set(missing_gaps(snap))
-    mention = source_message.author.mention
+    mention = f"<@{submission.author_id}>"
 
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
-        msg = await source_message.reply(
-            replies.source_request(mention), mention_author=True
-        )
+        msg = await destination.send(replies.source_request(mention))
         session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
+
+    if Gap.IMAGE in gaps and not await _has_open_request(
+        session, ImageRequest, submission.id
+    ):
+        msg = await destination.send(replies.image_request(mention))
+        session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
 
     if Gap.ALT_TEXT in gaps:
         for att in atts:
@@ -246,9 +631,7 @@ async def recompute_and_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
-            msg = await source_message.reply(
-                replies.alt_text_request(mention, att.filename), mention_author=True
-            )
+            msg = await destination.send(replies.alt_text_request(mention, att.filename))
             session.add(
                 AttachmentAltTextRequest(
                     submission_id=submission.id,
@@ -260,9 +643,13 @@ async def recompute_and_request(
     if Gap.GRAPHIC in gaps and not await _has_open_request(
         session, ContentLabelRequest, submission.id
     ):
-        msg = await source_message.reply(
-            replies.graphic_request(mention), mention_author=True
-        )
+        msg = await destination.send(replies.graphic_request(mention))
+        # Pre-seed the yes/no reactions so a curator just clicks one.
+        try:
+            await msg.add_reaction(GRAPHIC_YES_EMOJI)
+            await msg.add_reaction(GRAPHIC_NO_EMOJI)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not add graphic-vote reactions: %s", exc)
         session.add(
             ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
         )
@@ -271,10 +658,51 @@ async def recompute_and_request(
         new_state == SubmissionState.READY_TO_QUEUE
         and old_state != SubmissionState.READY_TO_QUEUE.value
     ):
-        await source_message.reply(replies.ready_confirmation(), mention_author=False)
+        await destination.send(replies.ready_confirmation())
+        # Separate verification-preview message (easy to remove later) projecting
+        # the submission onto the Bluesky post record it would become.
+        preview = await _build_post_preview(session, submission, atts, links)
+        await destination.send(replies.format_post_preview(preview))
         log.info("submission %s is ready_to_queue", submission.id)
 
     return new_state
+
+
+async def _build_post_preview(
+    session: AsyncSession,
+    submission: Submission,
+    atts: list[Attachment],
+    links: list[SubmissionLink],
+) -> replies.PostPreview:
+    board = await session.get(Board, submission.board_id)
+    nsfw = board.nsfw if board else False
+    has_uploaded_image = any(a.is_image for a in atts)
+    kind = _determine_kind(links, has_uploaded_image)
+    image_satisfied, image_source = _image_status(kind, atts, links)
+    primary = _primary_link(links)
+
+    labels: list[str] = []
+    if nsfw:
+        labels.append("sexual")  # board-level NSFW self-label
+    if submission.graphic_status == GraphicStatus.GRAPHIC.value:
+        labels.append("graphic-media")
+
+    return replies.PostPreview(
+        kind=kind,
+        title=primary.resolved_title if primary else None,
+        links=[(link.canonical_url, link.domain_family) for link in links],
+        images=[(a.filename, a.alt_text_body) for a in atts if a.is_image],
+        embed_title=primary.resolved_title if primary else None,
+        embed_description=primary.resolved_description if primary else None,
+        embed_has_thumb=bool(primary.resolved_image_path) if primary else False,
+        resolved_via=primary.resolved_via if primary else None,
+        labels=labels,
+        board_name=board.name if board else str(submission.board_id),
+        nsfw=nsfw,
+        graphic_status=submission.graphic_status,
+        image_satisfied=image_satisfied,
+        image_source=image_source,
+    )
 
 
 # --- human reply handling ---------------------------------------------------
@@ -298,6 +726,7 @@ async def handle_reply(
     *,
     settings: Settings,
     message: discord.Message,
+    http_client: httpx.AsyncClient,
 ) -> bool:
     """If ``message`` answers one of our open requests, apply it. Returns handled?"""
     ref = message.reference
@@ -305,20 +734,11 @@ async def handle_reply(
         return False
     bot_msg_id = ref.message_id
 
-    source_req = await session.scalar(
-        select(SourceRequest).where(SourceRequest.bot_message_id == bot_msg_id)
-    )
-    alt_req = await session.scalar(
-        select(AttachmentAltTextRequest).where(
-            AttachmentAltTextRequest.bot_message_id == bot_msg_id
-        )
-    )
-    graphic_req = await session.scalar(
-        select(ContentLabelRequest).where(
-            ContentLabelRequest.bot_message_id == bot_msg_id
-        )
-    )
-    req = source_req or alt_req or graphic_req
+    req = None
+    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest):
+        req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
+        if req is not None:
+            break
     if req is None:
         return False  # reply to something that isn't one of our prompts
 
@@ -332,14 +752,12 @@ async def handle_reply(
     if req.answered_at is not None:
         return True  # already satisfied; ignore duplicate
 
-    handled = await _apply_answer(session, req, submission, message)
+    handled = await _apply_answer(session, req, submission, message, settings, http_client)
     if not handled:
         return True  # we replied with a nudge; leave request open
 
-    # Re-evaluate against the original source message so follow-ups thread correctly.
-    source_message = await _fetch_source_message(message, submission)
-    if source_message is not None:
-        await recompute_and_request(session, submission, source_message=source_message)
+    # Replies arrive in the submission's thread, so post follow-ups right there.
+    await recompute_and_request(session, submission, destination=message.channel)
     return True
 
 
@@ -348,9 +766,22 @@ async def _apply_answer(
     req,
     submission: Submission,
     message: discord.Message,
+    settings: Settings,
+    http_client: httpx.AsyncClient,
 ) -> bool:
     """Apply a single reply. Returns False if the answer was unusable (nudged)."""
-    if isinstance(req, SourceRequest):
+    if isinstance(req, ImageRequest):
+        image_atts = [
+            a for a in message.attachments
+            if is_image_attachment(a.content_type, a.filename)
+        ]
+        if not image_atts:
+            await message.reply(replies.image_not_found(), mention_author=False)
+            return False
+        for att in image_atts:
+            await _ingest_attachment(session, submission, att, settings, http_client)
+
+    elif isinstance(req, SourceRequest):
         urls = extract_urls(message.content)
         if not urls:
             await message.reply(replies.source_not_found(), mention_author=False)
@@ -394,15 +825,3 @@ async def _apply_answer(
     req.answered_by = message.author.id
     req.answered_at = _now()
     return True
-
-
-async def _fetch_source_message(
-    reply_message: discord.Message, submission: Submission
-) -> discord.Message | None:
-    try:
-        return await reply_message.channel.fetch_message(
-            submission.source_discord_message_id
-        )
-    except (discord.NotFound, discord.HTTPException) as exc:
-        log.warning("could not fetch source message for submission %s: %s", submission.id, exc)
-        return None

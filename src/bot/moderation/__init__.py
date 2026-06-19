@@ -10,8 +10,20 @@ from __future__ import annotations
 
 from ..state import GraphicStatus
 
+# Graphic yes/no is answered by reacting to the bot's request message.
+GRAPHIC_YES_EMOJI = "✅"  # mark graphic
+GRAPHIC_NO_EMOJI = "❌"  # not graphic
+
 _YES = {"yes", "y", "true", "graphic", "gore", "1"}
 _NO = {"no", "n", "false", "notgraphic", "not-graphic", "sfw", "0"}
+
+
+def graphic_from_emoji(emoji: str) -> GraphicStatus | None:
+    if emoji == GRAPHIC_YES_EMOJI:
+        return GraphicStatus.GRAPHIC
+    if emoji == GRAPHIC_NO_EMOJI:
+        return GraphicStatus.NOT_GRAPHIC
+    return None
 
 
 def parse_graphic_answer(text: str) -> GraphicStatus | None:

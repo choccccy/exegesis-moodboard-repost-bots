@@ -27,6 +27,12 @@ def submission_dir(attachments_dir: str, board_id: int, submission_id: int) -> s
     return path
 
 
+def remove_submission_dir(attachments_dir: str, board_id: int, submission_id: int) -> None:
+    """Delete a submission's downloaded attachments (used when a 🦋 is removed)."""
+    path = os.path.join(attachments_dir, str(board_id), str(submission_id))
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _safe_filename(name: str) -> str:
     base = os.path.basename(name) or "attachment"
     return "".join(ch for ch in base if ch.isalnum() or ch in "._- ").strip() or "attachment"

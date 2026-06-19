@@ -15,5 +15,5 @@ services:
     # The bot is a long-running gateway client; no ports are exposed.
 
 volumes:
-  # Named volume holds db/, attachments/ and logs/ — survives container rebuilds.
+  # Named volume holds db/, attachments/ and logs/ - survives container rebuilds.
   bot-data:

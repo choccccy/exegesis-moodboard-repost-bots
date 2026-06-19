@@ -21,6 +21,9 @@ class BoardConfig(BaseModel):
     discord_channel_id: int
     nsfw: bool = False
     curator_role_ids: list[int] = Field(default_factory=list)
+    # When true, every submission must get an explicit graphic yes/no before it
+    # can become ready_to_queue. Set false per board to skip the graphic prompt.
+    require_graphic_classification: bool = True
 
 
 class Settings(BaseSettings):
@@ -42,6 +45,14 @@ class Settings(BaseSettings):
     )
     storage_min_free_mb: int = Field(500, alias="STORAGE_MIN_FREE_MB")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
+
+    # Startup catch-up: reconcile 🦋 reactions added while the bot was offline.
+    # Discord has no "reactions since X" API, so we scan recent history per
+    # channel and ingest any message currently bearing the trigger. Bounded by
+    # both a time window and a per-channel message cap to keep API use sane.
+    catchup_enabled: bool = Field(True, alias="CATCHUP_ENABLED")
+    catchup_lookback_hours: int = Field(168, alias="CATCHUP_LOOKBACK_HOURS")
+    catchup_max_messages: int = Field(500, alias="CATCHUP_MAX_MESSAGES")
 
     @field_validator("boards_json")
     @classmethod

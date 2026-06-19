@@ -55,14 +55,22 @@ class Submission(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     board_id: Mapped[int] = mapped_column(ForeignKey("boards.id"), index=True)
     source_discord_message_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    # The channel/thread where the bot posts its procedural request replies.
+    # The parent channel the source message lives in (used for board resolution).
     channel_id: Mapped[int] = mapped_column(BigInteger)
+    # The per-submission Discord thread where the bot runs the procedural Q&A.
+    thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     author_id: Mapped[int] = mapped_column(BigInteger)
     author_display: Mapped[str] = mapped_column(String(200), default="")
 
     state: Mapped[str] = mapped_column(String(40), default=SubmissionState.INTENT_SUBMITTED.value)
     graphic_status: Mapped[str] = mapped_column(String(20), default=GraphicStatus.UNKNOWN.value)
     graphic_classification_required: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Captured from the Discord-generated link embed at ingest. Feeds the
+    # external-embed preview and the at-least-one-image check (thumb).
+    embed_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embed_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embed_thumb_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -85,6 +93,9 @@ class Submission(Base):
     content_label_requests: Mapped[list["ContentLabelRequest"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
+    image_requests: Mapped[list["ImageRequest"]] = relationship(
+        back_populates="submission", cascade="all, delete-orphan"
+    )
 
 
 class SubmissionLink(Base):
@@ -96,6 +107,14 @@ class SubmissionLink(Base):
     raw_url: Mapped[str] = mapped_column(Text)
     canonical_url: Mapped[str] = mapped_column(Text)
     domain_family: Mapped[str] = mapped_column(String(40))
+
+    # Metadata resolved from the source (oembed / opengraph / html / discord / none).
+    resolved_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Local path of the downloaded thumbnail bytes (the future Bluesky blob).
+    resolved_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_via: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     submission: Mapped["Submission"] = relationship(back_populates="links")
 
@@ -156,6 +175,35 @@ class ContentLabelRequest(_RequestMixin, Base):
 
     submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
     submission: Mapped["Submission"] = relationship(back_populates="content_label_requests")
+
+
+class ImageRequest(_RequestMixin, Base):
+    __tablename__ = "image_requests"
+
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    submission: Mapped["Submission"] = relationship(back_populates="image_requests")
+
+
+class SubmissionThread(Base):
+    """Durable map from a source message to its private Discord thread.
+
+    Outlives the Submission (not cascade-deleted) so that removing + re-adding the
+    🦋 reuses the same private thread instead of spawning a new one and re-pinging
+    curators.
+    """
+
+    __tablename__ = "submission_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "board_id", "source_discord_message_id", name="uq_submission_thread_source"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    board_id: Mapped[int] = mapped_column(ForeignKey("boards.id"), index=True)
+    source_discord_message_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    thread_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class Curator(Base):

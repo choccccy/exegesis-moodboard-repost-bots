@@ -9,6 +9,7 @@ from .store import (
     StorageFullError,
     download_attachment,
     has_free_space,
+    remove_submission_dir,
     submission_dir,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "StorageFullError",
     "download_attachment",
     "has_free_space",
+    "remove_submission_dir",
     "submission_dir",
 ]

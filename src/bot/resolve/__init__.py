@@ -1,23 +1,12 @@
-"""Metadata resolution (STUB — Milestone 4).
+"""Source metadata resolution.
 
-The full plan defines a tiered fetch strategy: canonical fetch -> official
-oEmbed/API -> fetch-helper mirrors -> limited scraping -> human fallback. None of
-that is implemented in Milestone 1. This interface exists so the publisher layer
-(M2+) has a stable seam to call into. For now it echoes the canonical URL back.
+Tiered strategy (per the plan): official oEmbed where available -> OpenGraph /
+Twitter-card / <title> parse of the canonical page -> Discord-embed fallback ->
+give up (none). The posted URL always stays canonical regardless of which tier
+produced the metadata. Bluesky links are skipped here (resolved natively at
+publish time). Mirrors/scraping/auth remain extension points for later.
 """
 
-from __future__ import annotations
+from .fetch import ResolvedMetadata, resolve
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class ResolvedMetadata:
-    canonical_url: str
-    title: str | None = None
-    description: str | None = None
-
-
-async def resolve(canonical_url: str) -> ResolvedMetadata:
-    # M1: no network fetch. Returns the canonical URL unchanged.
-    return ResolvedMetadata(canonical_url=canonical_url)
+__all__ = ["ResolvedMetadata", "resolve"]
