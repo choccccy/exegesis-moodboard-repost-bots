@@ -23,6 +23,7 @@ services:
       CATCHUP_ENABLED:
       CATCHUP_LOOKBACK_HOURS:
       CATCHUP_MAX_MESSAGES:
+      YOUTUBE_API_KEY:
       # Container-internal paths.
       DATA_DIR: /data
       DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db

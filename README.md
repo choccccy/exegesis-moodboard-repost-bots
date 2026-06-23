@@ -14,18 +14,20 @@ while always preserving the canonical source URL and image alt text.
 1. Someone posts a link and/or image attachments in a watched channel.
 2. Someone reacts with 🦋 → the bot creates a `submission` and opens a **private thread**
    off that message where all the procedural Q&A happens (keeps the main channel clean).
+   Configured curator users (`curator_user_ids`) are pinged and added to the thread.
+   15 minutes after a submission is queued, all human members are removed from the thread
+   to keep the sidebar tidy.
 3. The bot parses + canonicalizes URLs (strips trackers, normalizes known mirrors back to
    their canonical domains), downloads attachments to `/data/attachments/...`, and reuses
    Discord alt text when present.
 4. For anything missing, the bot posts one request per gap in the thread:
-   - `reply with the source URL` — when no link was found in the original message
-   - `couldn't get metadata from X — reply with a more embeddable link, or react 🔗 to use as-is`
-   - `this link has no preview image — reply attaching an image to use`
+   - `reply with the source URL` - when no link was found in the original message
+   - `couldn't get metadata from X - reply with a more embeddable link, or react 🔗 to use as-is`
+   - `this link has no preview image - reply attaching an image to use`
    - `reply with the alt text for <file>`
    - `react 🩸 / ✅ to classify graphic content`
-5. The original poster **or any curator-role user** replies/reacts; the bot records the answer
-   and re-evaluates. When all requirements are met it posts a verification preview of the
-   prospective Bluesky post, then queues it for scheduled posting.
+5. A curator replies/reacts; the bot records the answer and re-evaluates. When all
+   requirements are met it queues the submission for scheduled posting.
 6. Posts fire hourly from noon Mountain Time — up to 6/day when fresh content exists,
    3/day when working through backlog. Freshness is based on the original Discord post time.
 7. For Bluesky posts the bot reposts natively; for everything else it creates an external-link
@@ -94,6 +96,7 @@ Key fields to fill in:
     "discord_channel_id": 987654321,
     "nsfw": false,
     "curator_role_ids": [111222333],
+    "curator_user_ids": [184475973356355584],
     "bluesky_handle": "my-board.bsky.social",
     "tags": ["my-board"]
   }
@@ -266,11 +269,12 @@ Commit the generated file in `migrations/versions/` and the next deploy applies 
 ## Dashboard
 
 A read-only observability dashboard at **https://dashboard.exegesis.space** shows:
-- Per-board queue depth, today's post count vs cap, and time of last publish
+- Per-board queue depth, today's post count vs daily cap, fresh/backlog mode, and time of last publish
 - Last 30 publishes across all boards
-- Any submissions currently in a failed state
+- Pending submissions still awaiting curator input, with links to their Discord threads
+- Recent bot errors with expandable tracebacks
 
-It auto-refreshes every 2 minutes. No login required.
+It auto-refreshes every 2 minutes. Timestamps are in Mountain Time. No login required.
 
 To run locally (useful for testing queries against a local DB):
 ```bash

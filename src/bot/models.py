@@ -258,6 +258,21 @@ class Curator(Base):
     board: Mapped["Board"] = relationship(back_populates="curators")
 
 
+class CancellationRequest(Base):
+    """Tracks the per-thread ❌ cancel button message.
+
+    One row per submission; the bot message is pre-seeded with ❌. If the OP or
+    a curator reacts ❌, the submission is deleted (same effect as removing 🦋).
+    """
+
+    __tablename__ = "cancellation_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), unique=True, index=True)
+    bot_message_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    prompted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class BotError(Base):
     """Persistent log of unhandled exceptions in background tasks."""
 

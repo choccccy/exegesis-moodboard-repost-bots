@@ -7,15 +7,16 @@ from dataclasses import dataclass, field
 from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
 
 METADATA_CONFIRM_EMOJI = "🔗"
+CANCEL_EMOJI = "❌"
 
 
-def source_request(mention: str) -> str:
-    return f"{mention} reply to this message with the source URL"
+def source_request() -> str:
+    return "reply to this message with the source URL"
 
 
-def image_request(mention: str) -> str:
+def image_request() -> str:
     return (
-        f"{mention} this link has no preview image, so the post would have no image. "
+        "this link has no preview image, so the post would have no image. "
         "reply to this message attaching an image to use"
     )
 
@@ -24,13 +25,13 @@ def image_not_found() -> str:
     return "no image attached - reply again attaching at least one image"
 
 
-def alt_text_request(mention: str, filename: str) -> str:
-    return f"{mention} reply to this message with the alt text for **{filename}**"
+def alt_text_request(filename: str) -> str:
+    return f"reply to this message with the alt text for **{filename}**"
 
 
-def graphic_request(mention: str) -> str:
+def graphic_request() -> str:
     return (
-        f"{mention} react {GRAPHIC_YES_EMOJI} if this contains graphic/gore content, "
+        f"react {GRAPHIC_YES_EMOJI} if this contains graphic/gore content, "
         f"{GRAPHIC_NO_EMOJI} if it's safe"
     )
 
@@ -39,9 +40,9 @@ def ready_confirmation() -> str:
     return "✓ all required info received - this submission is ready to queue"
 
 
-def metadata_request(mention: str, url: str) -> str:
+def metadata_request(url: str) -> str:
     return (
-        f"{mention} couldn't get any metadata from **{url}** - reply with a more embeddable "
+        f"couldn't get any metadata from **{url}** - reply with a more embeddable "
         f"link, or react {METADATA_CONFIRM_EMOJI} to use it as-is (at least one image will be required)"
     )
 
@@ -85,8 +86,11 @@ def reposted_notice(bsky_url: str) -> str:
     return f"reposted to Bluesky: {bsky_url}"
 
 
-def queued_notice() -> str:
-    return "queued - will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
+def queued_notice(dashboard_url: str | None = None) -> str:
+    msg = "queued - will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
+    if dashboard_url:
+        msg += f"\n{dashboard_url}"
+    return msg
 
 
 def publish_failed_notice(error: str | None) -> str:
@@ -108,12 +112,20 @@ def thread_name(submission_id: int) -> str:
     return f"🦋 submission {submission_id}"
 
 
-def thread_anchor(*, author_display: str, curator_user_mentions: list[str]) -> str:
-    """Top-of-thread message. Only configured curator users are pinged."""
-    parts = [f"🦋 new submission from {author_display}"]
+def thread_anchor(*, author_mention: str, curator_user_mentions: list[str]) -> str:
+    """Top-of-thread message. Pings the OP (adds them to the thread) and curator users."""
+    parts = [f"🦋 new submission from {author_mention}"]
     if curator_user_mentions:
         parts.append(" ".join(curator_user_mentions))
     return "\n".join(parts)
+
+
+def cancel_request() -> str:
+    return f"react {CANCEL_EMOJI} to cancel this submission and remove it from the queue"
+
+
+def source_cancel_confirmation(user_id: int) -> str:
+    return f"<@{user_id}> cancelled this submission via ❌ on the source post - removed from queue"
 
 
 # Human labels + atproto $type per embed mode.

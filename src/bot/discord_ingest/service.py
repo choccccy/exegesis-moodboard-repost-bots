@@ -31,6 +31,7 @@ from ..models import (
     AttachmentAltTextRequest,
     Attachment,
     Board,
+    CancellationRequest,
     ContentLabelRequest,
     ImageRequest,
     MetadataRequest,
@@ -126,11 +127,19 @@ async def handle_reaction(
     settings: Settings,
     message: discord.Message,
     http_client: httpx.AsyncClient,
+    member: discord.Member | None = None,
+    user_id: int = 0,
+    skip_auth: bool = False,
 ) -> None:
     """Entry point for a 🦋 reaction on a watched channel message."""
     board = await _board_for_channel(session, message.channel.id)
     if board is None:
         return  # not a watched channel
+
+    if not skip_auth:
+        board_cfg = settings.board_for_channel(message.channel.id)
+        if not _is_curator(member, user_id, board_cfg):
+            return
 
     submission = await session.scalar(
         select(Submission).where(
@@ -238,7 +247,7 @@ async def _post_thread_anchor(
     cfg = settings.board_for_channel(submission.channel_id)
     curator_user_ids = cfg.curator_user_ids if cfg else []
     text = replies.thread_anchor(
-        author_display=submission.author_display or str(submission.author_id),
+        author_mention=f"<@{submission.author_id}>",
         curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
     )
     try:
@@ -312,8 +321,12 @@ async def handle_reaction_removed(
     channel: discord.abc.Messageable,
     channel_id: int,
     message_id: int,
+    user_id: int,
 ) -> None:
     """A 🦋 was removed: delete the prospective post so a re-react starts fresh.
+
+    Only curators (by role or explicit user ID) may trigger deletion this way.
+    The OP can cancel via the ❌ button in the thread instead.
 
     Deletes the submission, its links/attachments/requests, and the downloaded
     files, then posts a short notice. Re-adding 🦋 re-runs ingest via
@@ -322,6 +335,9 @@ async def handle_reaction_removed(
     board = await _board_for_channel(session, channel_id)
     if board is None:
         return
+    board_cfg = settings.board_for_channel(channel_id)
+    if not await _curator_authorized(channel, user_id, board_cfg):
+        return  # only curators can cancel via butterfly removal; OP uses the ❌ button
     submission = await session.scalar(
         select(Submission).where(
             Submission.board_id == board.id,
@@ -361,6 +377,7 @@ async def handle_reaction_removed(
         ContentLabelRequest,
         ImageRequest,
         MetadataRequest,
+        CancellationRequest,
         PublishAttempt,
         SubmissionLink,
         Attachment,
@@ -445,6 +462,22 @@ async def handle_metadata_reaction(
     await recompute_and_request(session, submission, settings=settings, destination=channel)
 
 
+def _is_curator(
+    member: discord.Member | None,
+    user_id: int,
+    board_cfg: BoardConfig | None,
+) -> bool:
+    """True if user_id is an explicit curator user or holds a curator role."""
+    if board_cfg is None:
+        return False
+    if user_id in board_cfg.curator_user_ids:
+        return True
+    if member is None:
+        return False
+    role_ids = {r.id for r in member.roles}
+    return any(rid in role_ids for rid in board_cfg.curator_role_ids)
+
+
 def _reaction_authorized(
     member: discord.Member | None,
     user_id: int,
@@ -453,10 +486,149 @@ def _reaction_authorized(
 ) -> bool:
     if user_id == submission.author_id:
         return True
-    if member is None or board_cfg is None:
+    return _is_curator(member, user_id, board_cfg)
+
+
+async def _curator_authorized(
+    channel: discord.abc.Messageable,
+    user_id: int,
+    board_cfg: BoardConfig | None,
+) -> bool:
+    """Check curator status for contexts where member object is unavailable (reaction remove)."""
+    if board_cfg is None:
+        return False
+    if user_id in board_cfg.curator_user_ids:
+        return True
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return False
+    try:
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+    except (discord.NotFound, discord.HTTPException):
         return False
     role_ids = {r.id for r in member.roles}
     return any(rid in role_ids for rid in board_cfg.curator_role_ids)
+
+
+async def handle_cancel_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    member: discord.Member | None,
+    user_id: int,
+) -> None:
+    """❌ was reacted on a cancel-request message: delete the submission if authorized."""
+    req = await session.scalar(
+        select(CancellationRequest).where(CancellationRequest.bot_message_id == message_id)
+    )
+    if req is None:
+        return
+
+    submission = await session.get(Submission, req.submission_id)
+    if submission is None:
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    if not _reaction_authorized(member, user_id, submission, board_cfg):
+        return
+
+    if submission.state == SubmissionState.PUBLISHED.value:
+        thread = await _resolve_thread_by_id(channel, submission.thread_id) if submission.thread_id else None
+        if thread is not None:
+            attempt = await session.scalar(
+                select(PublishAttempt)
+                .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
+                .order_by(PublishAttempt.attempted_at.desc())
+            )
+            bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
+            await thread.send(replies.cannot_remove_published(bsky_url))
+        return
+
+    sub_id = submission.id
+    thread_id = submission.thread_id
+    board = await session.get(Board, submission.board_id)
+    remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+    for model in (
+        SourceRequest,
+        AttachmentAltTextRequest,
+        ContentLabelRequest,
+        ImageRequest,
+        MetadataRequest,
+        CancellationRequest,
+        PublishAttempt,
+        SubmissionLink,
+        Attachment,
+    ):
+        await session.execute(delete(model).where(model.submission_id == sub_id))
+    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    log.info("deleted submission %s after ❌ cancel by user %s", sub_id, user_id)
+
+    thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
+    if thread is not None:
+        await thread.send(replies.reaction_removed())
+
+
+async def handle_source_cancel_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    member: discord.Member | None,
+    user_id: int,
+) -> int | None:
+    """❌ reacted on the original source post: cancel the submission if OP or curator.
+
+    Returns the thread_id to send a confirmation message to, or None if the
+    reaction should be ignored (not a submission, not authorized, already published).
+    """
+    board = await _board_for_channel(session, channel.id)
+    if board is None:
+        return None
+    board_cfg = settings.board_for_channel(channel.id)
+
+    submission = await session.scalar(
+        select(Submission).where(
+            Submission.board_id == board.id,
+            Submission.source_discord_message_id == message_id,
+        )
+    )
+    if submission is None:
+        return None
+
+    if submission.state == SubmissionState.PUBLISHED.value:
+        return None
+
+    is_op = user_id == submission.author_id
+    is_explicit_curator = board_cfg is not None and user_id in board_cfg.curator_user_ids
+    is_role_curator = (
+        member is not None
+        and board_cfg is not None
+        and any(r.id in board_cfg.curator_role_ids for r in member.roles)
+    )
+    if not (is_op or is_explicit_curator or is_role_curator):
+        return None
+
+    sub_id = submission.id
+    thread_id = submission.thread_id
+    remove_submission_dir(settings.attachments_dir, board.id, sub_id)
+    for model in (
+        SourceRequest,
+        AttachmentAltTextRequest,
+        ContentLabelRequest,
+        ImageRequest,
+        MetadataRequest,
+        CancellationRequest,
+        PublishAttempt,
+        SubmissionLink,
+        Attachment,
+    ):
+        await session.execute(delete(model).where(model.submission_id == sub_id))
+    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
+    return thread_id
 
 
 async def _resolve_thread_by_id(
@@ -547,6 +719,7 @@ async def _resolve_links(
             fallback_title=submission.embed_title if is_primary else None,
             fallback_description=submission.embed_description if is_primary else None,
             fallback_image_url=submission.embed_thumb_url if is_primary else None,
+            youtube_api_key=settings.youtube_api_key,
         )
         link.resolved_title = meta.title
         link.resolved_description = meta.description
@@ -788,17 +961,31 @@ async def recompute_and_request(
     snap, atts, links = await _snapshot(session, submission)
     new_state = evaluate_state(snap)
     gaps = set(missing_gaps(snap))
-    mention = f"<@{submission.author_id}>"
-
     # Don't overwrite state for submissions already past READY_TO_QUEUE — evaluate_state
     # is content-based and would otherwise downgrade QUEUED/PUBLISHED back to ready_to_queue.
     if old_state not in _QUEUE_TERMINAL:
         submission.state = new_state.value
 
+    # Cancel button: posted once, before any other requests. OP and curators can react ❌.
+    has_cancel = await session.scalar(
+        select(CancellationRequest.id).where(CancellationRequest.submission_id == submission.id)
+    ) is not None
+    if not has_cancel:
+        try:
+            msg = await destination.send(replies.cancel_request())
+            await msg.add_reaction(replies.CANCEL_EMOJI)
+            session.add(CancellationRequest(
+                submission_id=submission.id,
+                bot_message_id=msg.id,
+                prompted_at=_now(),
+            ))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post cancel request for submission %s: %s", submission.id, exc)
+
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
-        msg = await destination.send(replies.source_request(mention))
+        msg = await destination.send(replies.source_request())
         session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
 
     if Gap.METADATA in gaps and not await _has_open_request(
@@ -806,7 +993,7 @@ async def recompute_and_request(
     ):
         primary = _primary_link(links)
         url = primary.canonical_url if primary else "?"
-        msg = await destination.send(replies.metadata_request(mention, url))
+        msg = await destination.send(replies.metadata_request(url))
         try:
             await msg.add_reaction(replies.METADATA_CONFIRM_EMOJI)
         except (discord.Forbidden, discord.HTTPException) as exc:
@@ -817,7 +1004,7 @@ async def recompute_and_request(
     if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
         session, ImageRequest, submission.id
     ):
-        msg = await destination.send(replies.image_request(mention))
+        msg = await destination.send(replies.image_request())
         session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
 
     if Gap.ALT_TEXT in gaps:
@@ -830,10 +1017,10 @@ async def recompute_and_request(
                 continue
             if att.local_path:
                 file = _discord_file_for_attachment(att.local_path, att.filename)
-                msg = await destination.send(replies.alt_text_request(mention, att.filename), file=file)
+                msg = await destination.send(replies.alt_text_request(att.filename), file=file)
             else:
                 msg = await destination.send(
-                    replies.alt_text_request(mention, att.filename) + f"\n{att.discord_url}"
+                    replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                 )
             session.add(
                 AttachmentAltTextRequest(
@@ -846,7 +1033,7 @@ async def recompute_and_request(
     if Gap.GRAPHIC in gaps and not await _has_open_request(
         session, ContentLabelRequest, submission.id
     ):
-        msg = await destination.send(replies.graphic_request(mention))
+        msg = await destination.send(replies.graphic_request())
         # Pre-seed the yes/no reactions so a curator just clicks one.
         try:
             await msg.add_reaction(GRAPHIC_YES_EMOJI)
@@ -863,7 +1050,12 @@ async def recompute_and_request(
             await destination.send(replies.ready_confirmation())
             preview = await _build_post_preview(session, submission, atts, links)
             await destination.send(replies.format_post_preview(preview))
-            await destination.send(replies.queued_notice())
+            _board_cfg = settings.board_for_channel(submission.channel_id)
+            queue_url = (
+                f"https://dashboard.exegesis.space/boards/{_board_cfg.name}"
+                if _board_cfg else None
+            )
+            await destination.send(replies.queued_notice(queue_url))
         submission.state = SubmissionState.QUEUED.value
         log.info("submission %s queued", submission.id)
         if isinstance(destination, discord.Thread):

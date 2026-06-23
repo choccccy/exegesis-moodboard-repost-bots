@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     bsky_app_password_doohickey_posting: str | None = Field(None, alias="BSKY_APP_PASSWORD_DOOHICKEY_POSTING")
     bsky_app_password_nerd_tv: str | None = Field(None, alias="BSKY_APP_PASSWORD_NERD_TV")
 
+    # Optional YouTube Data API v3 key (no OAuth - read-only metadata only).
+    # Without this, YouTube video metadata falls back to scraping, which fails
+    # from datacenter IPs because YouTube serves JS-only pages to bot UAs.
+    youtube_api_key: str | None = Field(None, alias="YOUTUBE_API_KEY")
+
     @field_validator("boards_json")
     @classmethod
     def _validate_boards_json(cls, value: str) -> str:

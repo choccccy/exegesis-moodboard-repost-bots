@@ -87,10 +87,57 @@ def parse_html_metadata(html: str, base_url: str) -> ResolvedMetadata:
     return ResolvedMetadata(title=title, description=description, image_url=image, via=via)
 
 
+def _youtube_video_id(url: str) -> str | None:
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    if parsed.netloc == "youtu.be":
+        return parsed.path.lstrip("/").split("/")[0] or None
+    if parsed.netloc in ("www.youtube.com", "youtube.com"):
+        return parse_qs(parsed.query).get("v", [None])[0]
+    return None
+
+
+async def _youtube_api(url: str, client: httpx.AsyncClient, api_key: str) -> ResolvedMetadata | None:
+    """Fetch YouTube video metadata via the Data API v3 (1 quota unit per call).
+
+    Works from datacenter IPs where scraping returns a JS-only shell page.
+    Falls back gracefully to None if the video ID can't be extracted or the
+    API returns an error (e.g. the key is invalid or quota is exhausted).
+    """
+    video_id = _youtube_video_id(url)
+    if not video_id:
+        return None
+    endpoint = (
+        f"https://www.googleapis.com/youtube/v3/videos"
+        f"?id={video_id}&part=snippet&key={api_key}"
+    )
+    resp = await client.get(endpoint, timeout=_FETCH_TIMEOUT)
+    if resp.status_code != 200:
+        log.info("youtube data api returned %d for %s", resp.status_code, url)
+        return None
+    items = resp.json().get("items", [])
+    if not items:
+        return None
+    snippet = items[0].get("snippet", {})
+    thumbs = snippet.get("thumbnails", {})
+    thumb = (
+        thumbs.get("maxres") or thumbs.get("standard")
+        or thumbs.get("high") or thumbs.get("medium")
+        or thumbs.get("default") or {}
+    )
+    return ResolvedMetadata(
+        title=snippet.get("title"),
+        description=snippet.get("channelTitle"),
+        image_url=thumb.get("url"),
+        via="oembed",
+    )
+
+
 async def _youtube_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
     endpoint = f"https://www.youtube.com/oembed?format=json&url={quote(url, safe='')}"
     resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
     if resp.status_code != 200:
+        log.info("youtube oembed returned %d for %s", resp.status_code, url)
         return None
     data = resp.json()
     return ResolvedMetadata(
@@ -149,6 +196,21 @@ def _deviantart_mirror_url(url: str) -> str:
     return url.replace("https://www.deviantart.com", "https://fixdeviantart.com", 1)
 
 
+def _youtube_watch_url(url: str) -> str:
+    """Convert youtu.be/ID short URLs to youtube.com/watch?v=ID.
+
+    YouTube's watch pages serve proper OG tags; the short URL form often returns
+    a minimal redirect page with no OG metadata when fetched by a bot UA.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.netloc == "youtu.be":
+        video_id = parsed.path.lstrip("/")
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
 _OEMBED_HANDLERS = {
     "youtube": _youtube_oembed,
     "deviantart": _deviantart_oembed,
@@ -160,6 +222,7 @@ _MIRROR_URL_FUNCS = {
     "reddit": _reddit_mirror_url,
     "instagram": _instagram_mirror_url,
     "deviantart": _deviantart_mirror_url,
+    "youtube": _youtube_watch_url,
 }
 
 
@@ -182,6 +245,7 @@ async def resolve(
     fallback_title: str | None = None,
     fallback_description: str | None = None,
     fallback_image_url: str | None = None,
+    youtube_api_key: str | None = None,
 ) -> ResolvedMetadata:
     """Resolve metadata for one canonical link, with Discord-embed fallback.
 
@@ -192,21 +256,32 @@ async def resolve(
         return ResolvedMetadata(via="skipped")
 
     meta: ResolvedMetadata | None = None
-    try:
-        # 1. Try oEmbed if available for this family.
-        if family in _OEMBED_HANDLERS:
+    # 0. YouTube Data API v3 - preferred over scraping; works from datacenter IPs.
+    if family == "youtube" and youtube_api_key:
+        try:
+            meta = await _youtube_api(url, client, youtube_api_key)
+        except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
+            log.info("youtube api fetch failed for %s: %s", url, exc)
+    # 1. Try oEmbed if available for this family.
+    if meta is None and family in _OEMBED_HANDLERS:
+        try:
             meta = await _OEMBED_HANDLERS[family](url, client)
-        # 2. Try mirror URL for OpenGraph (better than canonical for blocked platforms).
-        if meta is None and family in _MIRROR_URL_FUNCS:
-            mirror = _MIRROR_URL_FUNCS[family](url)
-            if mirror != url:
+        except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
+            log.info("oembed fetch failed for %s: %s", url, exc)
+    # 2. Try mirror URL for OpenGraph (better than canonical for blocked platforms).
+    if meta is None and family in _MIRROR_URL_FUNCS:
+        mirror = _MIRROR_URL_FUNCS[family](url)
+        if mirror != url:
+            try:
                 meta = await _fetch_opengraph(mirror, client)
-        # 3. Fall back to fetching canonical URL directly.
-        if meta is None:
+            except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
+                log.info("mirror opengraph fetch failed for %s: %s", mirror, exc)
+    # 3. Fall back to fetching canonical URL directly.
+    if meta is None:
+        try:
             meta = await _fetch_opengraph(url, client)
-    except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
-        log.info("metadata resolve failed for %s: %s", url, exc)
-        meta = None
+        except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
+            log.info("opengraph fetch failed for %s: %s", url, exc)
 
     meta = meta or ResolvedMetadata(via="none")
     fetched_anything = bool(meta.title or meta.image_url)

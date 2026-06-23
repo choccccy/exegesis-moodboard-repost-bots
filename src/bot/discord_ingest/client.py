@@ -17,8 +17,24 @@ from ..models import Submission, SubmissionThread
 from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
 from . import replies, service
+from .replies import CANCEL_EMOJI
 
 log = logging.getLogger(__name__)
+
+# Minimum gap between handle_reaction calls during catchup, to avoid hitting
+# Discord's per-guild thread-creation rate limit (observed: ~5-min freeze after
+# creating 19 threads in rapid succession).
+_CATCHUP_INTER_MESSAGE_DELAY = 2.0  # seconds
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Done-callback: surface silent asyncio task exceptions in the log."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("background task %s raised an unhandled exception", task.get_name())
 
 
 def _build_intents() -> discord.Intents:
@@ -62,7 +78,8 @@ class RepostBot(discord.Client):
         # on_ready can fire again on reconnect; only run the catch-up scan once.
         if self.settings.catchup_enabled and not self._catchup_started:
             self._catchup_started = True
-            asyncio.create_task(self._run_catchup())
+            task = asyncio.create_task(self._run_catchup())
+            task.add_done_callback(_log_task_exception)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == getattr(self.user, "id", None):
@@ -77,7 +94,8 @@ class RepostBot(discord.Client):
                 return
             async with session_scope() as session:
                 await service.handle_reaction(
-                    session, settings=self.settings, message=message, http_client=self.httpx_client
+                    session, settings=self.settings, message=message, http_client=self.httpx_client,
+                    member=payload.member, user_id=payload.user_id,
                 )
             return
 
@@ -112,6 +130,38 @@ class RepostBot(discord.Client):
                     user_id=payload.user_id,
                 )
 
+        if emoji == CANCEL_EMOJI:
+            channel = await self._resolve_channel(payload.channel_id)
+            if channel is None:
+                return
+            if payload.channel_id in self._watched_channels:
+                # ❌ on the original source post - OP or curator can cancel
+                thread_id = None
+                async with session_scope() as session:
+                    thread_id = await service.handle_source_cancel_reaction(
+                        session,
+                        settings=self.settings,
+                        channel=channel,
+                        message_id=payload.message_id,
+                        member=payload.member,
+                        user_id=payload.user_id,
+                    )
+                if thread_id is not None:
+                    thread = await self._resolve_channel(thread_id)
+                    if thread is not None:
+                        await thread.send(replies.source_cancel_confirmation(payload.user_id))
+            else:
+                # ❌ on the bot's cancel-request message inside a thread
+                async with session_scope() as session:
+                    await service.handle_cancel_reaction(
+                        session,
+                        settings=self.settings,
+                        channel=channel,
+                        message_id=payload.message_id,
+                        member=payload.member,
+                        user_id=payload.user_id,
+                    )
+
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         if str(payload.emoji) != self.settings.trigger_emoji:
             return
@@ -127,6 +177,7 @@ class RepostBot(discord.Client):
                 channel=channel,
                 channel_id=payload.channel_id,
                 message_id=payload.message_id,
+                user_id=payload.user_id,
             )
 
     async def on_message(self, message: discord.Message) -> None:
@@ -208,8 +259,10 @@ class RepostBot(discord.Client):
                             settings=self.settings,
                             message=message,
                             http_client=self.httpx_client,
+                            skip_auth=True,
                         )
                     total += 1
+                    await asyncio.sleep(_CATCHUP_INTER_MESSAGE_DELAY)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("catch-up scan failed for channel %s: %s", channel_id, exc)
                 continue
@@ -246,7 +299,7 @@ class RepostBot(discord.Client):
 
         async with session_scope() as session:
             rows = await session.execute(
-                select(SubmissionThread.thread_id)
+                select(SubmissionThread.thread_id, Submission.id.label("submission_id"))
                 .join(
                     Submission,
                     (Submission.board_id == SubmissionThread.board_id)
@@ -254,12 +307,12 @@ class RepostBot(discord.Client):
                 )
                 .where(Submission.state.in_(_PENDING_STATES))
             )
-            thread_ids = [r.thread_id for r in rows]
+            pending = [(r.thread_id, r.submission_id) for r in rows]
 
-        log.info("thread catch-up scan: %d pending thread(s)", len(thread_ids))
+        log.info("thread catch-up scan: %d pending thread(s)", len(pending))
         replayed = 0
 
-        for thread_id in thread_ids:
+        for thread_id, submission_id in pending:
             thread = await self._resolve_channel(thread_id)
             if thread is None:
                 continue
@@ -299,6 +352,20 @@ class RepostBot(discord.Client):
                                             user_id=user.id,
                                         )
                                     replayed += 1
+                            elif emoji == CANCEL_EMOJI:
+                                async for user in reaction.users():
+                                    if user.id == bot_id:
+                                        continue
+                                    async with session_scope() as session:
+                                        await service.handle_cancel_reaction(
+                                            session,
+                                            settings=self.settings,
+                                            channel=thread,
+                                            message_id=message.id,
+                                            member=None,
+                                            user_id=user.id,
+                                        )
+                                    replayed += 1
                     elif message.reference is not None:
                         # Replay human replies (alt text, source, etc.).
                         async with session_scope() as session:
@@ -311,5 +378,17 @@ class RepostBot(discord.Client):
                         replayed += 1
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("thread catch-up failed for thread %s: %s", thread_id, exc)
+                continue
+
+            # Ensure all missing request messages (including the cancel button) are present.
+            try:
+                async with session_scope() as session:
+                    submission = await session.get(Submission, submission_id)
+                    if submission is not None:
+                        await service.recompute_and_request(
+                            session, submission, settings=self.settings, destination=thread
+                        )
+            except Exception:
+                log.exception("recompute_and_request failed for submission %s in thread %s", submission_id, thread_id)
 
         log.info("thread catch-up scan complete: replayed %d event(s)", replayed)
