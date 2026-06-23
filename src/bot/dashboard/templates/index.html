@@ -1,0 +1,238 @@
+<title>exegesis moodboard — dashboard</title>
+<meta http-equiv="refresh" content="120">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    background: #0f0f0f;
+    color: #e0e0e0;
+    padding: 24px;
+  }
+  a { color: #60a5fa; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 28px;
+    border-bottom: 1px solid #222;
+    padding-bottom: 16px;
+  }
+  header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+  .refresh-note { font-size: 12px; color: #555; }
+
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
+       letter-spacing: 0.06em; color: #777; margin-bottom: 12px; }
+
+  section { margin-bottom: 36px; }
+
+  /* Board cards */
+  .boards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: #181818;
+    border: 1px solid #272727;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card-title {
+    font-weight: 600;
+    font-size: 15px;
+    color: #fff;
+    margin-bottom: 4px;
+  }
+  .card-handle {
+    font-size: 12px;
+    color: #555;
+    margin-bottom: 12px;
+  }
+  .card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    border-top: 1px solid #222;
+    font-size: 13px;
+    color: #aaa;
+  }
+  .card-row:first-of-type { border-top: none; }
+  .card-row span:last-child { font-weight: 500; color: #e0e0e0; }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 99px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-green  { background: #14532d; color: #86efac; }
+  .badge-yellow { background: #422006; color: #fcd34d; }
+  .badge-red    { background: #450a0a; color: #fca5a5; }
+  .badge-gray   { background: #1f1f1f; color: #777; }
+
+  /* Tables */
+  .table-wrap { overflow-x: auto; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th {
+    text-align: left;
+    font-weight: 500;
+    color: #555;
+    padding: 6px 10px;
+    border-bottom: 1px solid #222;
+  }
+  td {
+    padding: 7px 10px;
+    border-bottom: 1px solid #1a1a1a;
+    color: #ccc;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #161616; }
+
+  .empty { color: #444; font-style: italic; padding: 12px 0; }
+
+  .fail-banner {
+    background: #1c0a0a;
+    border: 1px solid #450a0a;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+    color: #fca5a5;
+    font-size: 13px;
+  }
+</style>
+
+<header>
+  <h1>🦋 exegesis moodboard</h1>
+  <span class="refresh-note">auto-refreshes every 2 min · loaded {{ loaded_at }}</span>
+</header>
+
+<section>
+  <h2>Boards</h2>
+  <div class="boards">
+    {% for b in boards %}
+    <div class="card">
+      <div class="card-title">{{ b.name }}</div>
+      <div class="card-handle">
+        {% if b.bluesky_handle %}
+          <a href="https://bsky.app/profile/{{ b.bluesky_handle }}" target="_blank">@{{ b.bluesky_handle }}</a>
+        {% else %}
+          <span>no bluesky handle</span>
+        {% endif %}
+      </div>
+
+      <div class="card-row">
+        <span>today</span>
+        <span>
+          {{ b.today_count }} / {{ b.cap }}
+          {% if b.fresh_mode %}
+            <span class="badge badge-green">fresh</span>
+          {% else %}
+            <span class="badge badge-gray">backlog</span>
+          {% endif %}
+        </span>
+      </div>
+
+      <div class="card-row">
+        <span>queued</span>
+        <span>
+          {% if b.queued_count > 0 %}
+            <span class="badge badge-yellow">{{ b.queued_count }}</span>
+          {% else %}
+            <span class="badge badge-gray">0</span>
+          {% endif %}
+        </span>
+      </div>
+
+      <div class="card-row">
+        <span>failed</span>
+        <span>
+          {% if b.failed_count > 0 %}
+            <span class="badge badge-red">{{ b.failed_count }}</span>
+          {% else %}
+            <span class="badge badge-gray">0</span>
+          {% endif %}
+        </span>
+      </div>
+
+      <div class="card-row">
+        <span>last post</span>
+        <span>
+          {% if b.last_bsky_url %}
+            <a href="{{ b.last_bsky_url }}" target="_blank">{{ b.last_published_rel }}</a>
+          {% else %}
+            —
+          {% endif %}
+        </span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{% if failures %}
+<section>
+  <h2>Failed submissions</h2>
+  {% for f in failures %}
+  <div class="fail-banner">
+    <strong>#{{ f.submission_id }}</strong> · {{ f.board_name }} · {{ f.failed_rel }}
+    {% if f.canonical_url %} · <a href="{{ f.canonical_url }}" target="_blank">{{ f.canonical_url }}</a>{% endif %}
+    {% if f.error %}<br><span style="color:#f87171; font-size:12px">{{ f.error }}</span>{% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section>
+  <h2>Recent publishes</h2>
+  {% if publishes %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>board</th>
+          <th>source</th>
+          <th>bluesky</th>
+          <th>when</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in publishes %}
+        <tr>
+          <td>{{ p.board_name }}</td>
+          <td>
+            {% if p.canonical_url %}
+              <a href="{{ p.canonical_url }}" target="_blank">{{ p.canonical_url }}</a>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if p.bsky_url %}
+              <a href="{{ p.bsky_url }}" target="_blank">post ↗</a>
+            {% elif p.at_uri %}
+              {{ p.at_uri }}
+            {% else %}—{% endif %}
+          </td>
+          <td style="color:#555; white-space:nowrap">{{ p.attempted_rel }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">no publishes yet</p>
+  {% endif %}
+</section>

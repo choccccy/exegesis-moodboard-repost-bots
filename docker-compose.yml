@@ -3,16 +3,49 @@ services:
     build: .
     container_name: bluesky-repost-bot
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
-      # Container-internal paths (volumes mounted below). Override of .env values
-      # so the same .env works on host and in-container.
+      # Resolved by `op run` and inherited from process env.
+      DISCORD_BOT_TOKEN:
+      BOARDS_JSON:
+      BSKY_APP_PASSWORD_ROBOT_POSTING:
+      BSKY_APP_PASSWORD_ROBOT_FUCKING:
+      BSKY_APP_PASSWORD_WEIRD_WHEELS:
+      BSKY_APP_PASSWORD_DOOHICKEY_POSTING:
+      BSKY_APP_PASSWORD_NERD_TV:
+      TRIGGER_EMOJI:
+      STORAGE_MIN_FREE_MB:
+      LOG_LEVEL:
+      QUEUE_TIMEZONE:
+      QUEUE_START_HOUR:
+      QUEUE_FRESH_WINDOW_HOURS:
+      QUEUE_FRESH_DAILY_CAP:
+      QUEUE_BACKLOG_DAILY_CAP:
+      CATCHUP_ENABLED:
+      CATCHUP_LOOKBACK_HOURS:
+      CATCHUP_MAX_MESSAGES:
+      # Container-internal paths.
       DATA_DIR: /data
       DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
     volumes:
       - bot-data:/data
-    # The bot is a long-running gateway client; no ports are exposed.
+
+  dashboard:
+    build: .
+    container_name: bluesky-dashboard
+    restart: unless-stopped
+    command: python -m bot.dashboard
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      BOARDS_JSON:
+      QUEUE_TIMEZONE:
+      QUEUE_FRESH_WINDOW_HOURS:
+      QUEUE_FRESH_DAILY_CAP:
+      QUEUE_BACKLOG_DAILY_CAP:
+      DATA_DIR: /data
+      DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
+    volumes:
+      - bot-data:/data:ro
 
 volumes:
   # Named volume holds db/, attachments/ and logs/ - survives container rebuilds.

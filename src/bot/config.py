@@ -1,7 +1,7 @@
 """Typed configuration loaded from the environment.
 
-The real environment is produced at deploy time by `op inject -i .env.tmpl -o .env`
-so no secret ever lives in source. See `.env.tmpl` for the field reference.
+Secrets are resolved at deploy time by `op run --env-file op.env` — nothing is
+ever written to disk. See `op.env` for the field reference.
 """
 
 from __future__ import annotations

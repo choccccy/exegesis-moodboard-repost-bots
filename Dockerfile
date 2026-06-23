@@ -22,5 +22,7 @@ COPY alembic.ini ./
 
 ENV PYTHONPATH=/app/src
 
-# Apply migrations, then launch the bot. Migrations are idempotent (upgrade head).
-ENTRYPOINT ["sh", "-c", "alembic upgrade head && python -m bot.main"]
+# Run migrations (idempotent), then exec whatever CMD is passed.
+# The "sh" arg sets $0 so $@ correctly captures CMD arguments.
+ENTRYPOINT ["sh", "-c", "alembic upgrade head && exec \"$@\"", "sh"]
+CMD ["python", "-m", "bot.main"]
