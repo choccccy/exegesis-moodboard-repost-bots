@@ -256,3 +256,15 @@ class Curator(Base):
     discord_role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     board: Mapped["Board"] = relationship(back_populates="curators")
+
+
+class BotError(Base):
+    """Persistent log of unhandled exceptions in background tasks."""
+
+    __tablename__ = "bot_errors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(index=True)   # e.g. "scheduler"
+    context: Mapped[str]                               # e.g. "board robot-posting"
+    traceback: Mapped[str] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

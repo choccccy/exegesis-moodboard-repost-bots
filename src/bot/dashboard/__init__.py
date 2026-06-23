@@ -34,6 +34,7 @@ async def index(request: Request):
     async with session_scope() as session:
         boards = await q.board_stats(session, settings)
         publishes = await q.recent_publishes(session, settings)
+        errors = await q.recent_errors(session)
 
     loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return _TEMPLATES.TemplateResponse(
@@ -42,6 +43,7 @@ async def index(request: Request):
         {
             "boards": boards,
             "publishes": publishes,
+            "errors": errors,
             "loaded_at": loaded_at,
         },
     )

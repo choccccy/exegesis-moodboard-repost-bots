@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Attachment, Board, PublishAttempt, Submission, SubmissionLink
+from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink
 from ..publish import at_uri_to_url
 from ..queue import count_posts_today, daily_cap, has_fresh_queued
 from ..state import SubmissionState
@@ -313,3 +313,33 @@ async def board_queue(
             error=r.error,
         ))
     return board, items
+
+
+@dataclass
+class RecentError:
+    error_id: int
+    source: str
+    context: str
+    traceback: str
+    occurred_at: datetime
+    occurred_rel: str
+
+
+async def recent_errors(session: AsyncSession, limit: int = 20) -> list[RecentError]:
+    rows = await session.scalars(
+        select(BotError).order_by(BotError.occurred_at.desc()).limit(limit)
+    )
+    result = []
+    for r in rows:
+        occurred_at = r.occurred_at
+        if occurred_at is not None and occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        result.append(RecentError(
+            error_id=r.id,
+            source=r.source,
+            context=r.context,
+            traceback=r.traceback,
+            occurred_at=occurred_at,
+            occurred_rel=_relative(occurred_at),
+        ))
+    return result

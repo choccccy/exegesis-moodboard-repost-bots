@@ -108,8 +108,30 @@
 
   .empty { color: #444; font-style: italic; padding: 12px 0; }
 
-  details summary { list-style: none; }
+  details summary { list-style: none; cursor: pointer; }
   details summary::-webkit-details-marker { display: none; }
+
+  /* Error log */
+  .error-row td { vertical-align: top; }
+  .error-source { white-space: nowrap; color: #fca5a5; font-weight: 500; }
+  .error-context { white-space: nowrap; color: #aaa; }
+  .error-time { white-space: nowrap; color: #555; }
+  .error-trace {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 11px;
+    color: #aaa;
+    background: #0a0a0a;
+    border: 1px solid #222;
+    border-radius: 4px;
+    padding: 8px 10px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 4px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  details[open] .error-summary-toggle::before { content: "▾ "; }
+  .error-summary-toggle::before { content: "▸ "; }
 </style>
 
 <header>
@@ -238,3 +260,36 @@
   <p class="empty">no publishes yet</p>
   {% endif %}
 </section>
+
+{% if errors %}
+<section>
+  <h2>Recent errors</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>source</th>
+          <th>context</th>
+          <th>when</th>
+          <th>traceback</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in errors %}
+        <tr class="error-row">
+          <td class="error-source">{{ e.source }}</td>
+          <td class="error-context">{{ e.context }}</td>
+          <td class="error-time">{{ e.occurred_rel }}</td>
+          <td style="max-width:none">
+            <details>
+              <summary class="error-summary-toggle" style="color:#666; font-size:12px">traceback</summary>
+              <pre class="error-trace">{{ e.traceback }}</pre>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}

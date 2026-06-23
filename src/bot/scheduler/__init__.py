@@ -13,6 +13,7 @@ from ..asset_store import has_free_space
 from ..config import BoardConfig, Settings
 from ..db import session_scope
 from ..discord_ingest import service as ingest_service
+from .. import errors as errors_module
 from ..models import Board, Submission, SubmissionThread
 from .. import queue as queue_module
 
@@ -88,6 +89,7 @@ async def _fire_all_boards(bot, settings: Settings, tz: ZoneInfo) -> None:
                 await _fire_board(session, bot, settings, board_cfg, fresh_cutoff, mt_midnight)
         except Exception:
             log.exception("queue tick failed for board %s", board_cfg.name)
+            await errors_module.record_error("scheduler", f"board {board_cfg.name}")
 
 
 async def _fire_board(
@@ -125,11 +127,14 @@ async def _fire_board(
 
     destination = None
     thread_row = await session.scalar(
-        select(SubmissionThread).where(SubmissionThread.submission_id == submission.id)
+        select(SubmissionThread).where(
+            SubmissionThread.board_id == submission.board_id,
+            SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+        )
     )
     if thread_row is not None:
         try:
-            destination = await bot.fetch_channel(thread_row.discord_thread_id)
+            destination = await bot.fetch_channel(thread_row.thread_id)
         except Exception as exc:
             log.warning(
                 "queue: could not resolve thread for submission %s: %s — publishing silently",
