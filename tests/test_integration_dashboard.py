@@ -112,14 +112,16 @@ async def test_stale_submission_not_fresh(session, board):
     assert items[0].is_fresh is False
 
 
-async def test_null_source_posted_at_not_fresh(session, board):
+async def test_null_source_posted_at_falls_back_to_created_at(session, board):
+    # When source_posted_at is unknown (e.g. YouTube submissions), created_at
+    # is used as the freshness date. A submission created just now is fresh.
     sub = make_submission(board, state=QUEUED, source_discord_message_id=1, source_posted_at=None)
     session.add(sub)
     await session.flush()
 
     _, items = await board_queue(session, board.name, _FakeSettings())
 
-    assert items[0].is_fresh is False
+    assert items[0].is_fresh is True
 
 
 async def test_naive_datetime_comparison_does_not_raise(session, board):

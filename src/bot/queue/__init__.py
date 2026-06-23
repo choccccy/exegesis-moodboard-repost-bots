@@ -32,9 +32,11 @@ async def pick_next_for_board(
     """
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
     cutoff = fresh_cutoff_utc.replace(tzinfo=None) if fresh_cutoff_utc.tzinfo else fresh_cutoff_utc
-    # NULL source_posted_at (pre-migration rows) sorts as backlog (priority=1).
+    # Fall back to created_at when source_posted_at is NULL (e.g. YouTube submissions
+    # where the original upload date isn't fetched).
+    effective_date = func.coalesce(Submission.source_posted_at, Submission.created_at)
     freshness_priority = case(
-        (Submission.source_posted_at >= cutoff, 0),
+        (effective_date >= cutoff, 0),
         else_=1,
     )
     return await session.scalar(
@@ -43,7 +45,7 @@ async def pick_next_for_board(
             Submission.board_id == board_id,
             Submission.state.in_(_eligible),
         )
-        .order_by(freshness_priority, Submission.source_posted_at.nulls_last(), Submission.created_at)
+        .order_by(freshness_priority, effective_date.nulls_last(), Submission.created_at)
         .limit(1)
     )
 
@@ -75,13 +77,14 @@ async def has_fresh_queued(
     """Return True if any QUEUED/PUBLISH_FAILED submission for this board is still fresh."""
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
     cutoff = fresh_cutoff_utc.replace(tzinfo=None) if fresh_cutoff_utc.tzinfo else fresh_cutoff_utc
+    effective_date = func.coalesce(Submission.source_posted_at, Submission.created_at)
     result = await session.scalar(
         select(func.count())
         .select_from(Submission)
         .where(
             Submission.board_id == board_id,
             Submission.state.in_(_eligible),
-            Submission.source_posted_at >= cutoff,
+            effective_date >= cutoff,
         )
     )
     return (result or 0) > 0

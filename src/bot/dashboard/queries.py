@@ -251,6 +251,7 @@ async def board_queue(
 
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
 
+    effective_date = func.coalesce(Submission.source_posted_at, Submission.created_at)
     rows = await session.execute(
         select(
             Submission.id,
@@ -276,26 +277,21 @@ async def board_queue(
         .where(Submission.board_id == board.id, Submission.state.in_(_eligible))
         .order_by(
             case(
-                (
-                    and_(
-                        Submission.source_posted_at.isnot(None),
-                        Submission.source_posted_at >= fresh_cutoff_naive,
-                    ),
-                    0,
-                ),
+                (effective_date >= fresh_cutoff_naive, 0),
                 else_=1,
             ),
-            Submission.source_posted_at.nulls_last(),
+            effective_date.nulls_last(),
             Submission.created_at,
         )
     )
 
     items: list[QueuedItem] = []
     for r in rows:
-        posted_at = r.source_posted_at
-        if posted_at is not None and posted_at.tzinfo is None:
-            posted_at = posted_at.replace(tzinfo=timezone.utc)
-        is_fresh = posted_at is not None and posted_at >= fresh_cutoff
+        # Use created_at as fallback when source_posted_at is unknown (e.g. YouTube).
+        effective_posted = r.source_posted_at if r.source_posted_at is not None else r.created_at
+        if effective_posted is not None and effective_posted.tzinfo is None:
+            effective_posted = effective_posted.replace(tzinfo=timezone.utc)
+        is_fresh = effective_posted is not None and effective_posted >= fresh_cutoff
         if r.domain_family == "bluesky":
             post_type = "repost"
         elif r.resolved_image_path:
