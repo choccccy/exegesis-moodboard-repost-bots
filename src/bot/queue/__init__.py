@@ -31,9 +31,10 @@ async def pick_next_for_board(
     ordering within each tier. Both QUEUED and PUBLISH_FAILED are included as candidates.
     """
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
+    cutoff = fresh_cutoff_utc.replace(tzinfo=None) if fresh_cutoff_utc.tzinfo else fresh_cutoff_utc
     # NULL source_posted_at (pre-migration rows) sorts as backlog (priority=1).
     freshness_priority = case(
-        (Submission.source_posted_at >= fresh_cutoff_utc, 0),
+        (Submission.source_posted_at >= cutoff, 0),
         else_=1,
     )
     return await session.scalar(
@@ -73,13 +74,14 @@ async def has_fresh_queued(
 ) -> bool:
     """Return True if any QUEUED/PUBLISH_FAILED submission for this board is still fresh."""
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
+    cutoff = fresh_cutoff_utc.replace(tzinfo=None) if fresh_cutoff_utc.tzinfo else fresh_cutoff_utc
     result = await session.scalar(
         select(func.count())
         .select_from(Submission)
         .where(
             Submission.board_id == board_id,
             Submission.state.in_(_eligible),
-            Submission.source_posted_at >= fresh_cutoff_utc,
+            Submission.source_posted_at >= cutoff,
         )
     )
     return (result or 0) > 0

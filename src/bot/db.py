@@ -31,8 +31,24 @@ def init_engine(database_url: str) -> None:
     path = _sqlite_path(database_url)
     if path:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-    _engine = create_async_engine(database_url, future=True)
+    _engine = create_async_engine(
+        database_url,
+        future=True,
+        connect_args={"timeout": 30} if database_url.startswith("sqlite") else {},
+    )
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+
+    # Enable WAL mode so concurrent readers don't block writers (and vice-versa).
+    # Must use cursor() — direct conn.execute() is a no-op on aiosqlite's sync adapter.
+    if database_url.startswith("sqlite"):
+        from sqlalchemy import event
+
+        @event.listens_for(_engine.sync_engine, "connect")
+        def _set_wal(dbapi_conn, _):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
 
 
 @asynccontextmanager

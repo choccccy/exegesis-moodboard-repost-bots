@@ -8,6 +8,7 @@ client.py so the logic is easy to follow and extend toward Matrix later.
 
 from __future__ import annotations
 
+import io
 import logging
 from datetime import datetime, timezone
 
@@ -700,6 +701,33 @@ async def _has_open_request(session: AsyncSession, model, submission_id: int, **
     return (await session.scalar(stmt)) is not None
 
 
+_DISCORD_MAX_BYTES = 8 * 1024 * 1024  # 8 MB free-tier upload limit
+_ALT_PREVIEW_MAX_PX = 1920
+
+
+def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File:
+    """Return a discord.File for the image, resizing in-memory if it exceeds 8 MB."""
+    from PIL import Image
+
+    with Image.open(local_path) as img:
+        w, h = img.size
+        if max(w, h) > _ALT_PREVIEW_MAX_PX:
+            scale = _ALT_PREVIEW_MAX_PX / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        fmt = img.format or "JPEG"
+        if fmt not in ("JPEG", "PNG", "WEBP", "GIF"):
+            fmt = "JPEG"
+        img.save(buf, format=fmt)
+        buf.seek(0)
+        if buf.getbuffer().nbytes > _DISCORD_MAX_BYTES:
+            # Still too large after resize - re-encode as JPEG at reduced quality
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=70)
+            buf.seek(0)
+        return discord.File(buf, filename=filename)
+
+
 _QUEUE_TERMINAL = frozenset({
     SubmissionState.QUEUED.value,
     SubmissionState.PUBLISHED.value,
@@ -779,7 +807,13 @@ async def recompute_and_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
-            msg = await destination.send(replies.alt_text_request(mention, att.filename))
+            if att.local_path:
+                file = _discord_file_for_attachment(att.local_path, att.filename)
+                msg = await destination.send(replies.alt_text_request(mention, att.filename), file=file)
+            else:
+                msg = await destination.send(
+                    replies.alt_text_request(mention, att.filename) + f"\n{att.discord_url}"
+                )
             session.add(
                 AttachmentAltTextRequest(
                     submission_id=submission.id,

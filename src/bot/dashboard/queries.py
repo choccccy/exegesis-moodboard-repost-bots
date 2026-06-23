@@ -230,6 +230,8 @@ async def board_queue(
 
     now_utc = datetime.now(timezone.utc)
     fresh_cutoff = now_utc - timedelta(hours=settings.queue_fresh_window_hours)
+    # SQLite stores datetimes as naive UTC; strip tzinfo for DB-level comparisons.
+    fresh_cutoff_naive = fresh_cutoff.replace(tzinfo=None)
 
     image_count_sq = (
         select(func.count())
@@ -277,7 +279,7 @@ async def board_queue(
                 (
                     and_(
                         Submission.source_posted_at.isnot(None),
-                        Submission.source_posted_at >= fresh_cutoff,
+                        Submission.source_posted_at >= fresh_cutoff_naive,
                     ),
                     0,
                 ),
@@ -290,7 +292,10 @@ async def board_queue(
 
     items: list[QueuedItem] = []
     for r in rows:
-        is_fresh = r.source_posted_at is not None and r.source_posted_at >= fresh_cutoff
+        posted_at = r.source_posted_at
+        if posted_at is not None and posted_at.tzinfo is None:
+            posted_at = posted_at.replace(tzinfo=timezone.utc)
+        is_fresh = posted_at is not None and posted_at >= fresh_cutoff
         if r.domain_family == "bluesky":
             post_type = "repost"
         elif r.resolved_image_path:
