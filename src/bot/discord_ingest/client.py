@@ -44,7 +44,7 @@ def _build_intents() -> discord.Intents:
 
 
 class RepostBot(discord.Client):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, yt_client=None) -> None:
         from ..version import __version__
         activity = discord.Activity(
             type=discord.ActivityType.watching,
@@ -52,6 +52,7 @@ class RepostBot(discord.Client):
         )
         super().__init__(intents=_build_intents(), activity=activity)
         self.settings = settings
+        self._yt_client = yt_client
         self._http: httpx.AsyncClient | None = None
         self._watched_channels = {b.discord_channel_id for b in settings.boards}
         self._catchup_started = False
@@ -161,6 +162,25 @@ class RepostBot(discord.Client):
                         member=payload.member,
                         user_id=payload.user_id,
                     )
+
+        if str(payload.emoji) == self.settings.playlist_emoji:
+            board_cfg = self.settings.board_for_channel(payload.channel_id)
+            if board_cfg is None or not board_cfg.youtube_playlist_id:
+                return
+            if not service._is_curator(payload.member, payload.user_id, board_cfg):
+                return
+            message = await self._fetch_message(payload.channel_id, payload.message_id)
+            if message is None:
+                return
+            async with session_scope() as session:
+                await service.handle_playlist_reaction(
+                    session,
+                    settings=self.settings,
+                    message=message,
+                    board_cfg=board_cfg,
+                    yt_client=self._yt_client,
+                    reactor_id=payload.user_id,
+                )
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         if str(payload.emoji) != self.settings.trigger_emoji:

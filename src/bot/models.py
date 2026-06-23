@@ -273,6 +273,22 @@ class CancellationRequest(Base):
     prompted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class YoutubePlaylistAdd(Base):
+    """Audit log of ▶️ playlist additions; also serves as the dedup table."""
+
+    __tablename__ = "youtube_playlist_add"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    board_id: Mapped[int] = mapped_column(ForeignKey("boards.id"), index=True)
+    source_discord_message_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    video_id: Mapped[str] = mapped_column(String(20), index=True)
+    playlist_id: Mapped[str] = mapped_column(String(100))
+    discord_requester_id: Mapped[int] = mapped_column(BigInteger)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    success: Mapped[bool] = mapped_column(Boolean)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class BotError(Base):
     """Persistent log of unhandled exceptions in background tasks."""
 

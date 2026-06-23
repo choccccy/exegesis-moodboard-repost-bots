@@ -40,6 +40,7 @@ from ..models import (
     Submission,
     SubmissionLink,
     SubmissionThread,
+    YoutubePlaylistAdd,
 )
 from .. import publish as publisher
 from ..moderation import (
@@ -629,6 +630,87 @@ async def handle_source_cancel_reaction(
     await session.execute(delete(Submission).where(Submission.id == sub_id))
     log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
     return thread_id
+
+
+async def handle_playlist_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    message: discord.Message,
+    board_cfg: BoardConfig,
+    yt_client,
+    reactor_id: int,
+) -> None:
+    """▶️ reacted by a curator: add the YouTube video to the board's playlist."""
+    from ..resolve.fetch import _youtube_video_id
+
+    if yt_client is None:
+        await message.channel.send("YouTube playlist not configured")
+        return
+
+    urls = extract_urls(message.content)
+    video_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        try:
+            result = canonicalize(raw)
+        except Exception:
+            continue
+        if result.domain_family != "youtube":
+            continue
+        vid = _youtube_video_id(result.canonical_url)
+        if vid and vid not in seen:
+            video_ids.append(vid)
+            seen.add(vid)
+
+    if not video_ids:
+        await message.channel.send("no YouTube video link found")
+        return
+
+    board = await _board_for_channel(session, message.channel.id)
+    if board is None:
+        return
+
+    for video_id in video_ids:
+        existing = await session.scalar(
+            select(YoutubePlaylistAdd).where(
+                YoutubePlaylistAdd.board_id == board.id,
+                YoutubePlaylistAdd.video_id == video_id,
+                YoutubePlaylistAdd.success.is_(True),
+            )
+        )
+        if existing is not None:
+            await message.channel.send(f"▶️ already in playlist: https://youtu.be/{video_id}")
+            continue
+
+        playlist_id = board_cfg.youtube_playlist_id
+        item_id: str | None = None
+        error_msg: str | None = None
+        success = False
+        try:
+            loop = asyncio.get_running_loop()
+            item_id = await loop.run_in_executor(
+                None, yt_client.add_to_playlist, playlist_id, video_id
+            )
+            success = True
+        except Exception as exc:
+            error_msg = str(exc)
+            log.warning("playlist insert failed for video %s: %s", video_id, exc)
+
+        session.add(YoutubePlaylistAdd(
+            board_id=board.id,
+            source_discord_message_id=message.id,
+            video_id=video_id,
+            playlist_id=playlist_id,
+            discord_requester_id=reactor_id,
+            success=success,
+            error_message=error_msg,
+        ))
+
+        if success:
+            await message.channel.send(f"▶️ added to playlist: https://youtu.be/{video_id}")
+        else:
+            await message.channel.send(f"failed to add https://youtu.be/{video_id} to playlist: {error_msg}")
 
 
 async def _resolve_thread_by_id(

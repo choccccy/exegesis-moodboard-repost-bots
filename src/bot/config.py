@@ -31,6 +31,7 @@ class BoardConfig(BaseModel):
     # Hashtags appended to every post from this board (no leading #).
     # Start with the channel name; extend after analyzing tag performance.
     tags: list[str] = Field(default_factory=list)
+    youtube_playlist_id: str | None = None
 
 
 class Settings(BaseSettings):
@@ -83,6 +84,12 @@ class Settings(BaseSettings):
     # Without this, YouTube video metadata falls back to scraping, which fails
     # from datacenter IPs because YouTube serves JS-only pages to bot UAs.
     youtube_api_key: str | None = Field(None, alias="YOUTUBE_API_KEY")
+
+    # YouTube OAuth2 credentials for playlist writes (separate from the read-only API key).
+    youtube_client_id: str | None = Field(None, alias="YOUTUBE_CLIENT_ID")
+    youtube_client_secret: str | None = Field(None, alias="YOUTUBE_CLIENT_SECRET")
+    youtube_refresh_token: str | None = Field(None, alias="YOUTUBE_REFRESH_TOKEN")
+    playlist_emoji: str = Field("▶️", alias="PLAYLIST_EMOJI")
 
     @field_validator("boards_json")
     @classmethod

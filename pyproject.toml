@@ -17,12 +17,15 @@ dependencies = [
     "jinja2>=3.1",
     "uvicorn[standard]>=0.30",
     "pillow>=10.0",
+    "google-api-python-client>=2.160",
+    "google-auth>=2.30",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "google-auth-oauthlib>=1.2",
 ]
 
 [project.scripts]

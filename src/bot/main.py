@@ -10,6 +10,7 @@ from .db import dispose_engine, init_engine
 from .discord_ingest import RepostBot
 from .logging_setup import configure_logging
 from .scheduler import run_housekeeping, run_queue_dispatcher
+from .youtube import YouTubeClient
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +23,18 @@ async def amain() -> None:
     if not settings.boards:
         log.warning("no boards configured (BOARDS_JSON is empty) - nothing will be watched")
 
-    bot = RepostBot(settings)
+    yt_client: YouTubeClient | None = None
+    if all([settings.youtube_client_id, settings.youtube_client_secret, settings.youtube_refresh_token]):
+        yt_client = YouTubeClient(
+            settings.youtube_client_id,  # type: ignore[arg-type]
+            settings.youtube_client_secret,  # type: ignore[arg-type]
+            settings.youtube_refresh_token,  # type: ignore[arg-type]
+        )
+        log.info("YouTube playlist client initialized")
+    else:
+        log.info("YouTube playlist client not configured (missing OAuth2 credentials)")
+
+    bot = RepostBot(settings, yt_client=yt_client)
     stop = asyncio.Event()
     housekeeping = asyncio.create_task(run_housekeeping(settings, stop))
     queue_dispatcher = asyncio.create_task(run_queue_dispatcher(bot, settings, stop))
