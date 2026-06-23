@@ -21,6 +21,7 @@ class BoardConfig(BaseModel):
     discord_channel_id: int
     nsfw: bool = False
     curator_role_ids: list[int] = Field(default_factory=list)
+    curator_user_ids: list[int] = Field(default_factory=list)
     # When true, every submission must get an explicit graphic yes/no before it
     # can become ready_to_queue. Set false per board to skip the graphic prompt.
     require_graphic_classification: bool = True

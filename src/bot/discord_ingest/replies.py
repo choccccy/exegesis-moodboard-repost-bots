@@ -41,21 +41,21 @@ def ready_confirmation() -> str:
 
 def metadata_request(mention: str, url: str) -> str:
     return (
-        f"{mention} couldn't get any metadata from **{url}** — reply with a more embeddable "
+        f"{mention} couldn't get any metadata from **{url}** - reply with a more embeddable "
         f"link, or react {METADATA_CONFIRM_EMOJI} to use it as-is (at least one image will be required)"
     )
 
 
 def metadata_confirmed() -> str:
-    return f"{METADATA_CONFIRM_EMOJI} noted — link confirmed as best available; at least one image must be attached"
+    return f"{METADATA_CONFIRM_EMOJI} noted - link confirmed as best available; at least one image must be attached"
 
 
 def metadata_link_updated(new_url: str) -> str:
-    return f"updated source to {new_url} — re-resolving metadata…"
+    return f"updated source to {new_url} - re-resolving metadata…"
 
 
 def metadata_url_not_found() -> str:
-    return f"no URL found — reply again with a link, or react {METADATA_CONFIRM_EMOJI} to use the existing one as-is"
+    return f"no URL found - reply again with a link, or react {METADATA_CONFIRM_EMOJI} to use the existing one as-is"
 
 
 def source_not_found() -> str:
@@ -86,7 +86,7 @@ def reposted_notice(bsky_url: str) -> str:
 
 
 def queued_notice() -> str:
-    return "queued — will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
+    return "queued - will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
 
 
 def publish_failed_notice(error: str | None) -> str:
@@ -99,7 +99,7 @@ def publish_failed_notice(error: str | None) -> str:
 def duplicate_warning(bsky_url: str) -> str:
     return (
         f"⚠ this URL was already posted: {bsky_url}\n"
-        "proceeding anyway — remove 🦋 if this was a mistake"
+        "proceeding anyway - remove 🦋 if this was a mistake"
     )
 
 
@@ -108,17 +108,12 @@ def thread_name(submission_id: int) -> str:
     return f"🦋 submission {submission_id}"
 
 
-def thread_anchor(*, poster_mention: str, curator_mentions: list[str]) -> str:
-    """Top-of-thread message: pulls people into the private thread.
-
-    Mentioning the poster adds them to the private thread; curator role mentions
-    notify the (Manage-Threads-visible) curators. The original message is
-    forwarded separately so curators can see the content inline.
-    """
-    lines = [f"🦋 new submission from {poster_mention}"]
-    if curator_mentions:
-        lines.append(f"{' '.join(curator_mentions)} - help curate this repost")
-    return "\n".join(lines)
+def thread_anchor(*, author_display: str, curator_user_mentions: list[str]) -> str:
+    """Top-of-thread message. Only configured curator users are pinged."""
+    parts = [f"🦋 new submission from {author_display}"]
+    if curator_user_mentions:
+        parts.append(" ".join(curator_user_mentions))
+    return "\n".join(parts)
 
 
 # Human labels + atproto $type per embed mode.

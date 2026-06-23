@@ -9,9 +9,13 @@ from datetime import datetime, timedelta, timezone
 import discord
 import httpx
 
+from sqlalchemy import select
+
 from ..config import Settings
 from ..db import session_scope
+from ..models import Submission, SubmissionThread
 from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
+from ..state import SubmissionState
 from . import replies, service
 
 log = logging.getLogger(__name__)
@@ -217,3 +221,95 @@ class RepostBot(discord.Client):
                     cap, channel_id,
                 )
         log.info("catch-up scan complete: processed %d butterflied message(s)", total)
+        asyncio.create_task(self._run_thread_catchup())
+
+    async def _run_thread_catchup(self) -> None:
+        """Reconcile missed reactions/replies in submission threads.
+
+        For each thread whose submission is still awaiting curator input, walk
+        the full thread history and replay:
+          - Human reply messages (alt text, source, image, metadata answers)
+          - Emoji reactions on bot messages (🩸/🕊️ graphic votes, 🔗 metadata confirm)
+
+        All service handlers are idempotent via answered_at guards, so replaying
+        already-processed events is safe.
+        """
+        _PENDING_STATES = (
+            SubmissionState.INTENT_SUBMITTED.value,
+            SubmissionState.AWAITING_SOURCE.value,
+            SubmissionState.AWAITING_BETTER_LINK.value,
+            SubmissionState.AWAITING_IMAGE.value,
+            SubmissionState.AWAITING_ALT_TEXT.value,
+            SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value,
+        )
+        _VOTE_EMOJIS = {GRAPHIC_YES_EMOJI, GRAPHIC_NO_EMOJI}
+
+        async with session_scope() as session:
+            rows = await session.execute(
+                select(SubmissionThread.thread_id)
+                .join(
+                    Submission,
+                    (Submission.board_id == SubmissionThread.board_id)
+                    & (Submission.source_discord_message_id == SubmissionThread.source_discord_message_id),
+                )
+                .where(Submission.state.in_(_PENDING_STATES))
+            )
+            thread_ids = [r.thread_id for r in rows]
+
+        log.info("thread catch-up scan: %d pending thread(s)", len(thread_ids))
+        replayed = 0
+
+        for thread_id in thread_ids:
+            thread = await self._resolve_channel(thread_id)
+            if thread is None:
+                continue
+            try:
+                async for message in thread.history(limit=None, oldest_first=True):  # type: ignore[union-attr]
+                    bot_id = getattr(self.user, "id", None)
+                    if message.author.id == bot_id:
+                        # Replay reactions on bot messages.
+                        for reaction in message.reactions:
+                            emoji = str(reaction.emoji)
+                            if emoji in _VOTE_EMOJIS:
+                                async for user in reaction.users():
+                                    if user.id == bot_id:
+                                        continue
+                                    async with session_scope() as session:
+                                        await service.handle_label_reaction(
+                                            session,
+                                            settings=self.settings,
+                                            channel=thread,
+                                            message_id=message.id,
+                                            emoji=emoji,
+                                            member=None,
+                                            user_id=user.id,
+                                        )
+                                    replayed += 1
+                            elif emoji == replies.METADATA_CONFIRM_EMOJI:
+                                async for user in reaction.users():
+                                    if user.id == bot_id:
+                                        continue
+                                    async with session_scope() as session:
+                                        await service.handle_metadata_reaction(
+                                            session,
+                                            settings=self.settings,
+                                            channel=thread,
+                                            message_id=message.id,
+                                            member=None,
+                                            user_id=user.id,
+                                        )
+                                    replayed += 1
+                    elif message.reference is not None:
+                        # Replay human replies (alt text, source, etc.).
+                        async with session_scope() as session:
+                            await service.handle_reply(
+                                session,
+                                settings=self.settings,
+                                message=message,
+                                http_client=self.httpx_client,
+                            )
+                        replayed += 1
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("thread catch-up failed for thread %s: %s", thread_id, exc)
+
+        log.info("thread catch-up scan complete: replayed %d event(s)", replayed)

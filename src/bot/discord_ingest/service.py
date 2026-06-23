@@ -234,15 +234,15 @@ async def _post_thread_anchor(
     submission: Submission,
     thread: discord.Thread,
 ) -> None:
-    """Anchor the private thread: mention poster + curators, then forward the source message."""
+    """Anchor the private thread: add curator users, notify curator roles, forward the source message."""
     cfg = settings.board_for_channel(submission.channel_id)
-    curator_mentions = [f"<@&{rid}>" for rid in (cfg.curator_role_ids if cfg else [])]
+    curator_user_ids = cfg.curator_user_ids if cfg else []
     text = replies.thread_anchor(
-        poster_mention=f"<@{submission.author_id}>",  # mention adds them to the private thread
-        curator_mentions=curator_mentions,
+        author_display=submission.author_display or str(submission.author_id),
+        curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
     )
     try:
-        await thread.send(text, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        await thread.send(text, allowed_mentions=discord.AllowedMentions(users=True))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.warning("could not post thread anchor for submission %s: %s", submission.id, exc)
 
