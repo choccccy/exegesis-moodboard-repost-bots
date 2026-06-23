@@ -112,13 +112,81 @@ to the `bot` service's `environment:` list in `docker-compose.yml`.
 4. Create the Bluesky app password and store it in 1Password.
 5. Redeploy (see below).
 
-### 5. DNS (one-time, for the dashboard)
+### 5. DNS + TLS (one-time, for the dashboard)
 
 In Porkbun, add an `A` record:
 - **Name:** `dashboard`
 - **Value:** the droplet's IP address
 
-Caddy will provision a TLS certificate automatically on the first request.
+Then on the droplet, set up the nginx vhost and TLS certificate. The droplet runs
+system nginx (which also serves other projects on the same host), so the dashboard
+gets its own vhost config rather than a dedicated reverse proxy container.
+
+```bash
+# Install the HTTP-only vhost first (needed for the ACME challenge)
+sudo tee /etc/nginx/sites-enabled/dashboard.exegesis.space > /dev/null << 'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name dashboard.exegesis.space;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$server_name$request_uri;
+    }
+}
+EOF
+sudo nginx -t && sudo systemctl reload nginx
+
+# Obtain TLS certificate via webroot
+sudo certbot certonly --webroot -w /var/www/html -d dashboard.exegesis.space \
+  --non-interactive --agree-tos -m osi@levver.io
+
+# Replace with full HTTPS vhost
+sudo tee /etc/nginx/sites-enabled/dashboard.exegesis.space > /dev/null << 'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name dashboard.exegesis.space;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$server_name$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name dashboard.exegesis.space;
+
+    ssl_certificate /etc/letsencrypt/live/dashboard.exegesis.space/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dashboard.exegesis.space/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_redirect off;
+    }
+}
+EOF
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Certbot sets up automatic renewal via a systemd timer — no further action needed.
 
 ---
 
@@ -142,17 +210,16 @@ entries in `docker-compose.yml`.
 
 This starts:
 - **`bot`** — the Discord ingestion + Bluesky publish bot
-- **`dashboard`** — read-only web dashboard at https://dashboard.exegesis.space
-- **`caddy`** — reverse proxy; handles TLS automatically via Let's Encrypt
+- **`dashboard`** — read-only web dashboard, bound to `127.0.0.1:8080` (proxied by nginx)
 
 Data (SQLite DB, downloaded attachments, logs) lives in the `bot-data` named volume and
-survives rebuilds. Caddy's TLS certificates live in `caddy-data`.
+survives rebuilds.
 
 ### Updating
 
 ```bash
 # Pull latest code, rebuild, and restart
-op run --env-file op.env -- docker --context DigitalOcean-remote compose up --build -d
+op run --env-file op.env --no-masking -- docker --context DigitalOcean-remote compose up --build -d
 ```
 
 Running containers are replaced one at a time. The DB volume is preserved.

@@ -223,3 +223,46 @@ async def test_resolve_other_family_fetches_directly():
     assert result.title == "Some site"
     call_url = client.get.call_args[0][0]
     assert "example.com" in call_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_tumblr_uses_oembed():
+    client = AsyncMock()
+    client.get.return_value = _oembed_response("Cool Robot Post")
+    result = await resolve(
+        "https://username.tumblr.com/post/123456789", "tumblr", client=client
+    )
+    assert result.title == "Cool Robot Post"
+    assert result.via == "oembed"
+    call_url = client.get.call_args[0][0]
+    assert "tumblr.com/oembed" in call_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_tumblr_photo_post_uses_url_as_image():
+    client = AsyncMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json = MagicMock(return_value={
+        "type": "photo",
+        "url": "https://cdn.tumblr.com/full.jpg",
+        "thumbnail_url": "https://cdn.tumblr.com/thumb.jpg",
+        "author_name": "cool-blog",
+    })
+    client.get.return_value = resp
+    result = await resolve(
+        "https://cool-blog.tumblr.com/post/123456789", "tumblr", client=client
+    )
+    assert result.image_url == "https://cdn.tumblr.com/full.jpg"
+    assert result.via == "oembed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_tumblr_oembed_404_falls_to_opengraph():
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(404), _html_response("Tumblr OG Title")]
+    result = await resolve(
+        "https://username.tumblr.com/post/123456789", "tumblr", client=client
+    )
+    assert result.title == "Tumblr OG Title"
+    assert client.get.call_count == 2  # noqa: PLR2004

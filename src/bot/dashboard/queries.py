@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Board, PublishAttempt, Submission, SubmissionLink
+from ..models import Attachment, Board, PublishAttempt, Submission, SubmissionLink
+from ..publish import at_uri_to_url
 from ..queue import count_posts_today, daily_cap, has_fresh_queued
 from ..state import SubmissionState
 from .settings import DashboardSettings
@@ -55,9 +56,14 @@ class BoardStat:
 @dataclass
 class RecentPublish:
     board_name: str
+    post_type: str          # "repost" | "image" | "link"
+    title: str | None
+    author_display: str
     canonical_url: str | None
-    bsky_url: str | None
-    at_uri: str | None
+    resolved_bsky_url: str | None
+    image_count: int
+    source_posted_at: datetime | None
+    source_posted_rel: str
     attempted_at: datetime
     attempted_rel: str
 
@@ -66,7 +72,13 @@ class RecentPublish:
 class FailedSub:
     submission_id: int
     board_name: str
+    post_type: str
+    title: str | None
+    author_display: str
     canonical_url: str | None
+    image_count: int
+    source_posted_at: datetime | None
+    source_posted_rel: str
     error: str | None
     failed_at: datetime | None
     failed_rel: str
@@ -113,6 +125,14 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
             .limit(1)
         )
 
+        if last_attempt:
+            handle = settings.bluesky_handle_for(board.name)
+            last_bsky_url = last_attempt.bsky_url or (
+                at_uri_to_url(last_attempt.at_uri, handle) if last_attempt.at_uri else None
+            )
+        else:
+            last_bsky_url = None
+
         stats.append(BoardStat(
             board_id=board.id,
             name=board.name,
@@ -122,7 +142,7 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
             today_count=today_count,
             cap=cap,
             fresh_mode=fresh_available,
-            last_bsky_url=last_attempt.bsky_url if last_attempt else None,
+            last_bsky_url=last_bsky_url,
             last_published_at=last_attempt.attempted_at if last_attempt else None,
             last_published_rel=_relative(last_attempt.attempted_at if last_attempt else None),
         ))
@@ -130,14 +150,33 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
     return stats
 
 
-async def recent_publishes(session: AsyncSession, limit: int = 30) -> list[RecentPublish]:
+async def recent_publishes(
+    session: AsyncSession, settings: DashboardSettings, limit: int = 30
+) -> list[RecentPublish]:
+    image_count_sq = (
+        select(func.count())
+        .select_from(Attachment)
+        .where(
+            Attachment.submission_id == Submission.id,
+            Attachment.is_image.is_(True),
+        )
+        .correlate(Submission)
+        .scalar_subquery()
+    )
+
     rows = await session.execute(
         select(
             PublishAttempt.bsky_url,
             PublishAttempt.at_uri,
             PublishAttempt.attempted_at,
             Board.name.label("board_name"),
+            Submission.author_display,
+            Submission.embed_title,
+            Submission.source_posted_at,
             SubmissionLink.canonical_url,
+            SubmissionLink.resolved_title,
+            SubmissionLink.resolved_image_path,
+            image_count_sq.label("image_count"),
         )
         .join(Submission, PublishAttempt.submission_id == Submission.id)
         .join(Board, Board.id == Submission.board_id)
@@ -152,25 +191,78 @@ async def recent_publishes(session: AsyncSession, limit: int = 30) -> list[Recen
         .order_by(PublishAttempt.attempted_at.desc())
         .limit(limit)
     )
-    return [
-        RecentPublish(
+
+    result = []
+    for r in rows:
+        handle = settings.bluesky_handle_for(r.board_name)
+        resolved_bsky_url = r.bsky_url or (
+            at_uri_to_url(r.at_uri, handle) if r.at_uri else None
+        )
+        if r.at_uri and "app.bsky.feed.repost" in r.at_uri:
+            post_type = "repost"
+        elif r.resolved_image_path:
+            post_type = "image"
+        else:
+            post_type = "link"
+
+        result.append(RecentPublish(
             board_name=r.board_name,
+            post_type=post_type,
+            title=r.embed_title or r.resolved_title,
+            author_display=r.author_display or "",
             canonical_url=r.canonical_url,
-            bsky_url=r.bsky_url,
-            at_uri=r.at_uri,
+            resolved_bsky_url=resolved_bsky_url,
+            image_count=r.image_count or 0,
+            source_posted_at=r.source_posted_at,
+            source_posted_rel=_relative(r.source_posted_at),
             attempted_at=r.attempted_at,
             attempted_rel=_relative(r.attempted_at),
-        )
-        for r in rows
-    ]
+        ))
+    return result
 
 
 async def failed_submissions(session: AsyncSession) -> list[FailedSub]:
+    image_count_sq = (
+        select(func.count())
+        .select_from(Attachment)
+        .where(
+            Attachment.submission_id == Submission.id,
+            Attachment.is_image.is_(True),
+        )
+        .correlate(Submission)
+        .scalar_subquery()
+    )
+    latest_error_sq = (
+        select(PublishAttempt.error)
+        .where(PublishAttempt.submission_id == Submission.id, PublishAttempt.success.is_(False))
+        .order_by(PublishAttempt.attempted_at.desc())
+        .limit(1)
+        .correlate(Submission)
+        .scalar_subquery()
+    )
+    latest_failed_at_sq = (
+        select(PublishAttempt.attempted_at)
+        .where(PublishAttempt.submission_id == Submission.id, PublishAttempt.success.is_(False))
+        .order_by(PublishAttempt.attempted_at.desc())
+        .limit(1)
+        .correlate(Submission)
+        .scalar_subquery()
+    )
+
     rows = await session.execute(
         select(
             Submission.id,
+            Submission.author_display,
+            Submission.embed_title,
+            Submission.source_posted_at,
             Board.name.label("board_name"),
             SubmissionLink.canonical_url,
+            SubmissionLink.resolved_title,
+            SubmissionLink.resolved_image_path,
+            SubmissionLink.domain_family,
+            image_count_sq.label("image_count"),
+            latest_error_sq.label("error"),
+            latest_failed_at_sq.label("failed_at"),
         )
         .join(Board, Board.id == Submission.board_id)
         .outerjoin(
@@ -183,23 +275,28 @@ async def failed_submissions(session: AsyncSession) -> list[FailedSub]:
         .where(Submission.state == SubmissionState.PUBLISH_FAILED.value)
         .order_by(Submission.id.desc())
     )
+
     result: list[FailedSub] = []
     for r in rows:
-        last_attempt = await session.scalar(
-            select(PublishAttempt)
-            .where(
-                PublishAttempt.submission_id == r.id,
-                PublishAttempt.success.is_(False),
-            )
-            .order_by(PublishAttempt.attempted_at.desc())
-            .limit(1)
-        )
+        if r.domain_family == "bluesky":
+            post_type = "repost"
+        elif r.resolved_image_path:
+            post_type = "image"
+        else:
+            post_type = "link"
+
         result.append(FailedSub(
             submission_id=r.id,
             board_name=r.board_name,
+            post_type=post_type,
+            title=r.embed_title or r.resolved_title,
+            author_display=r.author_display or "",
             canonical_url=r.canonical_url,
-            error=last_attempt.error if last_attempt else None,
-            failed_at=last_attempt.attempted_at if last_attempt else None,
-            failed_rel=_relative(last_attempt.attempted_at if last_attempt else None),
+            image_count=r.image_count or 0,
+            source_posted_at=r.source_posted_at,
+            source_posted_rel=_relative(r.source_posted_at),
+            error=r.error,
+            failed_at=r.failed_at,
+            failed_rel=_relative(r.failed_at),
         ))
     return result

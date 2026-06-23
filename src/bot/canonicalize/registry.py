@@ -70,6 +70,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "youtube": ["youtube.com", "youtu.be", "youtube-nocookie.com"],
     "pixiv":   ["pixiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
+    "tumblr":  ["tumblr.com"],
 }
 
 
@@ -154,6 +155,18 @@ def _canon_flickr(scheme, host, path, query) -> tuple[str, str]:
     return urlunsplit(("https", "www.flickr.com", path, "", "")), "flickr"
 
 
+_TUMBLR_POST_RE = re.compile(r"^(/post/\d+)(?:/[^/]*)?$")
+
+
+def _canon_tumblr(scheme, host, path, query) -> tuple[str, str]:
+    # Preserve username.tumblr.com subdomain (it's the blog identity).
+    # Strip optional title slug: /post/123456789/some-slug → /post/123456789
+    # Drop all query params (source=share, etc.).
+    m = _TUMBLR_POST_RE.match(path)
+    canonical_path = m.group(1) if m else path.rstrip("/")
+    return urlunsplit(("https", host, canonical_path, "", "")), "tumblr"
+
+
 _HANDLERS = {
     "bluesky": _canon_bluesky,
     "reddit": _canon_reddit,
@@ -165,6 +178,7 @@ _HANDLERS = {
     "youtube": _canon_youtube,
     "pixiv": _canon_pixiv,
     "flickr": _canon_flickr,
+    "tumblr": _canon_tumblr,
 }
 
 

@@ -33,7 +33,7 @@ async def index(request: Request):
     settings: DashboardSettings = request.app.state.settings
     async with session_scope() as session:
         boards = await q.board_stats(session, settings)
-        publishes = await q.recent_publishes(session)
+        publishes = await q.recent_publishes(session, settings)
         failures = await q.failed_submissions(session)
 
     loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

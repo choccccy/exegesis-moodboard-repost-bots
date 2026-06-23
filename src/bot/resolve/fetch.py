@@ -115,6 +115,24 @@ async def _deviantart_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMet
     )
 
 
+async def _tumblr_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    endpoint = f"https://www.tumblr.com/oembed/1.0?url={quote(url, safe='')}"
+    resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    # Photo posts: prefer full image URL; all types fall back to thumbnail.
+    image = data.get("thumbnail_url")
+    if data.get("type") == "photo":
+        image = data.get("url") or image
+    return ResolvedMetadata(
+        title=data.get("title") or None,
+        description=data.get("author_name"),
+        image_url=image,
+        via="oembed",
+    )
+
+
 def _twitter_mirror_url(url: str) -> str:
     return url.replace("https://twitter.com/", "https://fxtwitter.com/", 1)
 
@@ -134,6 +152,7 @@ def _deviantart_mirror_url(url: str) -> str:
 _OEMBED_HANDLERS = {
     "youtube": _youtube_oembed,
     "deviantart": _deviantart_oembed,
+    "tumblr": _tumblr_oembed,
 }
 
 _MIRROR_URL_FUNCS = {

@@ -198,3 +198,46 @@ def test_heuristic_shorts_requires_11_char_id():
 
 def test_bare_domain_gets_https():
     assert c("example.com/x").startswith("https://example.com/x")
+
+
+# --- Tumblr ---
+
+def test_tumblr_strips_slug():
+    assert c("https://username.tumblr.com/post/123456789/some-title-slug") == (
+        "https://username.tumblr.com/post/123456789"
+    )
+
+
+def test_tumblr_no_slug_unchanged():
+    assert c("https://username.tumblr.com/post/123456789") == (
+        "https://username.tumblr.com/post/123456789"
+    )
+
+
+def test_tumblr_strips_source_share():
+    assert c("https://username.tumblr.com/post/123456789/slug?source=share") == (
+        "https://username.tumblr.com/post/123456789"
+    )
+
+
+def test_tumblr_strips_query_no_slug():
+    assert c("https://username.tumblr.com/post/123456789?source=share") == (
+        "https://username.tumblr.com/post/123456789"
+    )
+
+
+def test_tumblr_preserves_subdomain():
+    # username subdomain is the blog identity — must not be flattened.
+    result = canonicalize("https://cool-robots.tumblr.com/post/999")
+    assert "cool-robots.tumblr.com" in result.canonical_url
+
+
+def test_tumblr_non_post_path_strips_query():
+    # Blog root and tagged pages aren't post URLs; query still stripped.
+    assert c("https://username.tumblr.com/tagged/robots?source=share") == (
+        "https://username.tumblr.com/tagged/robots"
+    )
+
+
+def test_tumblr_family():
+    assert fam("https://username.tumblr.com/post/123456789") == "tumblr"
