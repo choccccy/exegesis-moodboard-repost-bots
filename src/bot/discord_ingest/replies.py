@@ -108,18 +108,14 @@ def thread_name(submission_id: int) -> str:
     return f"🦋 submission {submission_id}"
 
 
-def thread_anchor(
-    *, source_url: str, poster_mention: str, curator_mentions: list[str]
-) -> str:
-    """Top-of-thread message: anchors back to the source and pulls people in.
+def thread_anchor(*, poster_mention: str, curator_mentions: list[str]) -> str:
+    """Top-of-thread message: pulls people into the private thread.
 
     Mentioning the poster adds them to the private thread; curator role mentions
-    notify the (Manage-Threads-visible) curators.
+    notify the (Manage-Threads-visible) curators. The original message is
+    forwarded separately so curators can see the content inline.
     """
-    lines = [
-        f"🦋 new submission from {poster_mention}",
-        f"source: {source_url}",
-    ]
+    lines = [f"🦋 new submission from {poster_mention}"]
     if curator_mentions:
         lines.append(f"{' '.join(curator_mentions)} - help curate this repost")
     return "\n".join(lines)

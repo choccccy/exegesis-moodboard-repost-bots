@@ -147,7 +147,9 @@
         <span>queued</span>
         <span>
           {% if b.queued_count > 0 %}
-            <span class="badge badge-yellow">{{ b.queued_count }}</span>
+            <a href="/boards/{{ b.name }}" style="text-decoration:none">
+              <span class="badge badge-yellow">{{ b.queued_count }}</span>
+            </a>
           {% else %}
             <span class="badge badge-gray">0</span>
           {% endif %}
@@ -158,7 +160,9 @@
         <span>failed</span>
         <span>
           {% if b.failed_count > 0 %}
-            <span class="badge badge-red">{{ b.failed_count }}</span>
+            <a href="/boards/{{ b.name }}" style="text-decoration:none">
+              <span class="badge badge-red">{{ b.failed_count }}</span>
+            </a>
           {% else %}
             <span class="badge badge-gray">0</span>
           {% endif %}
@@ -232,64 +236,5 @@
   </div>
   {% else %}
   <p class="empty">no publishes yet</p>
-  {% endif %}
-</section>
-
-<section>
-  <h2>Failed submissions</h2>
-  {% if failures %}
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>board</th>
-          <th>type</th>
-          <th>title</th>
-          <th>by</th>
-          <th>source</th>
-          <th>discord posted</th>
-          <th>failed</th>
-          <th>error</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for f in failures %}
-        <tr>
-          <td style="color:#555; white-space:nowrap">#{{ f.submission_id }}</td>
-          <td style="white-space:nowrap">{{ f.board_name }}</td>
-          <td>
-            {% if f.post_type == "repost" %}
-              <span class="badge badge-blue">repost</span>
-            {% elif f.post_type == "image" %}
-              <span class="badge badge-purple">image{% if f.image_count > 1 %} ×{{ f.image_count }}{% endif %}</span>
-            {% else %}
-              <span class="badge badge-gray">link</span>
-            {% endif %}
-          </td>
-          <td style="max-width:260px">{{ f.title or "—" }}</td>
-          <td style="white-space:nowrap; color:#777">{{ f.author_display or "—" }}</td>
-          <td>
-            {% if f.canonical_url %}
-              <a href="{{ f.canonical_url }}" target="_blank" title="{{ f.canonical_url }}">{{ f.canonical_url }}</a>
-            {% else %}—{% endif %}
-          </td>
-          <td style="color:#555; white-space:nowrap">{{ f.source_posted_rel }}</td>
-          <td style="color:#555; white-space:nowrap">{{ f.failed_rel }}</td>
-          <td style="max-width:320px">
-            {% if f.error %}
-            <details>
-              <summary style="cursor:pointer; color:#f87171; font-size:12px">{{ f.error | truncate(80) }}</summary>
-              <pre style="margin-top:6px; font-size:11px; color:#f87171; white-space:pre-wrap; word-break:break-all">{{ f.error }}</pre>
-            </details>
-            {% else %}—{% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% else %}
-  <p class="empty">no failed submissions</p>
   {% endif %}
 </section>

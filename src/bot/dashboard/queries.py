@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Attachment, Board, PublishAttempt, Submission, SubmissionLink
@@ -66,22 +66,6 @@ class RecentPublish:
     source_posted_rel: str
     attempted_at: datetime
     attempted_rel: str
-
-
-@dataclass
-class FailedSub:
-    submission_id: int
-    board_name: str
-    post_type: str
-    title: str | None
-    author_display: str
-    canonical_url: str | None
-    image_count: int
-    source_posted_at: datetime | None
-    source_posted_rel: str
-    error: str | None
-    failed_at: datetime | None
-    failed_rel: str
 
 
 async def board_stats(session: AsyncSession, settings: DashboardSettings) -> list[BoardStat]:
@@ -221,14 +205,36 @@ async def recent_publishes(
     return result
 
 
-async def failed_submissions(session: AsyncSession) -> list[FailedSub]:
+@dataclass
+class QueuedItem:
+    submission_id: int
+    post_type: str
+    title: str | None
+    author_display: str
+    canonical_url: str | None
+    image_count: int
+    is_fresh: bool
+    source_posted_at: datetime | None
+    source_posted_rel: str
+    queued_since_rel: str
+    state: str  # "queued" | "failed"
+    error: str | None
+
+
+async def board_queue(
+    session: AsyncSession, board_name: str, settings: DashboardSettings
+) -> tuple[Board | None, list[QueuedItem]]:
+    board = await session.scalar(select(Board).where(Board.name == board_name))
+    if board is None:
+        return None, []
+
+    now_utc = datetime.now(timezone.utc)
+    fresh_cutoff = now_utc - timedelta(hours=settings.queue_fresh_window_hours)
+
     image_count_sq = (
         select(func.count())
         .select_from(Attachment)
-        .where(
-            Attachment.submission_id == Submission.id,
-            Attachment.is_image.is_(True),
-        )
+        .where(Attachment.submission_id == Submission.id, Attachment.is_image.is_(True))
         .correlate(Submission)
         .scalar_subquery()
     )
@@ -240,31 +246,24 @@ async def failed_submissions(session: AsyncSession) -> list[FailedSub]:
         .correlate(Submission)
         .scalar_subquery()
     )
-    latest_failed_at_sq = (
-        select(PublishAttempt.attempted_at)
-        .where(PublishAttempt.submission_id == Submission.id, PublishAttempt.success.is_(False))
-        .order_by(PublishAttempt.attempted_at.desc())
-        .limit(1)
-        .correlate(Submission)
-        .scalar_subquery()
-    )
+
+    _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
 
     rows = await session.execute(
         select(
             Submission.id,
+            Submission.state,
             Submission.author_display,
             Submission.embed_title,
             Submission.source_posted_at,
-            Board.name.label("board_name"),
+            Submission.created_at,
             SubmissionLink.canonical_url,
             SubmissionLink.resolved_title,
             SubmissionLink.resolved_image_path,
             SubmissionLink.domain_family,
             image_count_sq.label("image_count"),
             latest_error_sq.label("error"),
-            latest_failed_at_sq.label("failed_at"),
         )
-        .join(Board, Board.id == Submission.board_id)
         .outerjoin(
             SubmissionLink,
             and_(
@@ -272,31 +271,44 @@ async def failed_submissions(session: AsyncSession) -> list[FailedSub]:
                 SubmissionLink.order_index == 0,
             ),
         )
-        .where(Submission.state == SubmissionState.PUBLISH_FAILED.value)
-        .order_by(Submission.id.desc())
+        .where(Submission.board_id == board.id, Submission.state.in_(_eligible))
+        .order_by(
+            case(
+                (
+                    and_(
+                        Submission.source_posted_at.isnot(None),
+                        Submission.source_posted_at >= fresh_cutoff,
+                    ),
+                    0,
+                ),
+                else_=1,
+            ),
+            Submission.source_posted_at.nulls_last(),
+            Submission.created_at,
+        )
     )
 
-    result: list[FailedSub] = []
+    items: list[QueuedItem] = []
     for r in rows:
+        is_fresh = r.source_posted_at is not None and r.source_posted_at >= fresh_cutoff
         if r.domain_family == "bluesky":
             post_type = "repost"
         elif r.resolved_image_path:
             post_type = "image"
         else:
             post_type = "link"
-
-        result.append(FailedSub(
+        items.append(QueuedItem(
             submission_id=r.id,
-            board_name=r.board_name,
             post_type=post_type,
             title=r.embed_title or r.resolved_title,
             author_display=r.author_display or "",
             canonical_url=r.canonical_url,
             image_count=r.image_count or 0,
+            is_fresh=is_fresh,
             source_posted_at=r.source_posted_at,
             source_posted_rel=_relative(r.source_posted_at),
+            queued_since_rel=_relative(r.created_at),
+            state="failed" if r.state == SubmissionState.PUBLISH_FAILED.value else "queued",
             error=r.error,
-            failed_at=r.failed_at,
-            failed_rel=_relative(r.failed_at),
         ))
-    return result
+    return board, items

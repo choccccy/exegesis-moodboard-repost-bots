@@ -1,0 +1,158 @@
+<title>{{ board_name }} queue — exegesis moodboards</title>
+<meta http-equiv="refresh" content="120">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    background: #0f0f0f;
+    color: #e0e0e0;
+    padding: 24px;
+  }
+  a { color: #60a5fa; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 28px;
+    border-bottom: 1px solid #222;
+    padding-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+  .header-meta { font-size: 12px; color: #555; }
+
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
+       letter-spacing: 0.06em; color: #777; margin-bottom: 12px; }
+
+  section { margin-bottom: 36px; }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 99px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge-green  { background: #14532d; color: #86efac; }
+  .badge-yellow { background: #422006; color: #fcd34d; }
+  .badge-gray   { background: #1f1f1f; color: #777; }
+  .badge-blue   { background: #1e3a5f; color: #93c5fd; }
+  .badge-purple { background: #2e1065; color: #c4b5fd; }
+  .badge-red    { background: #450a0a; color: #fca5a5; }
+
+  .table-wrap { overflow-x: auto; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th {
+    text-align: left;
+    font-weight: 500;
+    color: #555;
+    padding: 6px 10px;
+    border-bottom: 1px solid #222;
+  }
+  td {
+    padding: 7px 10px;
+    border-bottom: 1px solid #1a1a1a;
+    color: #ccc;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #161616; }
+
+  .empty { color: #444; font-style: italic; padding: 12px 0; }
+  details summary { list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+</style>
+
+<header>
+  <h1>
+    <a href="/" style="color:#555; font-size:14px; margin-right:4px">← dashboard</a>
+    🦋 {{ board_name }}
+    {% if handle %}<span style="font-size:13px; font-weight:400; color:#555">@{{ handle }}</span>{% endif %}
+  </h1>
+  <span class="header-meta">queue · {{ items | length }} item{% if items | length != 1 %}s{% endif %} · auto-refreshes every 2 min · {{ loaded_at }}</span>
+</header>
+
+<section>
+  {% if items %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>freshness</th>
+          <th>type</th>
+          <th>title</th>
+          <th>by</th>
+          <th>source</th>
+          <th>discord posted</th>
+          <th>queued</th>
+          <th>state</th>
+          <th>error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td style="color:#555">#{{ item.submission_id }}</td>
+          <td>
+            {% if item.is_fresh %}
+              <span class="badge badge-green">fresh</span>
+            {% else %}
+              <span class="badge badge-gray">backlog</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if item.post_type == "repost" %}
+              <span class="badge badge-blue">repost</span>
+            {% elif item.post_type == "image" %}
+              <span class="badge badge-purple">image{% if item.image_count > 1 %} ×{{ item.image_count }}{% endif %}</span>
+            {% else %}
+              <span class="badge badge-gray">link</span>
+            {% endif %}
+          </td>
+          <td style="max-width:280px">{{ item.title or "—" }}</td>
+          <td style="color:#777; white-space:nowrap">{{ item.author_display or "—" }}</td>
+          <td>
+            {% if item.canonical_url %}
+              <a href="{{ item.canonical_url }}" target="_blank" title="{{ item.canonical_url }}">{{ item.canonical_url }}</a>
+            {% else %}—{% endif %}
+          </td>
+          <td style="color:#555; white-space:nowrap">{{ item.source_posted_rel }}</td>
+          <td style="color:#555; white-space:nowrap">{{ item.queued_since_rel }}</td>
+          <td>
+            {% if item.state == "failed" %}
+              <span class="badge badge-red">failed</span>
+            {% else %}
+              <span class="badge badge-yellow">queued</span>
+            {% endif %}
+          </td>
+          <td style="max-width:320px">
+            {% if item.error %}
+            <details>
+              <summary style="cursor:pointer; color:#f87171; font-size:12px">{{ item.error | truncate(80) }}</summary>
+              <pre style="margin-top:6px; font-size:11px; color:#f87171; white-space:pre-wrap; word-break:break-all">{{ item.error }}</pre>
+            </details>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">nothing in the queue for this board</p>
+  {% endif %}
+</section>

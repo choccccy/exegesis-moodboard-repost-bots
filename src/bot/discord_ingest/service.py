@@ -232,26 +232,33 @@ async def _post_thread_anchor(
     submission: Submission,
     thread: discord.Thread,
 ) -> None:
-    """Anchor the private thread: jump link + add the poster + ping curators."""
-    guild_id = message.guild.id if message.guild else 0
-    source_url = (
-        f"https://discord.com/channels/{guild_id}/{submission.channel_id}/"
-        f"{submission.source_discord_message_id}"
-    )
+    """Anchor the private thread: mention poster + curators, then forward the source message."""
     cfg = settings.board_for_channel(submission.channel_id)
     curator_mentions = [f"<@&{rid}>" for rid in (cfg.curator_role_ids if cfg else [])]
     text = replies.thread_anchor(
-        source_url=source_url,
         poster_mention=f"<@{submission.author_id}>",  # mention adds them to the private thread
         curator_mentions=curator_mentions,
     )
     try:
-        await thread.send(
-            text,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-        )
+        await thread.send(text, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.warning("could not post thread anchor for submission %s: %s", submission.id, exc)
+
+    # Forward the original message so curators see the content inline.
+    try:
+        await message.forward(thread)
+    except (discord.Forbidden, discord.HTTPException, AttributeError) as exc:
+        # Fall back to a jump link if forward is unavailable or fails.
+        guild_id = message.guild.id if message.guild else 0
+        jump = (
+            f"https://discord.com/channels/{guild_id}/{submission.channel_id}/"
+            f"{submission.source_discord_message_id}"
+        )
+        log.warning("message forward failed for submission %s, falling back to jump link: %s", submission.id, exc)
+        try:
+            await thread.send(f"↗ {jump}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
 
 async def _derive_thread_title(
@@ -693,6 +700,30 @@ async def _has_open_request(session: AsyncSession, model, submission_id: int, **
     return (await session.scalar(stmt)) is not None
 
 
+_QUEUE_TERMINAL = frozenset({
+    SubmissionState.QUEUED.value,
+    SubmissionState.PUBLISHED.value,
+    SubmissionState.PUBLISH_FAILED.value,
+})
+
+
+def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
+    """Decide what to do when evaluate_state returns READY_TO_QUEUE.
+
+    Returns one of:
+      "fresh"  — first time reaching READY_TO_QUEUE; post confirmation + queue
+      "silent" — was stuck at READY_TO_QUEUE; transition to QUEUED without reposting
+      "none"   — already queued/published/failed; no state change
+    """
+    if evaluated != SubmissionState.READY_TO_QUEUE:
+        return "none"
+    if old_state in _QUEUE_TERMINAL:
+        return "none"
+    if old_state == SubmissionState.READY_TO_QUEUE.value:
+        return "silent"
+    return "fresh"
+
+
 async def recompute_and_request(
     session: AsyncSession,
     submission: Submission,
@@ -707,9 +738,13 @@ async def recompute_and_request(
     old_state = submission.state
     snap, atts, links = await _snapshot(session, submission)
     new_state = evaluate_state(snap)
-    submission.state = new_state.value
     gaps = set(missing_gaps(snap))
     mention = f"<@{submission.author_id}>"
+
+    # Don't overwrite state for submissions already past READY_TO_QUEUE — evaluate_state
+    # is content-based and would otherwise downgrade QUEUED/PUBLISHED back to ready_to_queue.
+    if old_state not in _QUEUE_TERMINAL:
+        submission.state = new_state.value
 
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
@@ -767,18 +802,14 @@ async def recompute_and_request(
             ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
         )
 
-    _already_done = (
-        SubmissionState.READY_TO_QUEUE.value,
-        SubmissionState.QUEUED.value,
-        SubmissionState.PUBLISHED.value,
-        SubmissionState.PUBLISH_FAILED.value,
-    )
-    if new_state == SubmissionState.READY_TO_QUEUE and old_state not in _already_done:
-        await destination.send(replies.ready_confirmation())
-        preview = await _build_post_preview(session, submission, atts, links)
-        await destination.send(replies.format_post_preview(preview))
+    action = _queue_action(old_state, new_state)
+    if action != "none":
+        if action == "fresh":
+            await destination.send(replies.ready_confirmation())
+            preview = await _build_post_preview(session, submission, atts, links)
+            await destination.send(replies.format_post_preview(preview))
+            await destination.send(replies.queued_notice())
         submission.state = SubmissionState.QUEUED.value
-        await destination.send(replies.queued_notice())
         log.info("submission %s queued", submission.id)
 
     return new_state
