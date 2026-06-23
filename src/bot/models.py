@@ -72,6 +72,9 @@ class Submission(Base):
     embed_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     embed_thumb_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # When the original Discord message was posted (used for freshness / queue ordering).
+    # Populated from message.created_at at ingest; kept distinct from created_at (ingest time).
+    source_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -94,6 +97,9 @@ class Submission(Base):
         back_populates="submission", cascade="all, delete-orphan"
     )
     image_requests: Mapped[list["ImageRequest"]] = relationship(
+        back_populates="submission", cascade="all, delete-orphan"
+    )
+    metadata_requests: Mapped[list["MetadataRequest"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
     publish_attempts: Mapped[list["PublishAttempt"]] = relationship(
@@ -185,6 +191,19 @@ class ImageRequest(_RequestMixin, Base):
 
     submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
     submission: Mapped["Submission"] = relationship(back_populates="image_requests")
+
+
+class MetadataRequest(_RequestMixin, Base):
+    """Tracks a bot prompt asking for a more embeddable link (or 🔗 confirmation).
+
+    answer == "confirmed" means the curator reacted 🔗 (best link as-is).
+    answer == <url> means they replied with a replacement link.
+    """
+
+    __tablename__ = "metadata_requests"
+
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    submission: Mapped["Submission"] = relationship(back_populates="metadata_requests")
 
 
 class PublishAttempt(Base):

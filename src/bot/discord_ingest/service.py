@@ -31,6 +31,7 @@ from ..models import (
     Board,
     ContentLabelRequest,
     ImageRequest,
+    MetadataRequest,
     PublishAttempt,
     SourceRequest,
     Submission,
@@ -93,6 +94,27 @@ async def _board_for_channel(session: AsyncSession, channel_id: int) -> Board | 
     )
 
 
+async def _find_prior_post(
+    session: AsyncSession, canonical_url: str, exclude_submission_id: int
+) -> str | None:
+    """Return the bsky_url (or at_uri) of an earlier published submission with the same canonical URL."""
+    attempt = await session.scalar(
+        select(PublishAttempt)
+        .join(Submission, PublishAttempt.submission_id == Submission.id)
+        .join(SubmissionLink, SubmissionLink.submission_id == Submission.id)
+        .where(
+            SubmissionLink.canonical_url == canonical_url,
+            PublishAttempt.success.is_(True),
+            Submission.id != exclude_submission_id,
+        )
+        .order_by(PublishAttempt.id.desc())
+        .limit(1)
+    )
+    if attempt is None:
+        return None
+    return attempt.bsky_url or attempt.at_uri
+
+
 # --- submission creation + content ingest -----------------------------------
 
 
@@ -127,6 +149,7 @@ async def handle_reaction(
             graphic_classification_required=(
                 cfg.require_graphic_classification if cfg else True
             ),
+            source_posted_at=message.created_at,
         )
         session.add(submission)
         await session.flush()  # assign submission.id
@@ -138,6 +161,17 @@ async def handle_reaction(
     if thread is None:
         log.warning("could not create/resolve thread for submission %s", submission.id)
         return
+
+    if created:
+        links = list(await session.scalars(
+            select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
+        ))
+        for link in links:
+            prior = await _find_prior_post(session, link.canonical_url, submission.id)
+            if prior:
+                await thread.send(replies.duplicate_warning(prior))
+                break
+
     await recompute_and_request(session, submission, settings=settings, destination=thread)
 
 
@@ -317,6 +351,7 @@ async def handle_reaction_removed(
         AttachmentAltTextRequest,
         ContentLabelRequest,
         ImageRequest,
+        MetadataRequest,
         PublishAttempt,
         SubmissionLink,
         Attachment,
@@ -366,6 +401,38 @@ async def handle_label_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     # The reaction is on a message in the thread, so `channel` is the thread.
+    await recompute_and_request(session, submission, settings=settings, destination=channel)
+
+
+async def handle_metadata_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    member: discord.Member | None,
+    user_id: int,
+) -> None:
+    """A curator reacted 🔗 on a metadata-request message — confirm this is the best link."""
+    req = await session.scalar(
+        select(MetadataRequest).where(
+            MetadataRequest.bot_message_id == message_id,
+            MetadataRequest.answered_at.is_(None),
+        )
+    )
+    if req is None:
+        return
+    submission = await session.get(Submission, req.submission_id)
+    if submission is None:
+        return
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    if not _reaction_authorized(member, user_id, submission, board_cfg):
+        return
+
+    req.answer = "confirmed"
+    req.answered_by = user_id
+    req.answered_at = _now()
+    await channel.send(replies.metadata_confirmed())
     await recompute_and_request(session, submission, settings=settings, destination=channel)
 
 
@@ -596,6 +663,13 @@ async def _snapshot(
     primary = _primary_link(links)
     has_embed_image = bool(primary.resolved_image_path) if primary else False
     image_statuses = [AltTextStatus(a.alt_text_status) for a in atts if a.is_image]
+    resolved_via = primary.resolved_via if primary else None
+    confirmed_meta = await session.scalar(
+        select(MetadataRequest).where(
+            MetadataRequest.submission_id == submission.id,
+            MetadataRequest.answer == "confirmed",
+        )
+    )
     snap = SubmissionSnapshot(
         has_canonical_link=len(links) > 0,
         image_alt_statuses=image_statuses,
@@ -603,6 +677,9 @@ async def _snapshot(
         graphic_classification_required=submission.graphic_classification_required,
         needs_image=kind in ("images", "external"),
         has_image=has_uploaded_image or has_embed_image,
+        needs_metadata=kind == "external",
+        resolved_via=resolved_via,
+        metadata_confirmed=confirmed_meta is not None,
     )
     return snap, atts, links
 
@@ -640,7 +717,20 @@ async def recompute_and_request(
         msg = await destination.send(replies.source_request(mention))
         session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
 
-    if Gap.IMAGE in gaps and not await _has_open_request(
+    if Gap.METADATA in gaps and not await _has_open_request(
+        session, MetadataRequest, submission.id
+    ):
+        primary = _primary_link(links)
+        url = primary.canonical_url if primary else "?"
+        msg = await destination.send(replies.metadata_request(mention, url))
+        try:
+            await msg.add_reaction(replies.METADATA_CONFIRM_EMOJI)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not add metadata confirm reaction: %s", exc)
+        session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
+
+    # IMAGE gap is suppressed while METADATA is open — a better link may provide an image.
+    if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
         session, ImageRequest, submission.id
     ):
         msg = await destination.send(replies.image_request(mention))
@@ -687,10 +777,32 @@ async def recompute_and_request(
         await destination.send(replies.ready_confirmation())
         preview = await _build_post_preview(session, submission, atts, links)
         await destination.send(replies.format_post_preview(preview))
-        log.info("submission %s is ready_to_queue, attempting publish", submission.id)
-        await _attempt_publish(session, settings, submission, atts, links, destination)
+        submission.state = SubmissionState.QUEUED.value
+        await destination.send(replies.queued_notice())
+        log.info("submission %s queued", submission.id)
 
     return new_state
+
+
+async def publish_queued_submission(
+    session: AsyncSession,
+    settings: Settings,
+    submission: Submission,
+    destination: discord.abc.Messageable | None,
+) -> None:
+    """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
+
+    Loads current attachments and links from DB, then delegates to _attempt_publish.
+    ``destination`` is the submission thread (or None if the thread can't be resolved —
+    publish still proceeds, just without a Discord status notice).
+    """
+    _snap, atts, links = await _snapshot(session, submission)
+    if destination is None:
+        class _DevNull:
+            async def send(self, *a, **kw):
+                pass
+        destination = _DevNull()  # type: ignore[assignment]
+    await _attempt_publish(session, settings, submission, atts, links, destination)
 
 
 async def _attempt_publish(
@@ -816,7 +928,7 @@ async def handle_reply(
     bot_msg_id = ref.message_id
 
     req = None
-    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest):
+    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest):
         req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
         if req is not None:
             break
@@ -903,6 +1015,32 @@ async def _apply_answer(
             await message.reply(replies.graphic_not_understood(), mention_author=False)
             return False
         submission.graphic_status = status.value
+
+    elif isinstance(req, MetadataRequest):
+        urls = extract_urls(message.content)
+        if not urls:
+            await message.reply(replies.metadata_url_not_found(), mention_author=False)
+            return False
+        new_raw = urls[0]
+        canon = canonicalize(new_raw)
+        primary = _primary_link(
+            list((await session.scalars(
+                select(SubmissionLink)
+                .where(SubmissionLink.submission_id == submission.id)
+                .order_by(SubmissionLink.order_index)
+            )).all())
+        )
+        if primary is not None:
+            primary.raw_url = new_raw
+            primary.canonical_url = canon.canonical_url
+            primary.domain_family = canon.domain_family
+            primary.resolved_title = None
+            primary.resolved_description = None
+            primary.resolved_image_url = None
+            primary.resolved_image_path = None
+            primary.resolved_via = None
+        await message.reply(replies.metadata_link_updated(canon.canonical_url), mention_author=False)
+        await _resolve_links(session, submission, settings, http_client)
 
     req.answer = message.content
     req.answered_by = message.author.id

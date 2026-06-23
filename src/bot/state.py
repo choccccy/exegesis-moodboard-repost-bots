@@ -14,6 +14,7 @@ from dataclasses import dataclass
 class SubmissionState(str, enum.Enum):
     INTENT_SUBMITTED = "intent_submitted"
     AWAITING_SOURCE = "awaiting_source"
+    AWAITING_BETTER_LINK = "awaiting_better_link"
     AWAITING_IMAGE = "awaiting_image"
     AWAITING_ALT_TEXT = "awaiting_alt_text"
     AWAITING_GRAPHIC_CLASSIFICATION = "awaiting_graphic_classification"
@@ -40,6 +41,7 @@ class Gap(str, enum.Enum):
     """A category of missing information that blocks publication."""
 
     SOURCE = "source"
+    METADATA = "metadata"
     IMAGE = "image"
     ALT_TEXT = "alt_text"
     GRAPHIC = "graphic"
@@ -61,13 +63,31 @@ class SubmissionSnapshot:
     needs_image: bool = False
     # Satisfied by an uploaded image OR an external-embed thumbnail.
     has_image: bool = True
+    # Whether metadata resolution is required (True for external links only).
+    needs_metadata: bool = False
+    # "none" when the resolver found nothing; other values (oembed, opengraph,
+    # html, discord) mean we have at least something useful.
+    resolved_via: str | None = None
+    # True when the curator reacted 🔗 to confirm this is the best available link.
+    metadata_confirmed: bool = False
 
 
 def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
-    """Return the ordered list of information gaps still blocking the submission."""
+    """Return the ordered list of information gaps still blocking the submission.
+
+    Priority: SOURCE > METADATA > IMAGE > ALT_TEXT > GRAPHIC.
+    METADATA before IMAGE so that a better link has a chance to provide an image.
+    """
     gaps: list[Gap] = []
     if not snap.has_canonical_link:
         gaps.append(Gap.SOURCE)
+    if (
+        snap.needs_metadata
+        and snap.has_canonical_link
+        and snap.resolved_via in (None, "none")
+        and not snap.metadata_confirmed
+    ):
+        gaps.append(Gap.METADATA)
     if snap.needs_image and not snap.has_image:
         gaps.append(Gap.IMAGE)
     if any(s == AltTextStatus.NEEDED for s in snap.image_alt_statuses):
@@ -79,6 +99,7 @@ def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
 
 _GAP_STATE = {
     Gap.SOURCE: SubmissionState.AWAITING_SOURCE,
+    Gap.METADATA: SubmissionState.AWAITING_BETTER_LINK,
     Gap.IMAGE: SubmissionState.AWAITING_IMAGE,
     Gap.ALT_TEXT: SubmissionState.AWAITING_ALT_TEXT,
     Gap.GRAPHIC: SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION,

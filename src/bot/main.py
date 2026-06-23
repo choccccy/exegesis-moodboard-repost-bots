@@ -9,7 +9,7 @@ from .config import get_settings
 from .db import dispose_engine, init_engine
 from .discord_ingest import RepostBot
 from .logging_setup import configure_logging
-from .scheduler import run_housekeeping
+from .scheduler import run_housekeeping, run_queue_dispatcher
 
 log = logging.getLogger(__name__)
 
@@ -25,12 +25,14 @@ async def amain() -> None:
     bot = RepostBot(settings)
     stop = asyncio.Event()
     housekeeping = asyncio.create_task(run_housekeeping(settings, stop))
+    queue_dispatcher = asyncio.create_task(run_queue_dispatcher(bot, settings, stop))
 
     try:
         await bot.start(settings.discord_bot_token)
     finally:
         stop.set()
         housekeeping.cancel()
+        queue_dispatcher.cancel()
         if not bot.is_closed():
             await bot.close()
         await dispose_engine()

@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     catchup_lookback_hours: int = Field(168, alias="CATCHUP_LOOKBACK_HOURS")
     catchup_max_messages: int = Field(500, alias="CATCHUP_MAX_MESSAGES")
 
+    # Queue / posting cadence.
+    # Posts fire at most once per hour, starting at queue_start_hour in the given timezone.
+    # Fresh submissions (created within queue_fresh_window_hours) get a higher daily cap.
+    queue_timezone: str = Field("America/Denver", alias="QUEUE_TIMEZONE")
+    queue_start_hour: int = Field(12, alias="QUEUE_START_HOUR")
+    queue_fresh_window_hours: int = Field(72, alias="QUEUE_FRESH_WINDOW_HOURS")
+    queue_fresh_daily_cap: int = Field(6, alias="QUEUE_FRESH_DAILY_CAP")
+    queue_backlog_daily_cap: int = Field(3, alias="QUEUE_BACKLOG_DAILY_CAP")
+
     # Per-board Bluesky app passwords. Named BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>
     # where BOARD_NAME_UPPER is the board name uppercased with hyphens replaced by underscores.
     # e.g. board "robot-posting" -> BSKY_APP_PASSWORD_ROBOT_POSTING

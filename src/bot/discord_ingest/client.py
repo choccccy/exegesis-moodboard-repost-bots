@@ -12,7 +12,7 @@ import httpx
 from ..config import Settings
 from ..db import session_scope
 from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
-from . import service
+from . import replies, service
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,20 @@ class RepostBot(discord.Client):
                     channel=channel,
                     message_id=payload.message_id,
                     emoji=emoji,
+                    member=payload.member,
+                    user_id=payload.user_id,
+                )
+
+        if emoji == replies.METADATA_CONFIRM_EMOJI:
+            channel = await self._resolve_channel(payload.channel_id)
+            if channel is None:
+                return
+            async with session_scope() as session:
+                await service.handle_metadata_reaction(
+                    session,
+                    settings=self.settings,
+                    channel=channel,
+                    message_id=payload.message_id,
                     member=payload.member,
                     user_id=payload.user_id,
                 )

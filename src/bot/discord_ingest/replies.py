@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 
 from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
 
+METADATA_CONFIRM_EMOJI = "🔗"
+
 
 def source_request(mention: str) -> str:
     return f"{mention} reply to this message with the source URL"
@@ -37,6 +39,25 @@ def ready_confirmation() -> str:
     return "✓ all required info received - this submission is ready to queue"
 
 
+def metadata_request(mention: str, url: str) -> str:
+    return (
+        f"{mention} couldn't get any metadata from **{url}** — reply with a more embeddable "
+        f"link, or react {METADATA_CONFIRM_EMOJI} to use it as-is (at least one image will be required)"
+    )
+
+
+def metadata_confirmed() -> str:
+    return f"{METADATA_CONFIRM_EMOJI} noted — link confirmed as best available; at least one image must be attached"
+
+
+def metadata_link_updated(new_url: str) -> str:
+    return f"updated source to {new_url} — re-resolving metadata…"
+
+
+def metadata_url_not_found() -> str:
+    return f"no URL found — reply again with a link, or react {METADATA_CONFIRM_EMOJI} to use the existing one as-is"
+
+
 def source_not_found() -> str:
     return "couldn't find a URL in that reply - reply again with the source URL"
 
@@ -64,8 +85,22 @@ def reposted_notice(bsky_url: str) -> str:
     return f"reposted to Bluesky: {bsky_url}"
 
 
+def queued_notice() -> str:
+    return "queued — will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
+
+
 def publish_failed_notice(error: str | None) -> str:
-    return f"publish failed: {error or 'unknown error'}"
+    return (
+        f"publish failed: {error or 'unknown error'}\n"
+        "will retry automatically at the next available queue slot"
+    )
+
+
+def duplicate_warning(bsky_url: str) -> str:
+    return (
+        f"⚠ this URL was already posted: {bsky_url}\n"
+        "proceeding anyway — remove 🦋 if this was a mistake"
+    )
 
 
 def thread_name(submission_id: int) -> str:

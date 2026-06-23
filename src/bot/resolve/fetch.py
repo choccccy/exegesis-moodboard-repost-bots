@@ -101,6 +101,49 @@ async def _youtube_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetada
     )
 
 
+async def _deviantart_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    endpoint = f"https://backend.deviantart.com/oembed?url={quote(url, safe='')}&format=json"
+    resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    return ResolvedMetadata(
+        title=data.get("title"),
+        description=data.get("author_name"),
+        image_url=data.get("thumbnail_url") or data.get("url"),
+        via="oembed",
+    )
+
+
+def _twitter_mirror_url(url: str) -> str:
+    return url.replace("https://twitter.com/", "https://fxtwitter.com/", 1)
+
+
+def _reddit_mirror_url(url: str) -> str:
+    return url.replace("https://www.reddit.com/", "https://vxreddit.com/", 1)
+
+
+def _instagram_mirror_url(url: str) -> str:
+    return url.replace("https://www.instagram.com/", "https://kkinstagram.com/", 1)
+
+
+def _deviantart_mirror_url(url: str) -> str:
+    return url.replace("https://www.deviantart.com", "https://fixdeviantart.com", 1)
+
+
+_OEMBED_HANDLERS = {
+    "youtube": _youtube_oembed,
+    "deviantart": _deviantart_oembed,
+}
+
+_MIRROR_URL_FUNCS = {
+    "twitter": _twitter_mirror_url,
+    "reddit": _reddit_mirror_url,
+    "instagram": _instagram_mirror_url,
+    "deviantart": _deviantart_mirror_url,
+}
+
+
 async def _fetch_opengraph(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
     resp = await client.get(
         url, headers=_HEADERS, timeout=_FETCH_TIMEOUT, follow_redirects=True
@@ -131,8 +174,15 @@ async def resolve(
 
     meta: ResolvedMetadata | None = None
     try:
-        if family == "youtube":
-            meta = await _youtube_oembed(url, client)
+        # 1. Try oEmbed if available for this family.
+        if family in _OEMBED_HANDLERS:
+            meta = await _OEMBED_HANDLERS[family](url, client)
+        # 2. Try mirror URL for OpenGraph (better than canonical for blocked platforms).
+        if meta is None and family in _MIRROR_URL_FUNCS:
+            mirror = _MIRROR_URL_FUNCS[family](url)
+            if mirror != url:
+                meta = await _fetch_opengraph(mirror, client)
+        # 3. Fall back to fetching canonical URL directly.
         if meta is None:
             meta = await _fetch_opengraph(url, client)
     except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:

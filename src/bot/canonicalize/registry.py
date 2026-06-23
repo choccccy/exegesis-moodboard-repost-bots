@@ -56,14 +56,20 @@ def _family_from_host(host: str) -> str | None:
 
 # host substrings -> family
 _DOMAIN_FAMILIES: dict[str, list[str]] = {
-    "bluesky": ["bsky.app", "bsky.social"],
-    "reddit": ["reddit.com", "redd.it"],
-    "twitter": ["twitter.com", "x.com", "fxtwitter.com", "fixupx.com", "vxtwitter.com", "nitter.net"],
+    "bluesky": ["bsky.app", "bsky.social", "xbsky.app"],
+    "reddit": ["reddit.com", "redd.it", "vxreddit.com", "rxddit.com"],
+    "twitter": [
+        "twitter.com", "x.com",
+        "fxtwitter.com", "fixupx.com", "vxtwitter.com",
+        "nitter.net", "girlcockx.com", "xcancel.com",
+    ],
     "artstation": ["artstation.com", "artstn.co"],
-    "deviantart": ["deviantart.com", "fav.me"],
-    "wikipedia": ["wikipedia.org"],
-    "instagram": ["instagram.com", "ddinstagram.com", "instagramez.com"],
+    "deviantart": ["deviantart.com", "fav.me", "fixdeviantart.com"],
+    "wikipedia": ["wikipedia.org"],  # mobile (en.m.wikipedia.org) matched via suffix
+    "instagram": ["instagram.com", "ddinstagram.com", "instagramez.com", "kkinstagram.com"],
     "youtube": ["youtube.com", "youtu.be", "youtube-nocookie.com"],
+    "pixiv":   ["pixiv.net"],
+    "flickr":  ["flickr.com", "flic.kr"],
 }
 
 
@@ -90,8 +96,16 @@ def _canon_artstation(scheme, host, path, query) -> tuple[str, str]:
 
 
 def _canon_deviantart(scheme, host, path, query) -> tuple[str, str]:
-    # Preserve the host (deviantart usernames are subdomains) but strip query.
-    return urlunsplit(("https", host, path.rstrip("/"), "", "")), "deviantart"
+    # Normalize fix mirror to canonical.
+    if "fixdeviantart.com" in host:
+        return urlunsplit(("https", "www.deviantart.com", path.rstrip("/"), "", "")), "deviantart"
+    # Old-style artist subdomains (artist.deviantart.com) -> www.deviantart.com/artist/...
+    if host.endswith(".deviantart.com") and not host.startswith(("www.", "backend.")):
+        username = host.split(".deviantart.com")[0]
+        new_path = f"/{username}{path.rstrip('/')}"
+        return urlunsplit(("https", "www.deviantart.com", new_path, "", "")), "deviantart"
+    # fav.me short links and www.deviantart.com: strip query.
+    return urlunsplit(("https", "www.deviantart.com", path.rstrip("/"), "", "")), "deviantart"
 
 
 def _canon_wikipedia(scheme, host, path, query) -> tuple[str, str]:
@@ -131,6 +145,15 @@ def _canon_youtube(scheme, host, path, query) -> tuple[str, str]:
     return urlunsplit(("https", host, path, _strip_tracking(query, keep=keep), "")), "youtube"
 
 
+def _canon_pixiv(scheme, host, path, query) -> tuple[str, str]:
+    return urlunsplit(("https", "www.pixiv.net", path.rstrip("/"), "", "")), "pixiv"
+
+
+def _canon_flickr(scheme, host, path, query) -> tuple[str, str]:
+    # flic.kr short links redirect; keep path as-is (follow_redirects handles it).
+    return urlunsplit(("https", "www.flickr.com", path, "", "")), "flickr"
+
+
 _HANDLERS = {
     "bluesky": _canon_bluesky,
     "reddit": _canon_reddit,
@@ -140,7 +163,31 @@ _HANDLERS = {
     "wikipedia": _canon_wikipedia,
     "instagram": _canon_instagram,
     "youtube": _canon_youtube,
+    "pixiv": _canon_pixiv,
+    "flickr": _canon_flickr,
 }
+
+
+# Path-pattern heuristics for unknown mirrors that follow well-known URL conventions.
+# Fires only when host lookup fails (family is None).
+_PATH_HEURISTICS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^/[^/]+/status/\d+(/|$)"), "twitter"),              # /handle/status/ID
+    (re.compile(r"^/r/[^/]+/comments/[^/]+"), "reddit"),               # /r/sub/comments/rkey
+    (re.compile(r"^/profile/[^/]+/post/[^/]+"), "bluesky"),            # /profile/handle/post/rkey
+    (re.compile(r"^/(?:p|reel|tv)/[A-Za-z0-9_-]+"), "instagram"),     # /p/CODE/ or /reel/CODE/
+    (re.compile(r"^/wiki/[^/]+"), "wikipedia"),                         # /wiki/PageName
+    (re.compile(r"^/artwork/[^/]+"), "artstation"),                     # /artwork/slug
+    (re.compile(r"^/shorts/[A-Za-z0-9_-]{11}(/|$)"), "youtube"),      # /shorts/11-char-ID
+    (re.compile(r"^/artworks/\d+"), "pixiv"),                           # /artworks/12345678
+    (re.compile(r"^/photos/[^/]+/\d+"), "flickr"),                     # /photos/user/ID
+]
+
+
+def _infer_family_from_path(path: str) -> str | None:
+    for pattern, family in _PATH_HEURISTICS:
+        if pattern.search(path):
+            return family
+    return None
 
 
 def canonicalize(url: str) -> CanonResult:
@@ -152,6 +199,9 @@ def canonicalize(url: str) -> CanonResult:
     parts = urlsplit(url if "://" in url else f"https://{url}")
     host = _host(parts.netloc)
     family = _family_from_host(host)
+
+    if family is None:
+        family = _infer_family_from_path(parts.path)
 
     if family and family in _HANDLERS:
         canonical, fam = _HANDLERS[family](parts.scheme, host, parts.path, parts.query)
