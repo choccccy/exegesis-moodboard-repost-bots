@@ -136,7 +136,7 @@
 
 <header>
   <h1>🦋 exegesis moodboards</h1>
-  <span class="refresh-note">auto-refreshes every 2 min · loaded {{ loaded_at }}</span>
+  <span class="refresh-note">v{{ version }} · auto-refreshes every 2 min · loaded {{ loaded_at }}</span>
 </header>
 
 <section>
@@ -260,6 +260,46 @@
   <p class="empty">no publishes yet</p>
   {% endif %}
 </section>
+
+{% if pending %}
+<section>
+  <h2>Pending details</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>board</th>
+          <th>blocking</th>
+          <th>source</th>
+          <th>by</th>
+          <th>submitted</th>
+          <th>thread</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in pending %}
+        <tr>
+          <td style="white-space:nowrap">{{ p.board_name }}</td>
+          <td><span class="badge badge-yellow">{{ p.state_label }}</span></td>
+          <td>
+            {% if p.canonical_url %}
+              <a href="{{ p.canonical_url }}" target="_blank" title="{{ p.canonical_url }}">{{ p.canonical_url }}</a>
+            {% else %}—{% endif %}
+          </td>
+          <td style="color:#777; white-space:nowrap">{{ p.author_display or "—" }}</td>
+          <td style="color:#555; white-space:nowrap">{{ p.submitted_rel }}</td>
+          <td style="white-space:nowrap">
+            {% if p.thread_url %}
+              <a href="{{ p.thread_url }}" target="_blank">open thread</a>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 
 {% if errors %}
 <section>

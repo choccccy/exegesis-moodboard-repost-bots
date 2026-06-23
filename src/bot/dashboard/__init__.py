@@ -5,12 +5,14 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ..db import init_engine, session_scope
+from ..version import __version__
 from . import queries as q
 from .settings import DashboardSettings
 
@@ -34,17 +36,21 @@ async def index(request: Request):
     async with session_scope() as session:
         boards = await q.board_stats(session, settings)
         publishes = await q.recent_publishes(session, settings)
+        pending = await q.pending_submissions(session)
         errors = await q.recent_errors(session)
 
-    loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tz = ZoneInfo(settings.queue_timezone)
+    loaded_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M MT")
     return _TEMPLATES.TemplateResponse(
         request,
         "index.html",
         {
             "boards": boards,
             "publishes": publishes,
+            "pending": pending,
             "errors": errors,
             "loaded_at": loaded_at,
+            "version": __version__,
         },
     )
 
@@ -57,7 +63,8 @@ async def board_queue_view(request: Request, board_name: str):
     if board is None:
         return RedirectResponse("/", status_code=302)
     handle = settings.bluesky_handle_for(board_name)
-    loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tz = ZoneInfo(settings.queue_timezone)
+    loaded_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M MT")
     return _TEMPLATES.TemplateResponse(
         request,
         "queue.html",

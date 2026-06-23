@@ -8,6 +8,7 @@ client.py so the logic is easy to follow and extend toward Matrix later.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from datetime import datetime, timezone
@@ -734,6 +735,26 @@ _QUEUE_TERMINAL = frozenset({
     SubmissionState.PUBLISH_FAILED.value,
 })
 
+_MEMBER_REMOVAL_DELAY = 15 * 60  # seconds after queuing before removing humans from thread
+
+
+async def _remove_thread_members_after_delay(thread: discord.Thread) -> None:
+    """Remove all human members from a private thread after a short grace period.
+
+    Leaves the bot in the thread so it can post the publish confirmation later.
+    Runs as a fire-and-forget background task.
+    """
+    await asyncio.sleep(_MEMBER_REMOVAL_DELAY)
+    try:
+        bot_id = thread.guild.me.id
+        members = await thread.fetch_members()
+        for member in members:
+            if member.id != bot_id:
+                await thread.remove_user(discord.Object(id=member.id))
+        log.debug("removed %d member(s) from queued thread %s", len(members) - 1, thread.id)
+    except Exception:
+        log.warning("failed to remove members from thread %s", thread.id, exc_info=True)
+
 
 def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
     """Decide what to do when evaluate_state returns READY_TO_QUEUE.
@@ -845,6 +866,8 @@ async def recompute_and_request(
             await destination.send(replies.queued_notice())
         submission.state = SubmissionState.QUEUED.value
         log.info("submission %s queued", submission.id)
+        if isinstance(destination, discord.Thread):
+            asyncio.create_task(_remove_thread_members_after_delay(destination))
 
     return new_state
 

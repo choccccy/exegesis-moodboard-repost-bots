@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink
+from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink, SubmissionThread
 from ..publish import at_uri_to_url
 from ..queue import count_posts_today, daily_cap, has_fresh_queued
 from ..state import SubmissionState
@@ -323,6 +323,87 @@ class RecentError:
     traceback: str
     occurred_at: datetime
     occurred_rel: str
+
+
+_PENDING_STATES = frozenset({
+    SubmissionState.INTENT_SUBMITTED.value,
+    SubmissionState.AWAITING_SOURCE.value,
+    SubmissionState.AWAITING_BETTER_LINK.value,
+    SubmissionState.AWAITING_IMAGE.value,
+    SubmissionState.AWAITING_ALT_TEXT.value,
+    SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value,
+})
+
+_STATE_LABEL = {
+    SubmissionState.INTENT_SUBMITTED.value: "submitted",
+    SubmissionState.AWAITING_SOURCE.value: "needs source",
+    SubmissionState.AWAITING_BETTER_LINK.value: "needs metadata",
+    SubmissionState.AWAITING_IMAGE.value: "needs image",
+    SubmissionState.AWAITING_ALT_TEXT.value: "needs alt text",
+    SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value: "needs classification",
+}
+
+
+@dataclass
+class PendingSubmission:
+    submission_id: int
+    board_name: str
+    state_label: str
+    canonical_url: str | None
+    author_display: str
+    submitted_rel: str
+    thread_url: str | None  # discord.com/channels/{guild}/{thread}
+
+
+async def pending_submissions(session: AsyncSession) -> list[PendingSubmission]:
+    rows = await session.execute(
+        select(
+            Submission.id,
+            Submission.state,
+            Submission.author_display,
+            Submission.created_at,
+            Submission.source_discord_message_id,
+            Submission.board_id,
+            Board.name.label("board_name"),
+            Board.discord_guild_id,
+            SubmissionLink.canonical_url,
+            SubmissionThread.thread_id,
+        )
+        .join(Board, Board.id == Submission.board_id)
+        .outerjoin(
+            SubmissionLink,
+            and_(
+                SubmissionLink.submission_id == Submission.id,
+                SubmissionLink.order_index == 0,
+            ),
+        )
+        .outerjoin(
+            SubmissionThread,
+            and_(
+                SubmissionThread.board_id == Submission.board_id,
+                SubmissionThread.source_discord_message_id == Submission.source_discord_message_id,
+            ),
+        )
+        .where(Submission.state.in_(_PENDING_STATES))
+        .order_by(Submission.created_at.asc())
+    )
+
+    result = []
+    for r in rows:
+        thread_url = (
+            f"https://discord.com/channels/{r.discord_guild_id}/{r.thread_id}"
+            if r.thread_id else None
+        )
+        result.append(PendingSubmission(
+            submission_id=r.id,
+            board_name=r.board_name,
+            state_label=_STATE_LABEL.get(r.state, r.state),
+            canonical_url=r.canonical_url,
+            author_display=r.author_display or "",
+            submitted_rel=_relative(r.created_at),
+            thread_url=thread_url,
+        ))
+    return result
 
 
 async def recent_errors(session: AsyncSession, limit: int = 20) -> list[RecentError]:

@@ -25,7 +25,12 @@ def _build_intents() -> discord.Intents:
 
 class RepostBot(discord.Client):
     def __init__(self, settings: Settings) -> None:
-        super().__init__(intents=_build_intents())
+        from ..version import __version__
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"v{__version__}",
+        )
+        super().__init__(intents=_build_intents(), activity=activity)
         self.settings = settings
         self._http: httpx.AsyncClient | None = None
         self._watched_channels = {b.discord_channel_id for b in settings.boards}
