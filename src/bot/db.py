@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,24 +32,14 @@ def init_engine(database_url: str) -> None:
     path = _sqlite_path(database_url)
     if path:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-    _engine = create_async_engine(
-        database_url,
-        future=True,
-        connect_args={"timeout": 30} if database_url.startswith("sqlite") else {},
-    )
+    _engine = create_async_engine(database_url, future=True)
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
 
-    # Enable WAL mode so concurrent readers don't block writers (and vice-versa).
-    # Must use cursor() — direct conn.execute() is a no-op on aiosqlite's sync adapter.
-    if database_url.startswith("sqlite"):
-        from sqlalchemy import event
 
-        @event.listens_for(_engine.sync_engine, "connect")
-        def _set_wal(dbapi_conn, _):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=30000")
-            cursor.close()
+_SQLITE_PRAGMAS = [
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA busy_timeout=30000",
+]
 
 
 @asynccontextmanager
@@ -58,6 +49,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         raise RuntimeError("init_engine() must be called before opening a session")
     async with _sessionmaker() as session:
         try:
+            if _engine is not None and str(_engine.url).startswith("sqlite"):
+                for pragma in _SQLITE_PRAGMAS:
+                    await session.execute(text(pragma))
             yield session
             await session.commit()
         except Exception:

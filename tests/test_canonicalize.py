@@ -24,6 +24,20 @@ def test_youtube_normalizes_and_preserves_timestamp():
     assert fam("https://youtu.be/dQw4w9WgXcQ") == "youtube"
 
 
+def test_youtube_playlist_preserves_list_param():
+    # Pure playlist URL (no video ID) - list param must be kept or the URL is meaningless.
+    url = "https://www.youtube.com/playlist?list=OLAK5uy_kb7IYT01OGlP4gRYUYxK93Gh2n_nJWG3Q"
+    assert c(url) == url
+    assert fam(url) == "youtube"
+
+
+def test_youtube_watch_with_playlist_drops_list():
+    # Video-in-playlist: the video is what's being submitted, playlist context is dropped.
+    assert c("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123") == (
+        "https://youtu.be/dQw4w9WgXcQ"
+    )
+
+
 def test_twitter_normalizes_to_twitter_com_and_drops_mirrors():
     assert c("https://x.com/user/status/123?s=20") == "https://twitter.com/user/status/123"
     assert c("https://fxtwitter.com/user/status/123") == "https://twitter.com/user/status/123"
