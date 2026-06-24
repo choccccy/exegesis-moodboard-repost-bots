@@ -117,7 +117,7 @@ def thread_anchor(*, author_mention: str, curator_user_mentions: list[str]) -> s
     """Top-of-thread message. Pings the OP (adds them to the thread) and curator users."""
     parts = [f"🦋 new submission from {author_mention}"]
     if curator_user_mentions:
-        parts.append(" ".join(curator_user_mentions))
+        parts.append(f"-# {' '.join(curator_user_mentions)}")
     return "\n".join(parts)
 
 
