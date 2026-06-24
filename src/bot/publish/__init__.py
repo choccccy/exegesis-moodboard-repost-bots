@@ -135,11 +135,45 @@ def _post_text_and_facets(title: str | None, url: str) -> tuple[str, list]:
     return text, facets
 
 
+_BSKY_MAX_BLOB = 2_000_000  # bytes; Bluesky hard limit
+
+
+def _compress_for_bsky(data: bytes) -> bytes:
+    """Compress image data to fit within Bluesky's 2MB blob limit.
+
+    Tries successive JPEG quality reductions, then halves resolution until
+    it fits. Converts RGBA/P modes to RGB so JPEG encoding works.
+    """
+    import io
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(data))
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+    for quality in (85, 70, 55, 40, 25):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= _BSKY_MAX_BLOB:
+            log.info("compressed image to %d bytes (quality=%d)", buf.tell(), quality)
+            return buf.getvalue()
+    # Quality alone wasn't enough - halve resolution until it fits.
+    while img.width > 100:
+        img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=25, optimize=True)
+        if buf.tell() <= _BSKY_MAX_BLOB:
+            log.info("compressed image to %d bytes (%dx%d)", buf.tell(), img.width, img.height)
+            return buf.getvalue()
+    return buf.getvalue()
+
+
 async def _upload_blob(client: AsyncClient, path: str) -> object | None:
     """Read a local file and upload it as a blob. Returns the blob ref or None."""
     try:
         data = Path(path).read_bytes()
-        mime, _ = mimetypes.guess_type(path)
+        if len(data) > _BSKY_MAX_BLOB:
+            log.warning("image %s is %d bytes, compressing before upload", path, len(data))
+            data = _compress_for_bsky(data)
         response = await client.upload_blob(data)
         return response.blob
     except Exception as exc:
