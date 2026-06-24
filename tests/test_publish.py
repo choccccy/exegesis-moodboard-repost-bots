@@ -103,6 +103,7 @@ def _mock_client(did: str = "did:plc:testdid000") -> MagicMock:
     repost_resp.uri = f"at://{did}/app.bsky.feed.repost/rp123"
     repost_resp.cid = "bafyreitest_repost"
     client.repost = AsyncMock(return_value=repost_resp)
+    client.like = AsyncMock()
 
     resolve_resp = MagicMock()
     resolve_resp.did = "did:plc:targetdid000"
@@ -699,8 +700,8 @@ async def test_publish_submission_record_kind_calls_repost():
     assert result.success
     assert result.is_repost
     client.repost.assert_called_once()
-    # Like must NOT be called for native reposts.
-    client.like.assert_not_called()
+    # Like the original post to boost it algorithmically.
+    client.like.assert_called_once()
 
 
 @pytest.mark.asyncio

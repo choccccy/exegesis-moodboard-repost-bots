@@ -156,6 +156,8 @@ class RepostBot(discord.Client):
                     if thread is not None:
                         if cancelled_sub:
                             await thread.send(replies.source_cancel_confirmation(payload.user_id))
+                            if isinstance(thread, discord.Thread):
+                                await service._archive_thread(thread)
                         for video_id in removed_videos:
                             await thread.send(
                                 f"<@{payload.user_id}> removed https://youtu.be/{video_id} from the playlist via ❌ on the source post"

@@ -34,9 +34,8 @@ def test_metadata_confirm_emoji_is_link():
 
 
 def test_metadata_request_includes_url():
-    msg = replies.metadata_request("@user", "https://example.com/foo")
+    msg = replies.metadata_request("https://example.com/foo")
     assert "https://example.com/foo" in msg
-    assert "@user" in msg
     assert replies.METADATA_CONFIRM_EMOJI in msg
 
 
@@ -60,14 +59,28 @@ def test_queued_notice_mentions_noon_mt():
     assert "noon MT" in msg
 
 
+def test_queued_notice_with_bluesky_handle():
+    msg = replies.queued_notice(bluesky_handle="robots.exegesis.space")
+    assert "robots.exegesis.space" in msg
+    assert "bsky.app" in msg
+
+
+def test_queued_notice_playlist_only_when_videos_added():
+    msg_no = replies.queued_notice(youtube_playlist_id="PLfoo", videos_added=0)
+    assert "playlist" not in msg_no
+    msg_yes = replies.queued_notice(youtube_playlist_id="PLfoo", videos_added=1)
+    assert "playlist" in msg_yes
+    assert "youtube.com" in msg_yes
+
+
 def test_publish_failed_notice_mentions_slot():
     msg = replies.publish_failed_notice(None)
     assert "slot" in msg.lower()
 
 
-def test_source_request_mentions_user():
-    msg = replies.source_request("@alice")
-    assert "@alice" in msg
+def test_source_request_is_string():
+    msg = replies.source_request()
+    assert "source" in msg.lower() and "url" in msg.lower()
 
 
 def test_ready_confirmation():
@@ -88,3 +101,10 @@ def test_reposted_notice_includes_url():
 def test_cannot_remove_published_includes_url():
     msg = replies.cannot_remove_published("https://bsky.app/profile/x/post/1")
     assert "https://bsky.app/profile/x/post/1" in msg
+
+
+def test_supplemental_image_request_is_string():
+    msg = replies.supplemental_image_request()
+    assert isinstance(msg, str)
+    assert len(msg) > 0
+    assert "image" in msg.lower()

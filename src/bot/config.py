@@ -93,11 +93,23 @@ class Settings(BaseSettings):
 
     dashboard_url: str | None = Field(None, alias="DASHBOARD_URL")
 
+    @field_validator("discord_bot_token")
+    @classmethod
+    def _reject_unresolved_op_ref(cls, value: str) -> str:
+        if value.startswith("op://"):
+            raise ValueError(
+                "DISCORD_BOT_TOKEN is an unresolved 1Password reference. "
+                "Deploy with: op run --env-file op.env --no-masking -- ..."
+            )
+        return value
+
     @field_validator("boards_json")
     @classmethod
     def _validate_boards_json(cls, value: str) -> str:
-        # Fail fast at startup if the operator's board JSON is malformed.
-        json.loads(value)
+        # Fail fast at startup if boards JSON is malformed or fails schema validation.
+        boards = json.loads(value)
+        for b in boards:
+            BoardConfig.model_validate(b)
         return value
 
     @property

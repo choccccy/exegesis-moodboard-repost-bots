@@ -107,6 +107,9 @@ class Submission(Base):
     metadata_requests: Mapped[list["MetadataRequest"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
+    supplemental_image_requests: Mapped[list["SupplementalImageRequest"]] = relationship(
+        back_populates="submission", cascade="all, delete-orphan"
+    )
     publish_attempts: Mapped[list["PublishAttempt"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
@@ -209,6 +212,19 @@ class MetadataRequest(_RequestMixin, Base):
 
     submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
     submission: Mapped["Submission"] = relationship(back_populates="metadata_requests")
+
+
+class SupplementalImageRequest(_RequestMixin, Base):
+    """Standing offer for OP or curator to attach additional images to a submission.
+
+    Unlike ImageRequest (which blocks on a missing-image gap), this is always available
+    and re-posted after each batch of images is received.
+    """
+
+    __tablename__ = "supplemental_image_requests"
+
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    submission: Mapped["Submission"] = relationship(back_populates="supplemental_image_requests")
 
 
 class PublishAttempt(Base):

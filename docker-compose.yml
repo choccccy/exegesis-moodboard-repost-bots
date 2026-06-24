@@ -27,7 +27,7 @@ services:
       YOUTUBE_CLIENT_ID:
       YOUTUBE_CLIENT_SECRET:
       YOUTUBE_REFRESH_TOKEN:
-      DASHBOARD_URL:
+      DASHBOARD_URL: https://dashboard.exegesis.space
       # Container-internal paths.
       DATA_DIR: /data
       DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
@@ -38,6 +38,7 @@ services:
     build: .
     container_name: bluesky-dashboard
     restart: unless-stopped
+    entrypoint: []
     command: python -m bot.dashboard
     ports:
       - "127.0.0.1:8080:8080"
@@ -50,7 +51,7 @@ services:
       DATA_DIR: /data
       DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
     volumes:
-      - bot-data:/data:ro
+      - bot-data:/data
 
 volumes:
   # Named volume holds db/, attachments/ and logs/ - survives container rebuilds.

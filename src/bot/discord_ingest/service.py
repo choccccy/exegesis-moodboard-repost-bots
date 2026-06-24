@@ -40,6 +40,7 @@ from ..models import (
     Submission,
     SubmissionLink,
     SubmissionThread,
+    SupplementalImageRequest,
     YoutubePlaylistAdd,
 )
 from .. import publish as publisher
@@ -221,6 +222,7 @@ async def _ensure_thread(
         if existing is not None:
             submission.thread_id = mapping.thread_id
             if post_anchor:
+                await _unarchive_thread(existing)
                 await _post_thread_anchor(settings, message, submission, existing, content_title=anchor_title, bot_id=bot_id)
             return existing, False
 
@@ -425,6 +427,7 @@ async def handle_reaction_removed(
         ContentLabelRequest,
         ImageRequest,
         MetadataRequest,
+        SupplementalImageRequest,
         CancellationRequest,
         PublishAttempt,
         SubmissionLink,
@@ -439,6 +442,7 @@ async def handle_reaction_removed(
     thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
     if thread is not None:
         await thread.send(replies.reaction_removed())
+        await _archive_thread(thread)
     else:
         log.info("no thread to notify for removed submission %s", sub_id)
 
@@ -606,6 +610,7 @@ async def handle_cancel_reaction(
         ContentLabelRequest,
         ImageRequest,
         MetadataRequest,
+        SupplementalImageRequest,
         CancellationRequest,
         PublishAttempt,
         SubmissionLink,
@@ -618,6 +623,7 @@ async def handle_cancel_reaction(
     thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
     if thread is not None:
         await thread.send(replies.reaction_removed())
+        await _archive_thread(thread)
 
 
 async def handle_source_cancel_reaction(
@@ -670,6 +676,7 @@ async def handle_source_cancel_reaction(
                 ContentLabelRequest,
                 ImageRequest,
                 MetadataRequest,
+                SupplementalImageRequest,
                 CancellationRequest,
                 PublishAttempt,
                 SubmissionLink,
@@ -723,15 +730,19 @@ async def _auto_add_to_playlist(
     links: list[SubmissionLink],
     board_cfg,
     yt_client,
-) -> None:
-    """Auto-add any YouTube videos from submission links to the board playlist at queue time."""
+) -> int:
+    """Auto-add any YouTube videos from submission links to the board playlist at queue time.
+
+    Returns the number of videos successfully added.
+    """
     from ..resolve.fetch import _youtube_video_id
 
     if yt_client is None or not board_cfg or not board_cfg.youtube_playlist_id:
-        return
+        return 0
 
     playlist_id = board_cfg.youtube_playlist_id
     seen: set[str] = set()
+    added = 0
     for link in links:
         if link.domain_family != "youtube":
             continue
@@ -757,6 +768,7 @@ async def _auto_add_to_playlist(
             loop = asyncio.get_running_loop()
             item_id = await loop.run_in_executor(None, yt_client.add_to_playlist, playlist_id, vid)
             success = True
+            added += 1
             log.info("auto-added video %s to playlist for submission %s", vid, submission.id)
         except Exception as exc:
             error_msg = str(exc)
@@ -772,6 +784,7 @@ async def _auto_add_to_playlist(
             error_message=error_msg,
             playlist_item_id=item_id,
         ))
+    return added
 
 
 async def _do_playlist_remove(
@@ -1211,6 +1224,28 @@ def _archive_thread_after_delay(thread: discord.Thread) -> None:
     _fire_and_forget(_archive_thread_after_delay_seconds(thread, _THREAD_CLOSE_DELAY))
 
 
+async def _archive_thread(thread: discord.Thread) -> None:
+    """Immediately archive (close) a thread. Used after cancellation."""
+    if thread.archived:
+        return
+    try:
+        await thread.edit(archived=True)
+        log.debug("archived cancelled thread %s", thread.id)
+    except Exception:
+        log.warning("failed to archive thread %s", thread.id, exc_info=True)
+
+
+async def _unarchive_thread(thread: discord.Thread) -> None:
+    """Reopen an archived thread so the bot can post into it."""
+    if not thread.archived:
+        return
+    try:
+        await thread.edit(archived=False)
+        log.debug("unarchived thread %s for reuse", thread.id)
+    except Exception:
+        log.warning("failed to unarchive thread %s", thread.id, exc_info=True)
+
+
 def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
     """Decide what to do when evaluate_state returns READY_TO_QUEUE.
 
@@ -1265,6 +1300,21 @@ async def recompute_and_request(
             ))
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post cancel request for submission %s: %s", submission.id, exc)
+
+    # Supplemental image offer: re-posted each time it's answered so OP/curator can
+    # keep adding images in batches. Suppressed once the submission is terminal.
+    if old_state not in _QUEUE_TERMINAL and not await _has_open_request(
+        session, SupplementalImageRequest, submission.id
+    ):
+        try:
+            msg = await destination.send(replies.supplemental_image_request())
+            session.add(SupplementalImageRequest(
+                submission_id=submission.id,
+                bot_message_id=msg.id,
+                prompted_at=_now(),
+            ))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post supplemental image request for submission %s: %s", submission.id, exc)
 
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
@@ -1330,21 +1380,26 @@ async def recompute_and_request(
 
     action = _queue_action(old_state, new_state)
     if action != "none":
+        submission.state = SubmissionState.QUEUED.value
+        log.info("submission %s queued", submission.id)
+        board_cfg_check = settings.board_for_channel(submission.channel_id)
+        videos_added = 0
+        if not submission.playlist_skipped:
+            videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg_check, yt_client)
         if action == "fresh":
             await destination.send(replies.ready_confirmation())
             preview = await _build_post_preview(session, submission, atts, links)
             await destination.send(replies.format_post_preview(preview))
-            _board_cfg = settings.board_for_channel(submission.channel_id)
             queue_url = (
-                f"https://dashboard.exegesis.space/boards/{_board_cfg.name}"
-                if _board_cfg else None
+                f"https://dashboard.exegesis.space/boards/{board_cfg_check.name}"
+                if board_cfg_check else None
             )
-            await destination.send(replies.queued_notice(queue_url))
-        submission.state = SubmissionState.QUEUED.value
-        log.info("submission %s queued", submission.id)
-        board_cfg_check = settings.board_for_channel(submission.channel_id)
-        if not submission.playlist_skipped:
-            await _auto_add_to_playlist(session, submission, links, board_cfg_check, yt_client)
+            await destination.send(replies.queued_notice(
+                bluesky_handle=board_cfg_check.bluesky_handle if board_cfg_check else None,
+                dashboard_url=queue_url,
+                youtube_playlist_id=board_cfg_check.youtube_playlist_id if board_cfg_check else None,
+                videos_added=videos_added,
+            ))
         if isinstance(destination, discord.Thread):
             if await _playlist_close_ready(
                 session, submission.board_id,
@@ -1501,7 +1556,7 @@ async def handle_reply(
     bot_msg_id = ref.message_id
 
     req = None
-    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest):
+    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest, SupplementalImageRequest):
         req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
         if req is not None:
             break
@@ -1536,7 +1591,7 @@ async def _apply_answer(
     http_client: httpx.AsyncClient,
 ) -> bool:
     """Apply a single reply. Returns False if the answer was unusable (nudged)."""
-    if isinstance(req, ImageRequest):
+    if isinstance(req, (ImageRequest, SupplementalImageRequest)):
         image_atts = [
             a for a in message.attachments
             if is_image_attachment(a.content_type, a.filename)

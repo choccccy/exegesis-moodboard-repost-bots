@@ -87,11 +87,24 @@ def reposted_notice(bsky_url: str) -> str:
     return f"reposted to Bluesky: {bsky_url}"
 
 
-def queued_notice(dashboard_url: str | None = None) -> str:
-    msg = "queued - will post at the next available slot (noon MT or later, up to 6/day fresh · 3/day backlog)"
+def queued_notice(
+    bluesky_handle: str | None = None,
+    dashboard_url: str | None = None,
+    youtube_playlist_id: str | None = None,
+    videos_added: int = 0,
+) -> str:
+    if bluesky_handle:
+        bsky_url = f"https://bsky.app/profile/{bluesky_handle}"
+        first = f"Queued - will post to [{bluesky_handle} on Bluesky](<{bsky_url}>) at the next available slot ."
+    else:
+        first = "Queued - will post at the next available slot."
+    parts = [first]
     if dashboard_url:
-        msg += f"\n{dashboard_url}"
-    return msg
+        parts.append(f"You can see what else is queued on the [dashboard](<{dashboard_url}>).")
+    if videos_added > 0 and youtube_playlist_id:
+        playlist_url = f"https://www.youtube.com/playlist?list={youtube_playlist_id}"
+        parts.append(f"-# Also added to the [YouTube playlist](<{playlist_url}>).")
+    return "\n".join(parts)
 
 
 def publish_failed_notice(error: str | None) -> str:
@@ -152,6 +165,10 @@ def thread_anchor(
     if curator_user_mentions:
         parts.append(f"-# Curators: {' '.join(curator_user_mentions)}")
     return "\n".join(parts)
+
+
+def supplemental_image_request() -> str:
+    return "📎 Reply to this message with any additional or supplemental images to include in the post."
 
 
 def cancel_request() -> str:
