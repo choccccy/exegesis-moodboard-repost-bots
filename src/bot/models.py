@@ -66,6 +66,11 @@ class Submission(Base):
     graphic_status: Mapped[str] = mapped_column(String(20), default=GraphicStatus.UNKNOWN.value)
     graphic_classification_required: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Playlist opt-out: set True when ⏹️ is reacted on the opt-out prompt.
+    playlist_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Message ID of the ⏹️ opt-out prompt posted in the submission thread.
+    playlist_opt_out_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     # Captured from the Discord-generated link embed at ingest. Feeds the
     # external-embed preview and the at-least-one-image check (thumb).
     embed_title: Mapped[str | None] = mapped_column(Text, nullable=True)

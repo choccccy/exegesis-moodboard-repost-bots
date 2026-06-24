@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import discord
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..accessibility import initial_alt_text, is_image_attachment
@@ -131,6 +131,7 @@ async def handle_reaction(
     member: discord.Member | None = None,
     user_id: int = 0,
     skip_auth: bool = False,
+    yt_client=None,
 ) -> None:
     """Entry point for a 🦋 reaction on a watched channel message."""
     board = await _board_for_channel(session, message.channel.id)
@@ -169,7 +170,7 @@ async def handle_reaction(
         await _resolve_links(session, submission, settings, http_client)
         log.info("created submission %s for message %s", submission.id, message.id)
 
-    thread = await _ensure_thread(session, settings, message, submission)
+    thread = await _ensure_thread(session, settings, message, submission, post_anchor=created)
     if thread is None:
         log.warning("could not create/resolve thread for submission %s", submission.id)
         return
@@ -184,7 +185,7 @@ async def handle_reaction(
                 await thread.send(replies.duplicate_warning(prior))
                 break
 
-    await recompute_and_request(session, submission, settings=settings, destination=thread)
+    await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client)
 
 
 async def _ensure_thread(
@@ -192,11 +193,13 @@ async def _ensure_thread(
     settings: Settings,
     message: discord.Message,
     submission: Submission,
+    post_anchor: bool = True,
 ) -> discord.Thread | None:
     """Get (or create) the per-submission *private* thread.
 
-    Reuse is keyed by a durable SubmissionThread mapping (survives 🦋 removal), so
-    re-reacting reuses the same thread without re-pinging curators.
+    Reuse is keyed by a durable SubmissionThread mapping (survives 🦋 removal).
+    The anchor ping is re-posted when post_anchor=True (new submission), skipped
+    when False (catchup re-scan of an already-live submission).
     """
     mapping = await session.scalar(
         select(SubmissionThread).where(
@@ -208,6 +211,8 @@ async def _ensure_thread(
         existing = await _resolve_thread(message, mapping.thread_id)
         if existing is not None:
             submission.thread_id = mapping.thread_id
+            if post_anchor:
+                await _post_thread_anchor(settings, message, submission, existing)
             return existing
 
     # Create a new private thread (no channel-visible "started a thread" system message).
@@ -271,6 +276,15 @@ async def _post_thread_anchor(
             await thread.send(f"↗ {jump}")
         except (discord.Forbidden, discord.HTTPException):
             pass
+
+    # For playlist-enabled boards, post the opt-out prompt and seed the reaction.
+    if cfg and cfg.youtube_playlist_id:
+        try:
+            opt_msg = await thread.send(replies.playlist_opt_out_prompt())
+            await opt_msg.add_reaction(replies.PLAYLIST_OPT_OUT_EMOJI)
+            submission.playlist_opt_out_message_id = opt_msg.id
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post playlist opt-out for submission %s: %s", submission.id, exc)
 
 
 async def _derive_thread_title(
@@ -405,6 +419,7 @@ async def handle_label_reaction(
     emoji: str,
     member: discord.Member | None,
     user_id: int,
+    yt_client=None,
 ) -> None:
     """A curator reacted ✅/❌ on a graphic-classification request message."""
     req = await session.scalar(
@@ -428,7 +443,7 @@ async def handle_label_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     # The reaction is on a message in the thread, so `channel` is the thread.
-    await recompute_and_request(session, submission, settings=settings, destination=channel)
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
 async def handle_metadata_reaction(
@@ -439,6 +454,7 @@ async def handle_metadata_reaction(
     message_id: int,
     member: discord.Member | None,
     user_id: int,
+    yt_client=None,
 ) -> None:
     """A curator reacted 🔗 on a metadata-request message — confirm this is the best link."""
     req = await session.scalar(
@@ -460,7 +476,7 @@ async def handle_metadata_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     await channel.send(replies.metadata_confirmed())
-    await recompute_and_request(session, submission, settings=settings, destination=channel)
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
 def _is_curator(
@@ -668,187 +684,61 @@ async def handle_source_cancel_reaction(
     return thread_id, cancelled_submission, removed_video_ids
 
 
-async def _ensure_playlist_thread(
+async def _auto_add_to_playlist(
     session: AsyncSession,
-    settings: Settings,
-    message: discord.Message,
-    board: Board,
-) -> discord.Thread | None:
-    """Get or create a private thread for a playlist addition, reusing any existing submission thread."""
-    mapping = await session.scalar(
-        select(SubmissionThread).where(
-            SubmissionThread.board_id == board.id,
-            SubmissionThread.source_discord_message_id == message.id,
-        )
-    )
-    if mapping is not None:
-        existing = await _resolve_thread(message, mapping.thread_id)
-        if existing is not None:
-            return existing
-
-    board_cfg = settings.board_for_channel(message.channel.id)
-    title = None
-    for embed in message.embeds:
-        title = embed.title or (embed.author.name if embed.author else None)
-        if title:
-            break
-    name = (title.strip()[:99] + "…" if title and len(title.strip()) > 100 else title.strip()) if title else "▶️ playlist add"
-
-    try:
-        thread = await message.channel.create_thread(  # type: ignore[union-attr]
-            name=name,
-            type=discord.ChannelType.private_thread,
-            invitable=False,
-        )
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.warning("playlist thread creation failed for message %s: %s", message.id, exc)
-        return None
-
-    curator_user_ids = board_cfg.curator_user_ids if board_cfg else []
-    anchor = replies.thread_anchor(
-        author_mention=f"<@{message.author.id}>",
-        curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
-    )
-    try:
-        await thread.send(anchor, allowed_mentions=discord.AllowedMentions(users=True))
-        await message.forward(thread)
-    except (discord.Forbidden, discord.HTTPException, AttributeError):
-        pass
-
-    if mapping is None:
-        session.add(SubmissionThread(
-            board_id=board.id,
-            source_discord_message_id=message.id,
-            thread_id=thread.id,
-        ))
-    else:
-        mapping.thread_id = thread.id
-    return thread
-
-
-async def handle_playlist_reaction(
-    session: AsyncSession,
-    *,
-    settings: Settings,
-    message: discord.Message,
-    board_cfg: BoardConfig,
+    submission: Submission,
+    links: list[SubmissionLink],
+    board_cfg,
     yt_client,
-    reactor_id: int,
 ) -> None:
-    """▶️ reacted by a curator: add the YouTube video to the board's playlist."""
+    """Auto-add any YouTube videos from submission links to the board playlist at queue time."""
     from ..resolve.fetch import _youtube_video_id
 
-    if yt_client is None:
-        await message.channel.send("YouTube playlist not configured")
+    if yt_client is None or not board_cfg or not board_cfg.youtube_playlist_id:
         return
 
-    urls = extract_urls(message.content)
-    video_ids: list[str] = []
+    playlist_id = board_cfg.youtube_playlist_id
     seen: set[str] = set()
-    for raw in urls:
-        try:
-            result = canonicalize(raw)
-        except Exception:
+    for link in links:
+        if link.domain_family != "youtube":
             continue
-        if result.domain_family != "youtube":
+        vid = _youtube_video_id(link.canonical_url)
+        if not vid or vid in seen:
             continue
-        vid = _youtube_video_id(result.canonical_url)
-        if vid and vid not in seen:
-            video_ids.append(vid)
-            seen.add(vid)
+        seen.add(vid)
 
-    if not video_ids:
-        await message.channel.send("no YouTube video link found")
-        return
-
-    board = await _board_for_channel(session, message.channel.id)
-    if board is None:
-        return
-
-    thread = await _ensure_playlist_thread(session, settings, message, board)
-    destination = thread or message.channel  # type: ignore[assignment]
-
-    for video_id in video_ids:
         existing = await session.scalar(
             select(YoutubePlaylistAdd).where(
-                YoutubePlaylistAdd.board_id == board.id,
-                YoutubePlaylistAdd.video_id == video_id,
+                YoutubePlaylistAdd.board_id == submission.board_id,
+                YoutubePlaylistAdd.video_id == vid,
                 YoutubePlaylistAdd.success.is_(True),
             )
         )
         if existing is not None:
-            await destination.send(f"▶️ already in playlist: https://youtu.be/{video_id}")
             continue
 
-        playlist_id = board_cfg.youtube_playlist_id
         item_id: str | None = None
         error_msg: str | None = None
         success = False
         try:
             loop = asyncio.get_running_loop()
-            item_id = await loop.run_in_executor(
-                None, yt_client.add_to_playlist, playlist_id, video_id
-            )
+            item_id = await loop.run_in_executor(None, yt_client.add_to_playlist, playlist_id, vid)
             success = True
+            log.info("auto-added video %s to playlist for submission %s", vid, submission.id)
         except Exception as exc:
             error_msg = str(exc)
-            log.warning("playlist insert failed for video %s: %s", video_id, exc)
+            log.warning("auto playlist add failed for video %s, submission %s: %s", vid, submission.id, exc)
 
-        row = YoutubePlaylistAdd(
-            board_id=board.id,
-            source_discord_message_id=message.id,
-            video_id=video_id,
+        session.add(YoutubePlaylistAdd(
+            board_id=submission.board_id,
+            source_discord_message_id=submission.source_discord_message_id,
+            video_id=vid,
             playlist_id=playlist_id,
-            discord_requester_id=reactor_id,
+            discord_requester_id=submission.author_id,
             success=success,
             error_message=error_msg,
             playlist_item_id=item_id,
-        )
-        session.add(row)
-
-        if success:
-            await destination.send(f"▶️ added to playlist: https://youtu.be/{video_id}")
-            # Post a cancel button so OP or curators can remove it.
-            try:
-                await session.flush()  # assign row.id
-                cancel_msg = await destination.send(
-                    f"react {replies.CANCEL_EMOJI} to remove this video from the playlist"
-                )
-                await cancel_msg.add_reaction(replies.CANCEL_EMOJI)
-                row.cancel_message_id = cancel_msg.id
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not post playlist cancel button for video %s: %s", video_id, exc)
-        else:
-            await destination.send(
-                f"failed to add https://youtu.be/{video_id} to playlist: {error_msg}"
-            )
-
-    # If the submission is already QUEUED and all playlist adds are now done,
-    # schedule thread archival with the remaining delay from the original queue time.
-    if seen:  # we processed at least one video
-        submission = await session.scalar(
-            select(Submission).where(
-                Submission.board_id == board.id,
-                Submission.source_discord_message_id == message.id,
-            )
-        )
-        if (
-            submission is not None
-            and submission.state == SubmissionState.QUEUED.value
-            and submission.thread_id
-            and await _playlist_close_ready(session, board.id, message.id, board_cfg)
-        ):
-            resolved_thread = await _resolve_thread(message, submission.thread_id)
-            if resolved_thread is not None and not resolved_thread.archived:
-                queued_at = submission.updated_at
-                if queued_at is not None and queued_at.tzinfo is None:
-                    queued_at = queued_at.replace(tzinfo=timezone.utc)
-                elapsed = (
-                    (datetime.now(timezone.utc) - queued_at).total_seconds()
-                    if queued_at else _THREAD_CLOSE_DELAY
-                )
-                remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
-                _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
+        ))
 
 
 async def _do_playlist_remove(
@@ -870,37 +760,57 @@ async def _do_playlist_remove(
     await destination.send(f"❌ removed https://youtu.be/{row.video_id} from the playlist")
 
 
-async def handle_playlist_cancel(
+async def handle_playlist_opt_out(
     session: AsyncSession,
     *,
-    settings: Settings,
-    channel: discord.abc.Messageable,
     message_id: int,
-    member: discord.Member | None,
     user_id: int,
+    member: discord.Member | None,
+    channel: discord.abc.Messageable,
+    settings: Settings,
     yt_client,
 ) -> None:
-    """❌ reacted on a playlist cancel button in a thread: remove the video from the playlist."""
-    row = await session.scalar(
-        select(YoutubePlaylistAdd).where(YoutubePlaylistAdd.cancel_message_id == message_id)
+    """⏹️ reacted on the playlist opt-out prompt: mark skipped and remove if already added."""
+    submission = await session.scalar(
+        select(Submission).where(Submission.playlist_opt_out_message_id == message_id)
     )
-    if row is None:
+    if submission is None:
         return
 
-    board = await session.get(Board, row.board_id)
+    board = await session.get(Board, submission.board_id)
     board_cfg = settings.board_for_channel(board.discord_channel_id) if board else None
 
-    is_requester = user_id == row.discord_requester_id
-    is_explicit = board_cfg is not None and user_id in board_cfg.curator_user_ids
-    is_role = (
-        member is not None
-        and board_cfg is not None
-        and any(r.id in board_cfg.curator_role_ids for r in member.roles)
-    )
-    if not (is_requester or is_explicit or is_role):
+    is_op = user_id == submission.author_id
+    if not (is_op or _is_curator(member, user_id, board_cfg)):
         return
 
-    await _do_playlist_remove(row, channel, session, yt_client)
+    submission.playlist_skipped = True
+    log.info("submission %s playlist opted out by user %s", submission.id, user_id)
+
+    # Remove from playlist if auto-add already ran.
+    playlist_rows = list(await session.scalars(
+        select(YoutubePlaylistAdd).where(
+            YoutubePlaylistAdd.board_id == submission.board_id,
+            YoutubePlaylistAdd.source_discord_message_id == submission.source_discord_message_id,
+            YoutubePlaylistAdd.success.is_(True),
+        )
+    ))
+    for row in playlist_rows:
+        await _do_playlist_remove(row, channel, session, yt_client)
+
+    # If submission is QUEUED and thread is still open, it's now safe to archive.
+    if submission.state == SubmissionState.QUEUED.value and submission.thread_id:
+        resolved_thread = await _resolve_thread_by_id(channel, submission.thread_id)
+        if resolved_thread is not None and not resolved_thread.archived:
+            queued_at = submission.updated_at
+            if queued_at is not None and queued_at.tzinfo is None:
+                queued_at = queued_at.replace(tzinfo=timezone.utc)
+            elapsed = (
+                (datetime.now(timezone.utc) - queued_at).total_seconds()
+                if queued_at else _THREAD_CLOSE_DELAY
+            )
+            remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
+            _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
 
 
 async def _resolve_thread_by_id(
@@ -927,7 +837,28 @@ async def _ingest_content(
     http_client: httpx.AsyncClient,
 ) -> None:
     """One-time parse of links + embed capture + attachment download."""
-    for i, raw in enumerate(extract_urls(message.content)):
+    raw_urls = extract_urls(message.content)
+    # Mobile share sheets send an embed URL without URL text in message.content.
+    if not raw_urls:
+        seen: set[str] = set()
+        for embed in message.embeds:
+            if embed.url and embed.url not in seen:
+                seen.add(embed.url)
+                raw_urls.append(embed.url)
+    # Forwarded messages (HAS_SNAPSHOT flag) store content/embeds in message_snapshots.
+    if not raw_urls:
+        for snap in getattr(message, 'message_snapshots', []):
+            snap_urls = extract_urls(getattr(snap, 'content', '') or '')
+            if snap_urls:
+                raw_urls.extend(snap_urls)
+                break
+            for embed in getattr(snap, 'embeds', []):
+                if embed.url:
+                    raw_urls.append(embed.url)
+                    break
+            if raw_urls:
+                break
+    for i, raw in enumerate(raw_urls):
         res = canonicalize(raw)
         session.add(
             SubmissionLink(
@@ -941,7 +872,10 @@ async def _ingest_content(
 
     _capture_embed(submission, message)
 
-    for att in message.attachments:
+    all_attachments = list(message.attachments)
+    for snap in getattr(message, 'message_snapshots', []):
+        all_attachments.extend(getattr(snap, 'attachments', []))
+    for att in all_attachments:
         await _ingest_attachment(session, submission, att, settings, http_client)
 
 
@@ -950,8 +884,12 @@ def _capture_embed(submission: Submission, message: discord.Message) -> None:
 
     Drives the external-embed preview and the at-least-one-image check. Embeds
     populate a beat after posting, so this may be empty if 🦋 was very fast.
+    Also checks message_snapshots for forwarded messages.
     """
-    for embed in message.embeds:
+    all_embeds = list(message.embeds)
+    for snap in getattr(message, 'message_snapshots', []):
+        all_embeds.extend(getattr(snap, 'embeds', []))
+    for embed in all_embeds:
         thumb = (embed.thumbnail.url if embed.thumbnail else None) or (
             embed.image.url if embed.image else None
         )
@@ -1188,24 +1126,24 @@ async def _playlist_close_ready(
     board_id: int,
     source_discord_message_id: int,
     board_cfg,
+    playlist_skipped: bool = False,
 ) -> bool:
     """Return True if playlist state does not block thread archival.
 
-    Blocks if any video that was ▶️ reacted has a failed add with no subsequent
-    successful add for the same video_id (i.e. the curator may still retry).
+    Blocks only if the auto-add hasn't been attempted yet (no DB row).
+    A failed add or an opt-out both allow closure.
     """
     if not board_cfg or not board_cfg.youtube_playlist_id:
         return True
-    rows = list(await session.scalars(
-        select(YoutubePlaylistAdd).where(
+    if playlist_skipped:
+        return True
+    row_count = await session.scalar(
+        select(func.count()).select_from(YoutubePlaylistAdd).where(
             YoutubePlaylistAdd.board_id == board_id,
             YoutubePlaylistAdd.source_discord_message_id == source_discord_message_id,
         )
-    ))
-    if not rows:
-        return True  # no ▶️ react attempted
-    successful_video_ids = {r.video_id for r in rows if r.success}
-    return all(r.success or r.video_id in successful_video_ids for r in rows)
+    ) or 0
+    return row_count > 0
 
 
 # Strong references to fire-and-forget tasks - prevents GC from cancelling them
@@ -1263,6 +1201,7 @@ async def recompute_and_request(
     *,
     settings: Settings,
     destination: discord.abc.Messageable,
+    yt_client=None,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
 
@@ -1369,11 +1308,14 @@ async def recompute_and_request(
             await destination.send(replies.queued_notice(queue_url))
         submission.state = SubmissionState.QUEUED.value
         log.info("submission %s queued", submission.id)
+        board_cfg_check = settings.board_for_channel(submission.channel_id)
+        if not submission.playlist_skipped:
+            await _auto_add_to_playlist(session, submission, links, board_cfg_check, yt_client)
         if isinstance(destination, discord.Thread):
-            board_cfg_check = settings.board_for_channel(submission.channel_id)
             if await _playlist_close_ready(
                 session, submission.board_id,
                 submission.source_discord_message_id, board_cfg_check,
+                playlist_skipped=submission.playlist_skipped,
             ):
                 _archive_thread_after_delay(destination)
 
@@ -1516,6 +1458,7 @@ async def handle_reply(
     settings: Settings,
     message: discord.Message,
     http_client: httpx.AsyncClient,
+    yt_client=None,
 ) -> bool:
     """If ``message`` answers one of our open requests, apply it. Returns handled?"""
     ref = message.reference
@@ -1546,7 +1489,7 @@ async def handle_reply(
         return True  # we replied with a nudge; leave request open
 
     # Replies arrive in the submission's thread, so post follow-ups right there.
-    await recompute_and_request(session, submission, settings=settings, destination=message.channel)
+    await recompute_and_request(session, submission, settings=settings, destination=message.channel, yt_client=yt_client)
     return True
 
 

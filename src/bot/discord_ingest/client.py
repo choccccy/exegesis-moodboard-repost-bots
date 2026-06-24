@@ -96,13 +96,11 @@ class RepostBot(discord.Client):
             async with session_scope() as session:
                 await service.handle_reaction(
                     session, settings=self.settings, message=message, http_client=self.httpx_client,
-                    member=payload.member, user_id=payload.user_id,
+                    member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
                 )
             return
 
         if emoji in (GRAPHIC_YES_EMOJI, GRAPHIC_NO_EMOJI):
-            # Graphic vote on a bot request message (lives in a thread). The DB
-            # lookup by message id scopes this to our own prompts.
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
@@ -115,6 +113,7 @@ class RepostBot(discord.Client):
                     emoji=emoji,
                     member=payload.member,
                     user_id=payload.user_id,
+                    yt_client=self._yt_client,
                 )
 
         if emoji == replies.METADATA_CONFIRM_EMOJI:
@@ -129,6 +128,7 @@ class RepostBot(discord.Client):
                     message_id=payload.message_id,
                     member=payload.member,
                     user_id=payload.user_id,
+                    yt_client=self._yt_client,
                 )
 
         if emoji == CANCEL_EMOJI:
@@ -157,7 +157,7 @@ class RepostBot(discord.Client):
                                 f"<@{payload.user_id}> removed https://youtu.be/{video_id} from the playlist via ❌ on the source post"
                             )
             else:
-                # ❌ on a bot message inside a thread - could be a submission cancel or playlist cancel
+                # ❌ on a bot message inside a thread - submission cancel button
                 async with session_scope() as session:
                     await service.handle_cancel_reaction(
                         session,
@@ -167,33 +167,20 @@ class RepostBot(discord.Client):
                         member=payload.member,
                         user_id=payload.user_id,
                     )
-                    await service.handle_playlist_cancel(
-                        session,
-                        settings=self.settings,
-                        channel=channel,
-                        message_id=payload.message_id,
-                        member=payload.member,
-                        user_id=payload.user_id,
-                        yt_client=self._yt_client,
-                    )
 
-        if str(payload.emoji) == self.settings.playlist_emoji:
-            board_cfg = self.settings.board_for_channel(payload.channel_id)
-            if board_cfg is None or not board_cfg.youtube_playlist_id:
-                return
-            if not service._is_curator(payload.member, payload.user_id, board_cfg):
-                return
-            message = await self._fetch_message(payload.channel_id, payload.message_id)
-            if message is None:
+        if emoji == replies.PLAYLIST_OPT_OUT_EMOJI:
+            channel = await self._resolve_channel(payload.channel_id)
+            if channel is None:
                 return
             async with session_scope() as session:
-                await service.handle_playlist_reaction(
+                await service.handle_playlist_opt_out(
                     session,
+                    message_id=payload.message_id,
+                    user_id=payload.user_id,
+                    member=payload.member,
+                    channel=channel,
                     settings=self.settings,
-                    message=message,
-                    board_cfg=board_cfg,
                     yt_client=self._yt_client,
-                    reactor_id=payload.user_id,
                 )
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:

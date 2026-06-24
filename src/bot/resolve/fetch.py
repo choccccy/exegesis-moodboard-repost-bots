@@ -129,7 +129,7 @@ async def _youtube_api(url: str, client: httpx.AsyncClient, api_key: str) -> Res
         title=snippet.get("title"),
         description=snippet.get("channelTitle"),
         image_url=thumb.get("url"),
-        via="oembed",
+        via="youtube_api",
     )
 
 

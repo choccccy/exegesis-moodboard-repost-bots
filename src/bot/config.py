@@ -89,8 +89,6 @@ class Settings(BaseSettings):
     youtube_client_id: str | None = Field(None, alias="YOUTUBE_CLIENT_ID")
     youtube_client_secret: str | None = Field(None, alias="YOUTUBE_CLIENT_SECRET")
     youtube_refresh_token: str | None = Field(None, alias="YOUTUBE_REFRESH_TOKEN")
-    playlist_emoji: str = Field("▶️", alias="PLAYLIST_EMOJI")
-
     @field_validator("boards_json")
     @classmethod
     def _validate_boards_json(cls, value: str) -> str:

@@ -202,7 +202,7 @@ async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tupl
 
 
 async def _publish_record(client: AsyncClient, links: list[SubmissionLink]) -> PublishResult:
-    """Create a native Bluesky repost of a bsky.app source link."""
+    """Create a native Bluesky repost of a bsky.app source link, and like the original."""
     canonical_url = links[0].canonical_url
     try:
         at_uri, cid = await _resolve_bluesky_post(client, canonical_url)
@@ -210,6 +210,10 @@ async def _publish_record(client: AsyncClient, links: list[SubmissionLink]) -> P
         return PublishResult(success=False, error=f"could not resolve Bluesky post: {exc}")
 
     response = await client.repost(at_uri, cid)
+    try:
+        await client.like(at_uri, cid)
+    except Exception as exc:
+        log.warning("failed to like reposted Bluesky post %s: %s", at_uri, exc)
     return PublishResult(success=True, at_uri=response.uri, at_cid=response.cid, is_repost=True)
 
 

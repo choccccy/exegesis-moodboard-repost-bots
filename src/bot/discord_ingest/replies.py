@@ -8,6 +8,7 @@ from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
 
 METADATA_CONFIRM_EMOJI = "🔗"
 CANCEL_EMOJI = "❌"
+PLAYLIST_OPT_OUT_EMOJI = "⏹️"
 
 
 def source_request() -> str:
@@ -126,6 +127,10 @@ def cancel_request() -> str:
 
 def source_cancel_confirmation(user_id: int) -> str:
     return f"<@{user_id}> cancelled this submission via ❌ on the source post - removed from queue"
+
+
+def playlist_opt_out_prompt() -> str:
+    return f"this will be added to the YouTube playlist — react {PLAYLIST_OPT_OUT_EMOJI} to skip it"
 
 
 # Human labels + atproto $type per embed mode.
