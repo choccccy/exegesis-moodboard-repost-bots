@@ -1,6 +1,6 @@
 """Typed configuration loaded from the environment.
 
-Secrets are resolved at deploy time by `op run --env-file op.env` — nothing is
+Secrets are resolved at deploy time by `op run --env-file op.env` - nothing is
 ever written to disk. See `op.env` for the field reference.
 """
 
@@ -32,6 +32,7 @@ class BoardConfig(BaseModel):
     # Start with the channel name; extend after analyzing tag performance.
     tags: list[str] = Field(default_factory=list)
     youtube_playlist_id: str | None = None
+    display_name: str | None = None
 
 
 class Settings(BaseSettings):
@@ -89,6 +90,9 @@ class Settings(BaseSettings):
     youtube_client_id: str | None = Field(None, alias="YOUTUBE_CLIENT_ID")
     youtube_client_secret: str | None = Field(None, alias="YOUTUBE_CLIENT_SECRET")
     youtube_refresh_token: str | None = Field(None, alias="YOUTUBE_REFRESH_TOKEN")
+
+    dashboard_url: str | None = Field(None, alias="DASHBOARD_URL")
+
     @field_validator("boards_json")
     @classmethod
     def _validate_boards_json(cls, value: str) -> str:

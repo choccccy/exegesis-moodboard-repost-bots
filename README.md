@@ -28,12 +28,12 @@ while always preserving the canonical source URL and image alt text.
    - `react 🩸 / ✅ to classify graphic content`
 5. A curator replies/reacts; the bot records the answer and re-evaluates. When all
    requirements are met it queues the submission for scheduled posting.
-6. Posts fire hourly from noon Mountain Time — up to 6/day when fresh content exists,
+6. Posts fire hourly from noon Mountain Time - up to 6/day when fresh content exists,
    3/day when working through backlog. Freshness is based on the original Discord post time.
 7. For Bluesky posts the bot reposts natively; for everything else it creates an external-link
    card or image post.
 8. Removing the 🦋 deletes the submission and its thread. Published posts cannot be un-reacted
-   (the Bluesky post is already live — contact an admin to take it down).
+   (the Bluesky post is already live - contact an admin to take it down).
 9. If publish fails, the bot retries automatically at the next queue slot.
 
 ---
@@ -41,8 +41,8 @@ while always preserving the canonical source URL and image alt text.
 ## Requirements
 
 - [Docker](https://docs.docker.com/get-docker/) + Docker Compose V2
-- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) — for secret injection
-- Python 3.12 + [`uv`](https://docs.astral.sh/uv/) — for local dev and running migrations
+- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) - for secret injection
+- Python 3.12 + [`uv`](https://docs.astral.sh/uv/) - for local dev and running migrations
 
 ---
 
@@ -61,12 +61,12 @@ while always preserving the canonical source URL and image alt text.
 ### 2. Bluesky app passwords
 
 For each board account, go to <https://bsky.app/settings/app-passwords>, create an app
-password, and store it in 1Password. The item name is your choice — you'll reference it in
+password, and store it in 1Password. The item name is your choice - you'll reference it in
 `op.env`.
 
 ### 3. Configure `op.env`
 
-`op.env` is the source of truth for all config and is safe to commit — it contains
+`op.env` is the source of truth for all config and is safe to commit - it contains
 `op://` references, not real secrets. Secrets are resolved at runtime by `op run`;
 they are never written to disk.
 
@@ -84,7 +84,7 @@ Key fields to fill in:
 | Field | What to put |
 |---|---|
 | `DISCORD_BOT_TOKEN` | `op://` reference to the bot token |
-| `BOARDS_JSON` | JSON array — see format below |
+| `BOARDS_JSON` | JSON array - see format below |
 | `BSKY_APP_PASSWORD_<NAME>` | `op://` reference per board (one line each) |
 
 **`BOARDS_JSON` format** (one object per board, kept on one line for env compatibility):
@@ -103,7 +103,7 @@ Key fields to fill in:
 ]
 ```
 
-**`BSKY_APP_PASSWORD_<NAME>`** — board name uppercased with hyphens replaced by
+**`BSKY_APP_PASSWORD_<NAME>`** - board name uppercased with hyphens replaced by
 underscores. Board `my-board` → `BSKY_APP_PASSWORD_MY_BOARD`. Also add the bare key
 to the `bot` service's `environment:` list in `docker-compose.yml`.
 
@@ -189,18 +189,18 @@ EOF
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Certbot sets up automatic renewal via a systemd timer — no further action needed.
+Certbot sets up automatic renewal via a systemd timer - no further action needed.
 
 ---
 
 ## Deploy
 
 The deploy target is the `DigitalOcean-remote` Docker context, which connects to the
-droplet over SSH. All `docker compose` commands run remotely — the build happens on the
+droplet over SSH. All `docker compose` commands run remotely - the build happens on the
 droplet using the local source tree.
 
 Secrets live in `op.env` as `op://` references and are resolved at runtime by the
-1Password CLI — nothing is ever written to disk.
+1Password CLI - nothing is ever written to disk.
 
 ```bash
 # Deploy (builds images on the remote host, starts all three services)
@@ -212,8 +212,8 @@ inherits them and passes them through to each container via the bare-key `enviro
 entries in `docker-compose.yml`.
 
 This starts:
-- **`bot`** — the Discord ingestion + Bluesky publish bot
-- **`dashboard`** — read-only web dashboard, bound to `127.0.0.1:8080` (proxied by nginx)
+- **`bot`** - the Discord ingestion + Bluesky publish bot
+- **`dashboard`** - read-only web dashboard, bound to `127.0.0.1:8080` (proxied by nginx)
 
 Data (SQLite DB, downloaded attachments, logs) lives in the `bot-data` named volume and
 survives rebuilds.

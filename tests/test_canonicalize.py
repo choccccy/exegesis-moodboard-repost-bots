@@ -241,7 +241,7 @@ def test_tumblr_strips_query_no_slug():
 
 
 def test_tumblr_preserves_subdomain():
-    # username subdomain is the blog identity — must not be flattened.
+    # username subdomain is the blog identity - must not be flattened.
     result = canonicalize("https://cool-robots.tumblr.com/post/999")
     assert "cool-robots.tumblr.com" in result.canonical_url
 

@@ -101,7 +101,7 @@ async def prune(client: discord.Client, pairs: list[tuple[int, int]], curator_id
                 log.debug("thread %d: removed user %d", thread_id, user_id)
                 removed += 1
             except discord.NotFound:
-                already_gone += 1  # user wasn't in the thread — fine
+                already_gone += 1  # user wasn't in the thread - fine
             except discord.HTTPException as exc:
                 if exc.status == 403:
                     log.debug("thread %d: forbidden removing user %d, skipping thread", thread_id, user_id)

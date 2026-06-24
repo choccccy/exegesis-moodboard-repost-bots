@@ -1,4 +1,4 @@
-"""Minimal settings for the dashboard process — only needs DB + board config."""
+"""Minimal settings for the dashboard process - only needs DB + board config."""
 
 from __future__ import annotations
 

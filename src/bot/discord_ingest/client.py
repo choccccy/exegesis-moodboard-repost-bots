@@ -24,7 +24,8 @@ log = logging.getLogger(__name__)
 # Minimum gap between handle_reaction calls during catchup, to avoid hitting
 # Discord's per-guild thread-creation rate limit (observed: ~5-min freeze after
 # creating 19 threads in rapid succession).
-_CATCHUP_INTER_MESSAGE_DELAY = 2.0  # seconds
+_CATCHUP_INTER_MESSAGE_DELAY = 2.0       # seconds; existing submission, thread reused
+_CATCHUP_NEW_THREAD_DELAY = 6.0          # seconds; new thread created, respect rate limit
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -81,6 +82,8 @@ class RepostBot(discord.Client):
             self._catchup_started = True
             task = asyncio.create_task(self._run_catchup())
             task.add_done_callback(_log_task_exception)
+            retry_task = asyncio.create_task(self._run_threadless_retry_loop())
+            retry_task.add_done_callback(_log_task_exception)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == getattr(self.user, "id", None):
@@ -97,6 +100,7 @@ class RepostBot(discord.Client):
                 await service.handle_reaction(
                     session, settings=self.settings, message=message, http_client=self.httpx_client,
                     member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
+                    bot_id=getattr(self.user, "id", None),
                 )
             return
 
@@ -275,15 +279,17 @@ class RepostBot(discord.Client):
                     if not any(str(r.emoji) == trigger for r in message.reactions):
                         continue
                     async with session_scope() as session:
-                        await service.handle_reaction(
+                        new_thread = await service.handle_reaction(
                             session,
                             settings=self.settings,
                             message=message,
                             http_client=self.httpx_client,
                             skip_auth=True,
+                            bot_id=getattr(self.user, "id", None),
                         )
                     total += 1
-                    await asyncio.sleep(_CATCHUP_INTER_MESSAGE_DELAY)
+                    delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
+                    await asyncio.sleep(delay)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("catch-up scan failed for channel %s: %s", channel_id, exc)
                 continue
@@ -407,7 +413,8 @@ class RepostBot(discord.Client):
                     submission = await session.get(Submission, submission_id)
                     if submission is not None:
                         await service.recompute_and_request(
-                            session, submission, settings=self.settings, destination=thread
+                            session, submission, settings=self.settings, destination=thread,
+                            bot_id=getattr(self.user, "id", None),
                         )
             except Exception:
                 log.exception("recompute_and_request failed for submission %s in thread %s", submission_id, thread_id)
@@ -421,6 +428,10 @@ class RepostBot(discord.Client):
         Threads queued more than 15 min ago get archived immediately. Threads queued
         recently (bot restarted mid-window) get a shortened delay for the remaining time.
         Threads that still have a pending playlist add (failed ▶️ awaiting retry) are skipped.
+
+        Critically: channel resolution (fetch_channel) is deferred into each background
+        task so this loop never makes Discord API calls. Bulk fetch_channel calls were
+        the source of guild-wide rate-limit penalties on startup.
         """
         async with session_scope() as session:
             rows = await session.execute(
@@ -445,14 +456,13 @@ class RepostBot(discord.Client):
 
         log.info("queued thread archival scan: %d thread(s) to evaluate", len(queued))
         now = datetime.now(timezone.utc)
+        # Stagger threads that are immediately due to avoid bursting thread.edit() calls.
+        immediate_stagger = 0.0
+        _ARCHIVE_STAGGER = 2.0  # seconds between immediately-due archives
+        scheduled = 0
 
         for thread_id, queued_at, board_id, source_msg_id, channel_id in queued:
-            thread = await self._resolve_channel(thread_id)
-            if thread is None:
-                continue
-            if isinstance(thread, discord.Thread) and thread.archived:
-                continue
-
+            # Skip playlist-blocked threads (DB-only check, no Discord API call).
             async with session_scope() as session:
                 board_cfg = self.settings.board_for_channel(channel_id)
                 if not await service._playlist_close_ready(session, board_id, source_msg_id, board_cfg):
@@ -467,4 +477,86 @@ class RepostBot(discord.Client):
             else:
                 remaining = 0.0
 
-            service._fire_and_forget(service._archive_thread_after_delay_seconds(thread, remaining))
+            if remaining == 0.0:
+                remaining = immediate_stagger
+                immediate_stagger += _ARCHIVE_STAGGER
+
+            # Channel resolution happens inside the background task after the delay,
+            # so this loop makes zero Discord API calls (no rate-limit burst).
+            service._fire_and_forget(self._archive_thread_by_id(thread_id, remaining))
+            scheduled += 1
+
+        log.info("queued thread archival scan: scheduled %d archive(s)", scheduled)
+
+    async def _archive_thread_by_id(self, thread_id: int, delay: float) -> None:
+        """Archive a thread by ID, after `delay` seconds.
+
+        Channel resolution is deferred until after the delay so the caller
+        can schedule many archives without making any immediate Discord API calls.
+        """
+        if delay > 0:
+            await asyncio.sleep(delay)
+        thread = await self._resolve_channel(thread_id)
+        if thread is None:
+            log.debug("archive skipped: thread %s not found", thread_id)
+            return
+        if isinstance(thread, discord.Thread) and thread.archived:
+            log.debug("archive skipped: thread %s already archived", thread_id)
+            return
+        try:
+            await thread.edit(archived=True)  # type: ignore[union-attr]
+            log.debug("archived queued thread %s", thread_id)
+        except Exception:
+            log.warning("failed to archive thread %s", thread_id, exc_info=True)
+
+    async def _run_threadless_retry_loop(self) -> None:
+        """Loop forever, retrying thread creation for submissions that missed it.
+
+        Thread creation can fail fast due to our 15-second timeout when Discord is
+        rate limiting. Those submissions are recorded in the DB but have no Discord
+        thread. This loop catches them every 3 minutes and tries again.
+        """
+        _RETRY_INTERVAL = 3 * 60  # seconds between scans
+        _THREAD_DELAY = 10.0      # seconds between thread creations within one scan
+
+        _TERMINAL_STATES = (
+            SubmissionState.PUBLISHED.value,
+            SubmissionState.PUBLISH_FAILED.value,
+        )
+
+        while True:
+            await asyncio.sleep(_RETRY_INTERVAL)
+            try:
+                async with session_scope() as session:
+                    rows = await session.execute(
+                        select(Submission)
+                        .outerjoin(
+                            SubmissionThread,
+                            (SubmissionThread.board_id == Submission.board_id)
+                            & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
+                        )
+                        .where(SubmissionThread.thread_id.is_(None))
+                        .where(~Submission.state.in_(_TERMINAL_STATES))
+                    )
+                    threadless = list(rows.scalars())
+
+                if not threadless:
+                    continue
+
+                log.info("threadless retry: %d submission(s) without Discord threads", len(threadless))
+                for sub in threadless:
+                    message = await self._fetch_message(sub.channel_id, sub.source_discord_message_id)
+                    if message is None:
+                        log.warning("threadless retry: source message %s not found for submission %s", sub.source_discord_message_id, sub.id)
+                        continue
+                    async with session_scope() as session:
+                        fresh = await session.get(Submission, sub.id)
+                        if fresh is None or fresh.state in _TERMINAL_STATES:
+                            continue
+                        thread, _ = await service._ensure_thread(session, self.settings, message, fresh, post_anchor=True, bot_id=getattr(self.user, "id", None))
+                        if thread is not None:
+                            await service.recompute_and_request(session, fresh, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None))
+                            log.info("threadless retry: created thread for submission %s", fresh.id)
+                    await asyncio.sleep(_THREAD_DELAY)
+            except Exception:
+                log.exception("threadless retry loop encountered an error")

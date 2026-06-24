@@ -32,4 +32,6 @@ def configure_logging(level: str, logs_dir: str) -> None:
     )
 
     # discord.py is chatty at INFO for the gateway; keep it at WARNING.
+    # discord.http logs rate-limit sleeps at WARNING - keep those visible.
     logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("discord.http").setLevel(logging.WARNING)

@@ -22,15 +22,15 @@ QUEUED = SubmissionState.QUEUED.value
 
 # Naive UTC datetimes as SQLite stores them (no tzinfo).
 _NOW_NAIVE = datetime(2026, 6, 23, 18, 0, 0)
-_FRESH_NAIVE = _NOW_NAIVE - timedelta(hours=24)    # 24h ago — within 72h window
-_STALE_NAIVE = _NOW_NAIVE - timedelta(hours=96)    # 96h ago — outside 72h window
+_FRESH_NAIVE = _NOW_NAIVE - timedelta(hours=24)    # 24h ago - within 72h window
+_STALE_NAIVE = _NOW_NAIVE - timedelta(hours=96)    # 96h ago - outside 72h window
 
 # Aware cutoff as the scheduler passes (UTC-aware).
 _CUTOFF_AWARE = (_NOW_NAIVE - timedelta(hours=72)).replace(tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
-# pick_next_for_board — ordering
+# pick_next_for_board - ordering
 # ---------------------------------------------------------------------------
 
 async def test_fresh_submission_picked_before_backlog(session, board):

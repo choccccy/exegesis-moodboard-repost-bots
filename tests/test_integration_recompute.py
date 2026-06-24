@@ -5,12 +5,12 @@ mock Discord destination.  The bugs that motivated them:
 
   1. QUEUED/PUBLISHED/PUBLISH_FAILED submissions were downgraded back to ready_to_queue
      because evaluate_state is content-based and always returns READY_TO_QUEUE for a
-     complete submission — we must not blindly overwrite the persisted state.
+     complete submission - we must not blindly overwrite the persisted state.
 
   2. Submissions stuck at ready_to_queue from a prior run could not advance to queued
      because READY_TO_QUEUE was in the _already_done guard set.
 
-  3. Request rows (SourceRequest, etc.) must be idempotent — calling recompute twice
+  3. Request rows (SourceRequest, etc.) must be idempotent - calling recompute twice
      must not post duplicate requests to Discord or insert duplicate DB rows.
 """
 
@@ -93,7 +93,7 @@ async def test_stuck_ready_to_queue_transitions_silently(session, board):
     dest = await _recompute(session, sub, board)
 
     assert sub.state == SubmissionState.QUEUED.value
-    # The confirmation was already sent in a prior run — must not be re-sent.
+    # The confirmation was already sent in a prior run - must not be re-sent.
     assert replies.ready_confirmation() not in dest.sent
     assert replies.queued_notice() not in dest.sent
 

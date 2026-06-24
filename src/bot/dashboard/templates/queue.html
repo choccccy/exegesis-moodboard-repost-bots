@@ -1,4 +1,4 @@
-<title>{{ board_name }} queue — exegesis moodboards</title>
+<title>{{ board_name }} queue - exegesis moodboards</title>
 <meta http-equiv="refresh" content="120">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -123,12 +123,12 @@
               <span class="badge badge-gray">link</span>
             {% endif %}
           </td>
-          <td style="max-width:280px">{{ item.title or "—" }}</td>
-          <td style="color:#777; white-space:nowrap">{{ item.author_display or "—" }}</td>
+          <td style="max-width:280px">{{ item.title or "-" }}</td>
+          <td style="color:#777; white-space:nowrap">{{ item.author_display or "-" }}</td>
           <td>
             {% if item.canonical_url %}
               <a href="{{ item.canonical_url }}" target="_blank" title="{{ item.canonical_url }}">{{ item.canonical_url }}</a>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
           <td style="color:#555; white-space:nowrap">{{ item.source_posted_rel }}</td>
           <td style="color:#555; white-space:nowrap">{{ item.queued_since_rel }}</td>
@@ -145,7 +145,7 @@
               <summary style="cursor:pointer; color:#f87171; font-size:12px">{{ item.error | truncate(80) }}</summary>
               <pre style="margin-top:6px; font-size:11px; color:#f87171; white-space:pre-wrap; word-break:break-all">{{ item.error }}</pre>
             </details>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
         </tr>
         {% endfor %}

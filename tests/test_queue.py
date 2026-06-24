@@ -1,4 +1,4 @@
-"""Tests for queue scheduling logic — pure functions only (no DB/Discord)."""
+"""Tests for queue scheduling logic - pure functions only (no DB/Discord)."""
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo

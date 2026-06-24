@@ -4,7 +4,7 @@
 
 This document specifies a standalone Dockerized Python bot that ingests posts from Discord moodboard channels and republishes them to Bluesky while preserving attribution and pushing attention back to the original source.[web:111][web:128] The bot is intentionally **source-first**, not a content aggregator: every repost must include the canonical source URL, mirrors are fetch helpers only, and missing source information blocks publication until a human supplies it.[web:118][web:132][web:143]
 
-The system is Discord-first for v1, but it must be designed so Matrix can later become a parallel or replacement ingestion surface without changing the user-facing rules. The same concepts — reaction-driven submission, bot replies asking for missing information, attachment handling, approval gating, and queueing — should later map onto Matrix with minimal behavioral drift.[web:99]
+The system is Discord-first for v1, but it must be designed so Matrix can later become a parallel or replacement ingestion surface without changing the user-facing rules. The same concepts - reaction-driven submission, bot replies asking for missing information, attachment handling, approval gating, and queueing - should later map onto Matrix with minimal behavioral drift.[web:99]
 
 ## Core principles
 

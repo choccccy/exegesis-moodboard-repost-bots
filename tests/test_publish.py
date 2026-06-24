@@ -461,7 +461,7 @@ def test_append_tags_empty_list_is_noop():
 
 
 # ---------------------------------------------------------------------------
-# publish_submission — like and bsky_url
+# publish_submission - like and bsky_url
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -677,7 +677,7 @@ async def test_publish_reply_post_text_contains_link_url():
 
 
 # ---------------------------------------------------------------------------
-# publish_submission — native repost (record kind)
+# publish_submission - native repost (record kind)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -721,7 +721,7 @@ async def test_publish_submission_record_kind_bsky_url_is_original_post():
 
 
 # ---------------------------------------------------------------------------
-# publish_submission — multi-link reply thread
+# publish_submission - multi-link reply thread
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -773,7 +773,7 @@ async def test_publish_submission_single_link_no_reply_posts():
 
 
 # ---------------------------------------------------------------------------
-# at_uri_to_url — repost record type returns AT URI unchanged
+# at_uri_to_url - repost record type returns AT URI unchanged
 # ---------------------------------------------------------------------------
 
 def test_at_uri_to_url_repost_record_returns_at_uri():

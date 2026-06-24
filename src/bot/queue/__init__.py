@@ -1,8 +1,8 @@
 """Fresh/backlog queue: pick the next submission to publish per board.
 
 Selection order within each board:
-  1. Fresh submissions (created within the configured freshness window) — FIFO
-  2. Backlog submissions (older than the freshness window) — FIFO
+  1. Fresh submissions (created within the configured freshness window) - FIFO
+  2. Backlog submissions (older than the freshness window) - FIFO
 
 Both QUEUED and PUBLISH_FAILED submissions are candidates; PUBLISH_FAILED acts as
 an automatic retry via the next available slot.

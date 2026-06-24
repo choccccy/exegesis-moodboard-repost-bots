@@ -1,4 +1,4 @@
-# Secrets (never written to disk — op run resolves op.env references at runtime)
+# Secrets (never written to disk - op run resolves op.env references at runtime)
 .env
 
 # Persistent data volume (db, attachments, logs)

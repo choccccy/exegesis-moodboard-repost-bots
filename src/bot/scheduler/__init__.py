@@ -137,7 +137,7 @@ async def _fire_board(
             destination = await bot.fetch_channel(thread_row.thread_id)
         except Exception as exc:
             log.warning(
-                "queue: could not resolve thread for submission %s: %s — publishing silently",
+                "queue: could not resolve thread for submission %s: %s - publishing silently",
                 submission.id, exc,
             )
 

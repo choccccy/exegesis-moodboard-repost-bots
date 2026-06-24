@@ -57,7 +57,7 @@ async def test_fire_board_calls_publish(session, board):
         await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_awaited_once()
-    # publish_queued_submission(session, settings, submission, destination) — 4 args
+    # publish_queued_submission(session, settings, submission, destination) - 4 args
     _, _, submission_arg, _ = mock_pub.await_args.args
     assert submission_arg.id == sub.id
 

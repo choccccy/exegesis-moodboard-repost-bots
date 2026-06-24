@@ -132,7 +132,8 @@ async def handle_reaction(
     user_id: int = 0,
     skip_auth: bool = False,
     yt_client=None,
-) -> None:
+    bot_id: int | None = None,
+) -> bool:
     """Entry point for a 🦋 reaction on a watched channel message."""
     board = await _board_for_channel(session, message.channel.id)
     if board is None:
@@ -141,7 +142,7 @@ async def handle_reaction(
     if not skip_auth:
         board_cfg = settings.board_for_channel(message.channel.id)
         if not _is_curator(member, user_id, board_cfg):
-            return
+            return False
 
     submission = await session.scalar(
         select(Submission).where(
@@ -170,10 +171,10 @@ async def handle_reaction(
         await _resolve_links(session, submission, settings, http_client)
         log.info("created submission %s for message %s", submission.id, message.id)
 
-    thread = await _ensure_thread(session, settings, message, submission, post_anchor=created)
+    thread, new_thread = await _ensure_thread(session, settings, message, submission, post_anchor=created, bot_id=bot_id)
     if thread is None:
         log.warning("could not create/resolve thread for submission %s", submission.id)
-        return
+        return False
 
     if created:
         links = list(await session.scalars(
@@ -185,7 +186,8 @@ async def handle_reaction(
                 await thread.send(replies.duplicate_warning(prior))
                 break
 
-    await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client)
+    await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id)
+    return new_thread
 
 
 async def _ensure_thread(
@@ -194,13 +196,20 @@ async def _ensure_thread(
     message: discord.Message,
     submission: Submission,
     post_anchor: bool = True,
-) -> discord.Thread | None:
+    bot_id: int | None = None,
+) -> tuple[discord.Thread | None, bool]:
     """Get (or create) the per-submission *private* thread.
 
     Reuse is keyed by a durable SubmissionThread mapping (survives 🦋 removal).
     The anchor ping is re-posted when post_anchor=True (new submission), skipped
     when False (catchup re-scan of an already-live submission).
     """
+    # Derive the content title once - used for both the thread name and the anchor message.
+    content_title = await _derive_thread_title(session, message, submission)
+    # Strip fallback sentinel ("🦋 submission N") before passing to anchor - title=None
+    # tells the anchor to omit the 📌 line rather than show the generic placeholder.
+    anchor_title: str | None = content_title if not content_title.startswith("🦋 submission") else None
+
     mapping = await session.scalar(
         select(SubmissionThread).where(
             SubmissionThread.board_id == submission.board_id,
@@ -212,22 +221,27 @@ async def _ensure_thread(
         if existing is not None:
             submission.thread_id = mapping.thread_id
             if post_anchor:
-                await _post_thread_anchor(settings, message, submission, existing)
-            return existing
+                await _post_thread_anchor(settings, message, submission, existing, content_title=anchor_title, bot_id=bot_id)
+            return existing, False
 
     # Create a new private thread (no channel-visible "started a thread" system message).
+    # 15-second timeout: discord.py's built-in retry waits for retry_after (up to 5 min)
+    # which would stall the entire coroutine. Fail fast and let the periodic retry pick it up.
     try:
-        name = await _derive_thread_title(session, message, submission)
-        thread = await message.channel.create_thread(  # type: ignore[union-attr]
-            name=name,
-            type=discord.ChannelType.private_thread,
-            invitable=False,
-        )
+        async with asyncio.timeout(15):
+            thread = await message.channel.create_thread(  # type: ignore[union-attr]
+                name=content_title,
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+            )
+    except TimeoutError:
+        log.warning("thread creation timed out (rate limited) for message %s; will retry", message.id)
+        return None, False
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.warning("private thread creation failed for message %s: %s", message.id, exc)
-        return None
+        return None, False
 
-    await _post_thread_anchor(settings, message, submission, thread)
+    await _post_thread_anchor(settings, message, submission, thread, content_title=anchor_title, bot_id=bot_id)
 
     submission.thread_id = thread.id
     if mapping is None:
@@ -240,7 +254,7 @@ async def _ensure_thread(
         )
     else:
         mapping.thread_id = thread.id  # old thread was gone; remember the new one
-    return thread
+    return thread, True
 
 
 async def _post_thread_anchor(
@@ -248,13 +262,32 @@ async def _post_thread_anchor(
     message: discord.Message,
     submission: Submission,
     thread: discord.Thread,
+    content_title: str | None = None,
+    bot_id: int | None = None,
 ) -> None:
     """Anchor the private thread: add curator users, notify curator roles, forward the source message."""
     cfg = settings.board_for_channel(submission.channel_id)
     curator_user_ids = cfg.curator_user_ids if cfg else []
+
+    board_display = None
+    bluesky_handle = None
+    youtube_playlist_id = None
+    if cfg:
+        board_display = cfg.display_name or cfg.name.replace("-", " ").title()
+        bluesky_handle = cfg.bluesky_handle
+        youtube_playlist_id = cfg.youtube_playlist_id
+
+    bot_mention = f"<@{bot_id}>" if bot_id else "The bot"
+
     text = replies.thread_anchor(
         author_mention=f"<@{submission.author_id}>",
         curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
+        bot_mention=bot_mention,
+        board_display_name=board_display,
+        bluesky_handle=bluesky_handle,
+        youtube_playlist_id=youtube_playlist_id,
+        content_title=content_title,
+        dashboard_url=settings.dashboard_url,
     )
     try:
         await thread.send(text, allowed_mentions=discord.AllowedMentions(users=True))
@@ -456,7 +489,7 @@ async def handle_metadata_reaction(
     user_id: int,
     yt_client=None,
 ) -> None:
-    """A curator reacted 🔗 on a metadata-request message — confirm this is the best link."""
+    """A curator reacted 🔗 on a metadata-request message - confirm this is the best link."""
     req = await session.scalar(
         select(MetadataRequest).where(
             MetadataRequest.bot_message_id == message_id,
@@ -1182,9 +1215,9 @@ def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
     """Decide what to do when evaluate_state returns READY_TO_QUEUE.
 
     Returns one of:
-      "fresh"  — first time reaching READY_TO_QUEUE; post confirmation + queue
-      "silent" — was stuck at READY_TO_QUEUE; transition to QUEUED without reposting
-      "none"   — already queued/published/failed; no state change
+      "fresh"  - first time reaching READY_TO_QUEUE; post confirmation + queue
+      "silent" - was stuck at READY_TO_QUEUE; transition to QUEUED without reposting
+      "none"   - already queued/published/failed; no state change
     """
     if evaluated != SubmissionState.READY_TO_QUEUE:
         return "none"
@@ -1202,6 +1235,7 @@ async def recompute_and_request(
     settings: Settings,
     destination: discord.abc.Messageable,
     yt_client=None,
+    bot_id: int | None = None,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
 
@@ -1211,7 +1245,7 @@ async def recompute_and_request(
     snap, atts, links = await _snapshot(session, submission)
     new_state = evaluate_state(snap)
     gaps = set(missing_gaps(snap))
-    # Don't overwrite state for submissions already past READY_TO_QUEUE — evaluate_state
+    # Don't overwrite state for submissions already past READY_TO_QUEUE - evaluate_state
     # is content-based and would otherwise downgrade QUEUED/PUBLISHED back to ready_to_queue.
     if old_state not in _QUEUE_TERMINAL:
         submission.state = new_state.value
@@ -1250,7 +1284,7 @@ async def recompute_and_request(
             log.warning("could not add metadata confirm reaction: %s", exc)
         session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
 
-    # IMAGE gap is suppressed while METADATA is open — a better link may provide an image.
+    # IMAGE gap is suppressed while METADATA is open - a better link may provide an image.
     if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
         session, ImageRequest, submission.id
     ):
@@ -1331,7 +1365,7 @@ async def publish_queued_submission(
     """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
 
     Loads current attachments and links from DB, then delegates to _attempt_publish.
-    ``destination`` is the submission thread (or None if the thread can't be resolved —
+    ``destination`` is the submission thread (or None if the thread can't be resolved -
     publish still proceeds, just without a Discord status notice).
     """
     _snap, atts, links = await _snapshot(session, submission)

@@ -1,4 +1,4 @@
-<title>exegesis moodboards — dashboard</title>
+<title>exegesis moodboards - dashboard</title>
 <meta http-equiv="refresh" content="120">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -197,7 +197,7 @@
           {% if b.last_bsky_url %}
             <a href="{{ b.last_bsky_url }}" target="_blank">{{ b.last_published_rel }}</a>
           {% else %}
-            —
+            -
           {% endif %}
         </span>
       </div>
@@ -247,18 +247,18 @@
               <span class="badge badge-gray">link</span>
             {% endif %}
           </td>
-          <td style="max-width:260px">{{ p.title or "—" }}</td>
-          <td style="white-space:nowrap; color:#777">{{ p.author_display or "—" }}</td>
+          <td style="max-width:260px">{{ p.title or "-" }}</td>
+          <td style="white-space:nowrap; color:#777">{{ p.author_display or "-" }}</td>
           <td>
             {% if p.canonical_url %}
               <a href="{{ p.canonical_url }}" target="_blank" title="{{ p.canonical_url }}">{{ p.canonical_url }}</a>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
           <td>
             {% if p.resolved_bsky_url %}
               {% set short_bsky = p.resolved_bsky_url | replace("https://bsky.app/profile/", "") %}
               <a href="{{ p.resolved_bsky_url }}" target="_blank" title="{{ p.resolved_bsky_url }}">{{ short_bsky }}</a>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
           <td style="color:#555; white-space:nowrap">{{ p.source_posted_rel }}</td>
           <td style="color:#555; white-space:nowrap">{{ p.attempted_rel }}</td>
@@ -335,14 +335,14 @@
           <td>
             {% if p.canonical_url %}
               <a href="{{ p.canonical_url }}" target="_blank" title="{{ p.canonical_url }}">{{ p.canonical_url }}</a>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
-          <td style="color:#777; white-space:nowrap">{{ p.author_display or "—" }}</td>
+          <td style="color:#777; white-space:nowrap">{{ p.author_display or "-" }}</td>
           <td style="color:#555; white-space:nowrap">{{ p.submitted_rel }}</td>
           <td style="white-space:nowrap">
             {% if p.thread_url %}
               <a href="{{ p.thread_url }}" target="_blank">open thread</a>
-            {% else %}—{% endif %}
+            {% else %}-{% endif %}
           </td>
         </tr>
         {% endfor %}

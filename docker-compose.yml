@@ -27,6 +27,7 @@ services:
       YOUTUBE_CLIENT_ID:
       YOUTUBE_CLIENT_SECRET:
       YOUTUBE_REFRESH_TOKEN:
+      DASHBOARD_URL:
       # Container-internal paths.
       DATA_DIR: /data
       DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db

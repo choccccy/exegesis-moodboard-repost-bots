@@ -113,11 +113,44 @@ def thread_name(submission_id: int) -> str:
     return f"🦋 submission {submission_id}"
 
 
-def thread_anchor(*, author_mention: str, curator_user_mentions: list[str]) -> str:
-    """Top-of-thread message. Pings the OP (adds them to the thread) and curator users."""
-    parts = [f"🦋 new submission from {author_mention}"]
+def thread_anchor(
+    *,
+    author_mention: str,
+    curator_user_mentions: list[str],
+    bot_mention: str = "The bot",
+    board_display_name: str | None = None,
+    bluesky_handle: str | None = None,
+    youtube_playlist_id: str | None = None,
+    content_title: str | None = None,
+    dashboard_url: str | None = None,
+) -> str:
+    """Top-of-thread orientation message for the OP and curators."""
+    if bluesky_handle:
+        dest = f"[{bluesky_handle} on Bluesky](<https://bsky.app/profile/{bluesky_handle}>)"
+    else:
+        dest = "Bluesky"
+
+    board_part = f" for the **{board_display_name}** moodboard" if board_display_name else ""
+
+    if youtube_playlist_id:
+        playlist_url = f"https://www.youtube.com/playlist?list={youtube_playlist_id}"
+        playlist_part = f" and added to the [YouTube playlist](<{playlist_url}>)"
+    else:
+        playlist_part = ""
+
+    parts = [
+        f"🦋 {author_mention}, your post was picked up{board_part} and will be scheduled to post to {dest}{playlist_part}."
+    ]
+    if content_title:
+        parts.append(f"📌 \"{content_title}\"")
+    parts.append(
+        f"\n{bot_mention} will ask a few questions below (alt text, content rating, etc.). "
+        "You can answer them yourself, or wait for a curator - either works."
+    )
+    if dashboard_url:
+        parts.append(f"\nYou can see what else is queued on the [dashboard](<{dashboard_url}>).")
     if curator_user_mentions:
-        parts.append(f"-# {' '.join(curator_user_mentions)}")
+        parts.append(f"-# Curators: {' '.join(curator_user_mentions)}")
     return "\n".join(parts)
 
 
@@ -130,7 +163,7 @@ def source_cancel_confirmation(user_id: int) -> str:
 
 
 def playlist_opt_out_prompt() -> str:
-    return f"this will be added to the YouTube playlist — react {PLAYLIST_OPT_OUT_EMOJI} to skip it"
+    return f"this will be added to the YouTube playlist - react {PLAYLIST_OPT_OUT_EMOJI} to skip it"
 
 
 # Human labels + atproto $type per embed mode.

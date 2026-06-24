@@ -34,7 +34,7 @@ class _FakeSettings:
 
 
 # ---------------------------------------------------------------------------
-# board_queue — basic
+# board_queue - basic
 # ---------------------------------------------------------------------------
 
 async def test_unknown_board_returns_none(session, board):
@@ -89,7 +89,7 @@ async def test_published_submission_not_in_queue(session, board):
 
 
 # ---------------------------------------------------------------------------
-# board_queue — freshness classification
+# board_queue - freshness classification
 # ---------------------------------------------------------------------------
 
 async def test_fresh_submission_marked_fresh(session, board):
@@ -137,7 +137,7 @@ async def test_naive_datetime_comparison_does_not_raise(session, board):
 
 
 # ---------------------------------------------------------------------------
-# board_queue — ordering (fresh before backlog)
+# board_queue - ordering (fresh before backlog)
 # ---------------------------------------------------------------------------
 
 async def test_fresh_ordered_before_stale(session, board):
