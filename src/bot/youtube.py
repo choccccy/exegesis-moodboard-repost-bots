@@ -32,6 +32,10 @@ class YouTubeClient:
         )
         self._svc = build("youtube", "v3", credentials=creds)
 
+    def remove_from_playlist(self, item_id: str) -> None:
+        """Remove a playlist item by its item ID (not the video ID)."""
+        self._svc.playlistItems().delete(id=item_id).execute()
+
     def add_to_playlist(self, playlist_id: str, video_id: str) -> str:
         """Insert video into playlist. Returns the playlist item ID.
 

@@ -201,6 +201,17 @@
           {% endif %}
         </span>
       </div>
+
+      {% if b.youtube_playlist_id %}
+      <div class="card-row">
+        <span>▶️ playlist</span>
+        <span>
+          <a href="https://www.youtube.com/playlist?list={{ b.youtube_playlist_id }}" target="_blank">
+            {{ b.youtube_playlist_add_count }} video{% if b.youtube_playlist_add_count != 1 %}s{% endif %}
+          </a>
+        </span>
+      </div>
+      {% endif %}
     </div>
     {% endfor %}
   </div>
@@ -260,6 +271,46 @@
   <p class="empty">no publishes yet</p>
   {% endif %}
 </section>
+
+{% if playlist_adds %}
+<section>
+  <h2>Recent playlist adds</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>board</th>
+          <th>video</th>
+          <th>status</th>
+          <th>added</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in playlist_adds %}
+        <tr>
+          <td style="white-space:nowrap">{{ p.board_name }}</td>
+          <td>
+            {% if p.success %}
+              <a href="https://youtu.be/{{ p.video_id }}" target="_blank">youtu.be/{{ p.video_id }}</a>
+            {% else %}
+              <span style="color:#555">{{ p.video_id }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if p.success %}
+              <span class="badge badge-green">added</span>
+            {% else %}
+              <span class="badge badge-red" title="{{ p.error_message or '' }}">failed</span>
+            {% endif %}
+          </td>
+          <td style="color:#555; white-space:nowrap">{{ p.added_rel }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 
 {% if pending %}
 <section>

@@ -137,22 +137,27 @@ class RepostBot(discord.Client):
                 return
             if payload.channel_id in self._watched_channels:
                 # ❌ on the original source post - OP or curator can cancel
-                thread_id = None
                 async with session_scope() as session:
-                    thread_id = await service.handle_source_cancel_reaction(
+                    thread_id, cancelled_sub, removed_videos = await service.handle_source_cancel_reaction(
                         session,
                         settings=self.settings,
                         channel=channel,
                         message_id=payload.message_id,
                         member=payload.member,
                         user_id=payload.user_id,
+                        yt_client=self._yt_client,
                     )
                 if thread_id is not None:
                     thread = await self._resolve_channel(thread_id)
                     if thread is not None:
-                        await thread.send(replies.source_cancel_confirmation(payload.user_id))
+                        if cancelled_sub:
+                            await thread.send(replies.source_cancel_confirmation(payload.user_id))
+                        for video_id in removed_videos:
+                            await thread.send(
+                                f"<@{payload.user_id}> removed https://youtu.be/{video_id} from the playlist via ❌ on the source post"
+                            )
             else:
-                # ❌ on the bot's cancel-request message inside a thread
+                # ❌ on a bot message inside a thread - could be a submission cancel or playlist cancel
                 async with session_scope() as session:
                     await service.handle_cancel_reaction(
                         session,
@@ -161,6 +166,15 @@ class RepostBot(discord.Client):
                         message_id=payload.message_id,
                         member=payload.member,
                         user_id=payload.user_id,
+                    )
+                    await service.handle_playlist_cancel(
+                        session,
+                        settings=self.settings,
+                        channel=channel,
+                        message_id=payload.message_id,
+                        member=payload.member,
+                        user_id=payload.user_id,
+                        yt_client=self._yt_client,
                     )
 
         if str(payload.emoji) == self.settings.playlist_emoji:
@@ -412,3 +426,58 @@ class RepostBot(discord.Client):
                 log.exception("recompute_and_request failed for submission %s in thread %s", submission_id, thread_id)
 
         log.info("thread catch-up scan complete: replayed %d event(s)", replayed)
+        service._fire_and_forget(self._archive_queued_threads())
+
+    async def _archive_queued_threads(self) -> None:
+        """On startup, archive any QUEUED-submission threads that haven't been closed yet.
+
+        Threads queued more than 15 min ago get archived immediately. Threads queued
+        recently (bot restarted mid-window) get a shortened delay for the remaining time.
+        Threads that still have a pending playlist add (failed ▶️ awaiting retry) are skipped.
+        """
+        async with session_scope() as session:
+            rows = await session.execute(
+                select(
+                    SubmissionThread.thread_id,
+                    Submission.updated_at,
+                    Submission.board_id,
+                    Submission.source_discord_message_id,
+                    Submission.channel_id,
+                )
+                .join(
+                    Submission,
+                    (Submission.board_id == SubmissionThread.board_id)
+                    & (Submission.source_discord_message_id == SubmissionThread.source_discord_message_id),
+                )
+                .where(Submission.state == SubmissionState.QUEUED.value)
+            )
+            queued = [
+                (r.thread_id, r.updated_at, r.board_id, r.source_discord_message_id, r.channel_id)
+                for r in rows
+            ]
+
+        log.info("queued thread archival scan: %d thread(s) to evaluate", len(queued))
+        now = datetime.now(timezone.utc)
+
+        for thread_id, queued_at, board_id, source_msg_id, channel_id in queued:
+            thread = await self._resolve_channel(thread_id)
+            if thread is None:
+                continue
+            if isinstance(thread, discord.Thread) and thread.archived:
+                continue
+
+            async with session_scope() as session:
+                board_cfg = self.settings.board_for_channel(channel_id)
+                if not await service._playlist_close_ready(session, board_id, source_msg_id, board_cfg):
+                    log.debug("skipping thread %s - playlist add still pending", thread_id)
+                    continue
+
+            if queued_at is not None:
+                if queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=timezone.utc)
+                elapsed = (now - queued_at).total_seconds()
+                remaining = max(0.0, service._THREAD_CLOSE_DELAY - elapsed)
+            else:
+                remaining = 0.0
+
+            service._fire_and_forget(service._archive_thread_after_delay_seconds(thread, remaining))

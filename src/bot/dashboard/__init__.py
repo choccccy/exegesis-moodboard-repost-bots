@@ -37,6 +37,7 @@ async def index(request: Request):
         boards = await q.board_stats(session, settings)
         publishes = await q.recent_publishes(session, settings)
         pending = await q.pending_submissions(session)
+        playlist_adds = await q.recent_playlist_adds(session)
         errors = await q.recent_errors(session)
 
     tz = ZoneInfo(settings.queue_timezone)
@@ -48,6 +49,7 @@ async def index(request: Request):
             "boards": boards,
             "publishes": publishes,
             "pending": pending,
+            "playlist_adds": playlist_adds,
             "errors": errors,
             "loaded_at": loaded_at,
             "version": __version__,

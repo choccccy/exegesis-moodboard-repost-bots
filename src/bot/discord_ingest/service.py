@@ -579,57 +579,151 @@ async def handle_source_cancel_reaction(
     message_id: int,
     member: discord.Member | None,
     user_id: int,
-) -> int | None:
-    """❌ reacted on the original source post: cancel the submission if OP or curator.
+    yt_client=None,
+) -> tuple[int | None, bool, list[str]]:
+    """❌ reacted on the original source post: cancel the submission and/or playlist add if OP or curator.
 
-    Returns the thread_id to send a confirmation message to, or None if the
-    reaction should be ignored (not a submission, not authorized, already published).
+    Returns (thread_id, cancelled_submission, removed_video_ids).
+    thread_id is None if there's no thread to notify.
     """
     board = await _board_for_channel(session, channel.id)
     if board is None:
         return None
     board_cfg = settings.board_for_channel(channel.id)
 
-    submission = await session.scalar(
-        select(Submission).where(
-            Submission.board_id == board.id,
-            Submission.source_discord_message_id == message_id,
-        )
-    )
-    if submission is None:
-        return None
-
-    if submission.state == SubmissionState.PUBLISHED.value:
-        return None
-
-    is_op = user_id == submission.author_id
     is_explicit_curator = board_cfg is not None and user_id in board_cfg.curator_user_ids
     is_role_curator = (
         member is not None
         and board_cfg is not None
         and any(r.id in board_cfg.curator_role_ids for r in member.roles)
     )
-    if not (is_op or is_explicit_curator or is_role_curator):
+
+    thread_id: int | None = None
+    cancelled_submission = False
+    removed_video_ids: list[str] = []
+
+    # Cancel any pending submission.
+    submission = await session.scalar(
+        select(Submission).where(
+            Submission.board_id == board.id,
+            Submission.source_discord_message_id == message_id,
+        )
+    )
+    if submission is not None and submission.state != SubmissionState.PUBLISHED.value:
+        is_op = user_id == submission.author_id
+        if is_op or is_explicit_curator or is_role_curator:
+            thread_id = thread_id or submission.thread_id
+            sub_id = submission.id
+            remove_submission_dir(settings.attachments_dir, board.id, sub_id)
+            for model in (
+                SourceRequest,
+                AttachmentAltTextRequest,
+                ContentLabelRequest,
+                ImageRequest,
+                MetadataRequest,
+                CancellationRequest,
+                PublishAttempt,
+                SubmissionLink,
+                Attachment,
+            ):
+                await session.execute(delete(model).where(model.submission_id == sub_id))
+            await session.execute(delete(Submission).where(Submission.id == sub_id))
+            log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
+            cancelled_submission = True
+
+    # Cancel any playlist addition(s) for this source message.
+    playlist_rows = list(await session.scalars(
+        select(YoutubePlaylistAdd).where(
+            YoutubePlaylistAdd.board_id == board.id,
+            YoutubePlaylistAdd.source_discord_message_id == message_id,
+            YoutubePlaylistAdd.success.is_(True),
+        )
+    ))
+    for row in playlist_rows:
+        is_requester = user_id == row.discord_requester_id
+        if not (is_requester or is_explicit_curator or is_role_curator):
+            continue
+        if row.playlist_item_id and yt_client is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, yt_client.remove_from_playlist, row.playlist_item_id)
+            except Exception as exc:
+                log.warning("playlist remove failed for item %s: %s", row.playlist_item_id, exc)
+        await session.delete(row)
+        removed_video_ids.append(row.video_id)
+
+    if not cancelled_submission and not removed_video_ids:
+        return None, False, []
+
+    # Find thread_id from SubmissionThread if not already known.
+    if thread_id is None:
+        mapping = await session.scalar(
+            select(SubmissionThread).where(
+                SubmissionThread.board_id == board.id,
+                SubmissionThread.source_discord_message_id == message_id,
+            )
+        )
+        thread_id = mapping.thread_id if mapping else None
+
+    return thread_id, cancelled_submission, removed_video_ids
+
+
+async def _ensure_playlist_thread(
+    session: AsyncSession,
+    settings: Settings,
+    message: discord.Message,
+    board: Board,
+) -> discord.Thread | None:
+    """Get or create a private thread for a playlist addition, reusing any existing submission thread."""
+    mapping = await session.scalar(
+        select(SubmissionThread).where(
+            SubmissionThread.board_id == board.id,
+            SubmissionThread.source_discord_message_id == message.id,
+        )
+    )
+    if mapping is not None:
+        existing = await _resolve_thread(message, mapping.thread_id)
+        if existing is not None:
+            return existing
+
+    board_cfg = settings.board_for_channel(message.channel.id)
+    title = None
+    for embed in message.embeds:
+        title = embed.title or (embed.author.name if embed.author else None)
+        if title:
+            break
+    name = (title.strip()[:99] + "…" if title and len(title.strip()) > 100 else title.strip()) if title else "▶️ playlist add"
+
+    try:
+        thread = await message.channel.create_thread(  # type: ignore[union-attr]
+            name=name,
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("playlist thread creation failed for message %s: %s", message.id, exc)
         return None
 
-    sub_id = submission.id
-    thread_id = submission.thread_id
-    remove_submission_dir(settings.attachments_dir, board.id, sub_id)
-    for model in (
-        SourceRequest,
-        AttachmentAltTextRequest,
-        ContentLabelRequest,
-        ImageRequest,
-        MetadataRequest,
-        CancellationRequest,
-        PublishAttempt,
-        SubmissionLink,
-        Attachment,
-    ):
-        await session.execute(delete(model).where(model.submission_id == sub_id))
-    await session.execute(delete(Submission).where(Submission.id == sub_id))
-    log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
-    return thread_id
+    curator_user_ids = board_cfg.curator_user_ids if board_cfg else []
+    anchor = replies.thread_anchor(
+        author_mention=f"<@{message.author.id}>",
+        curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
+    )
+    try:
+        await thread.send(anchor, allowed_mentions=discord.AllowedMentions(users=True))
+        await message.forward(thread)
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        pass
+
+    if mapping is None:
+        session.add(SubmissionThread(
+            board_id=board.id,
+            source_discord_message_id=message.id,
+            thread_id=thread.id,
+        ))
+    else:
+        mapping.thread_id = thread.id
+    return thread
 
 
 async def handle_playlist_reaction(
@@ -671,6 +765,9 @@ async def handle_playlist_reaction(
     if board is None:
         return
 
+    thread = await _ensure_playlist_thread(session, settings, message, board)
+    destination = thread or message.channel  # type: ignore[assignment]
+
     for video_id in video_ids:
         existing = await session.scalar(
             select(YoutubePlaylistAdd).where(
@@ -680,7 +777,7 @@ async def handle_playlist_reaction(
             )
         )
         if existing is not None:
-            await message.channel.send(f"▶️ already in playlist: https://youtu.be/{video_id}")
+            await destination.send(f"▶️ already in playlist: https://youtu.be/{video_id}")
             continue
 
         playlist_id = board_cfg.youtube_playlist_id
@@ -697,7 +794,7 @@ async def handle_playlist_reaction(
             error_msg = str(exc)
             log.warning("playlist insert failed for video %s: %s", video_id, exc)
 
-        session.add(YoutubePlaylistAdd(
+        row = YoutubePlaylistAdd(
             board_id=board.id,
             source_discord_message_id=message.id,
             video_id=video_id,
@@ -705,12 +802,105 @@ async def handle_playlist_reaction(
             discord_requester_id=reactor_id,
             success=success,
             error_message=error_msg,
-        ))
+            playlist_item_id=item_id,
+        )
+        session.add(row)
 
         if success:
-            await message.channel.send(f"▶️ added to playlist: https://youtu.be/{video_id}")
+            await destination.send(f"▶️ added to playlist: https://youtu.be/{video_id}")
+            # Post a cancel button so OP or curators can remove it.
+            try:
+                await session.flush()  # assign row.id
+                cancel_msg = await destination.send(
+                    f"react {replies.CANCEL_EMOJI} to remove this video from the playlist"
+                )
+                await cancel_msg.add_reaction(replies.CANCEL_EMOJI)
+                row.cancel_message_id = cancel_msg.id
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post playlist cancel button for video %s: %s", video_id, exc)
         else:
-            await message.channel.send(f"failed to add https://youtu.be/{video_id} to playlist: {error_msg}")
+            await destination.send(
+                f"failed to add https://youtu.be/{video_id} to playlist: {error_msg}"
+            )
+
+    # If the submission is already QUEUED and all playlist adds are now done,
+    # schedule thread archival with the remaining delay from the original queue time.
+    if seen:  # we processed at least one video
+        submission = await session.scalar(
+            select(Submission).where(
+                Submission.board_id == board.id,
+                Submission.source_discord_message_id == message.id,
+            )
+        )
+        if (
+            submission is not None
+            and submission.state == SubmissionState.QUEUED.value
+            and submission.thread_id
+            and await _playlist_close_ready(session, board.id, message.id, board_cfg)
+        ):
+            resolved_thread = await _resolve_thread(message, submission.thread_id)
+            if resolved_thread is not None and not resolved_thread.archived:
+                queued_at = submission.updated_at
+                if queued_at is not None and queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=timezone.utc)
+                elapsed = (
+                    (datetime.now(timezone.utc) - queued_at).total_seconds()
+                    if queued_at else _THREAD_CLOSE_DELAY
+                )
+                remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
+                _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
+
+
+async def _do_playlist_remove(
+    row: YoutubePlaylistAdd,
+    destination: discord.abc.Messageable,
+    session: AsyncSession,
+    yt_client,
+) -> None:
+    """Remove a video from the YouTube playlist and clean up the DB row."""
+    if row.playlist_item_id and yt_client is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, yt_client.remove_from_playlist, row.playlist_item_id)
+        except Exception as exc:
+            log.warning("playlist remove failed for item %s: %s", row.playlist_item_id, exc)
+            await destination.send(f"failed to remove from playlist: {exc}")
+            return
+    await session.delete(row)
+    await destination.send(f"❌ removed https://youtu.be/{row.video_id} from the playlist")
+
+
+async def handle_playlist_cancel(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    member: discord.Member | None,
+    user_id: int,
+    yt_client,
+) -> None:
+    """❌ reacted on a playlist cancel button in a thread: remove the video from the playlist."""
+    row = await session.scalar(
+        select(YoutubePlaylistAdd).where(YoutubePlaylistAdd.cancel_message_id == message_id)
+    )
+    if row is None:
+        return
+
+    board = await session.get(Board, row.board_id)
+    board_cfg = settings.board_for_channel(board.discord_channel_id) if board else None
+
+    is_requester = user_id == row.discord_requester_id
+    is_explicit = board_cfg is not None and user_id in board_cfg.curator_user_ids
+    is_role = (
+        member is not None
+        and board_cfg is not None
+        and any(r.id in board_cfg.curator_role_ids for r in member.roles)
+    )
+    if not (is_requester or is_explicit or is_role):
+        return
+
+    await _do_playlist_remove(row, channel, session, yt_client)
 
 
 async def _resolve_thread_by_id(
@@ -990,25 +1180,64 @@ _QUEUE_TERMINAL = frozenset({
     SubmissionState.PUBLISH_FAILED.value,
 })
 
-_MEMBER_REMOVAL_DELAY = 15 * 60  # seconds after queuing before removing humans from thread
+_THREAD_CLOSE_DELAY = 15 * 60  # seconds after queuing before archiving the thread
 
 
-async def _remove_thread_members_after_delay(thread: discord.Thread) -> None:
-    """Remove all human members from a private thread after a short grace period.
+async def _playlist_close_ready(
+    session: AsyncSession,
+    board_id: int,
+    source_discord_message_id: int,
+    board_cfg,
+) -> bool:
+    """Return True if playlist state does not block thread archival.
 
-    Leaves the bot in the thread so it can post the publish confirmation later.
+    Blocks if any video that was ▶️ reacted has a failed add with no subsequent
+    successful add for the same video_id (i.e. the curator may still retry).
+    """
+    if not board_cfg or not board_cfg.youtube_playlist_id:
+        return True
+    rows = list(await session.scalars(
+        select(YoutubePlaylistAdd).where(
+            YoutubePlaylistAdd.board_id == board_id,
+            YoutubePlaylistAdd.source_discord_message_id == source_discord_message_id,
+        )
+    ))
+    if not rows:
+        return True  # no ▶️ react attempted
+    successful_video_ids = {r.video_id for r in rows if r.success}
+    return all(r.success or r.video_id in successful_video_ids for r in rows)
+
+
+# Strong references to fire-and-forget tasks - prevents GC from cancelling them
+# before the sleep completes (asyncio footgun: bare create_task result is weakly held).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _archive_thread_after_delay_seconds(thread: discord.Thread, delay: float) -> None:
+    """Archive (close) a private thread after `delay` seconds.
+
+    Archiving removes it from members' sidebars without deleting any content.
+    The bot can still unarchive it later to post the publish confirmation.
     Runs as a fire-and-forget background task.
     """
-    await asyncio.sleep(_MEMBER_REMOVAL_DELAY)
+    if delay > 0:
+        await asyncio.sleep(delay)
     try:
-        bot_id = thread.guild.me.id
-        members = await thread.fetch_members()
-        for member in members:
-            if member.id != bot_id:
-                await thread.remove_user(discord.Object(id=member.id))
-        log.debug("removed %d member(s) from queued thread %s", len(members) - 1, thread.id)
+        await thread.edit(archived=True)
+        log.debug("archived queued thread %s", thread.id)
     except Exception:
-        log.warning("failed to remove members from thread %s", thread.id, exc_info=True)
+        log.warning("failed to archive thread %s", thread.id, exc_info=True)
+
+
+def _archive_thread_after_delay(thread: discord.Thread) -> None:
+    """Schedule archival of a thread after the standard close delay."""
+    _fire_and_forget(_archive_thread_after_delay_seconds(thread, _THREAD_CLOSE_DELAY))
 
 
 def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
@@ -1141,7 +1370,12 @@ async def recompute_and_request(
         submission.state = SubmissionState.QUEUED.value
         log.info("submission %s queued", submission.id)
         if isinstance(destination, discord.Thread):
-            asyncio.create_task(_remove_thread_members_after_delay(destination))
+            board_cfg_check = settings.board_for_channel(submission.channel_id)
+            if await _playlist_close_ready(
+                session, submission.board_id,
+                submission.source_discord_message_id, board_cfg_check,
+            ):
+                _archive_thread_after_delay(destination)
 
     return new_state
 

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink, SubmissionThread
+from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink, SubmissionThread, YoutubePlaylistAdd
 from ..publish import at_uri_to_url
 from ..queue import count_posts_today, daily_cap, has_fresh_queued
 from ..state import SubmissionState
@@ -51,6 +51,8 @@ class BoardStat:
     last_bsky_url: str | None
     last_published_at: datetime | None
     last_published_rel: str
+    youtube_playlist_id: str | None = None
+    youtube_playlist_add_count: int = 0
 
 
 @dataclass
@@ -117,6 +119,17 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
         else:
             last_bsky_url = None
 
+        board_cfg = next((b for b in settings.boards if b.name == board.name), None)
+        playlist_id = board_cfg.youtube_playlist_id if board_cfg else None
+        playlist_add_count = 0
+        if playlist_id:
+            playlist_add_count = await session.scalar(
+                select(func.count()).select_from(YoutubePlaylistAdd).where(
+                    YoutubePlaylistAdd.board_id == board.id,
+                    YoutubePlaylistAdd.success.is_(True),
+                )
+            ) or 0
+
         stats.append(BoardStat(
             board_id=board.id,
             name=board.name,
@@ -129,6 +142,8 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
             last_bsky_url=last_bsky_url,
             last_published_at=last_attempt.attempted_at if last_attempt else None,
             last_published_rel=_relative(last_attempt.attempted_at if last_attempt else None),
+            youtube_playlist_id=playlist_id,
+            youtube_playlist_add_count=playlist_add_count,
         ))
 
     return stats
@@ -402,6 +417,48 @@ async def pending_submissions(session: AsyncSession) -> list[PendingSubmission]:
             author_display=r.author_display or "",
             submitted_rel=_relative(r.created_at),
             thread_url=thread_url,
+        ))
+    return result
+
+
+@dataclass
+class PlaylistAdd:
+    board_name: str
+    video_id: str
+    playlist_id: str
+    added_at: datetime
+    added_rel: str
+    success: bool
+    error_message: str | None
+
+
+async def recent_playlist_adds(session: AsyncSession, limit: int = 30) -> list[PlaylistAdd]:
+    rows = await session.execute(
+        select(
+            YoutubePlaylistAdd.video_id,
+            YoutubePlaylistAdd.playlist_id,
+            YoutubePlaylistAdd.added_at,
+            YoutubePlaylistAdd.success,
+            YoutubePlaylistAdd.error_message,
+            Board.name.label("board_name"),
+        )
+        .join(Board, Board.id == YoutubePlaylistAdd.board_id)
+        .order_by(YoutubePlaylistAdd.added_at.desc())
+        .limit(limit)
+    )
+    result = []
+    for r in rows:
+        added_at = r.added_at
+        if added_at is not None and added_at.tzinfo is None:
+            added_at = added_at.replace(tzinfo=timezone.utc)
+        result.append(PlaylistAdd(
+            board_name=r.board_name,
+            video_id=r.video_id,
+            playlist_id=r.playlist_id,
+            added_at=added_at,
+            added_rel=_relative(added_at),
+            success=r.success,
+            error_message=r.error_message,
         ))
     return result
 

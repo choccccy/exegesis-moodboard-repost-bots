@@ -121,7 +121,7 @@ def thread_anchor(*, author_mention: str, curator_user_mentions: list[str]) -> s
 
 
 def cancel_request() -> str:
-    return f"react {CANCEL_EMOJI} to cancel this submission and remove it from the queue"
+    return f"react {CANCEL_EMOJI} here to cancel, or react {CANCEL_EMOJI} on the original post"
 
 
 def source_cancel_confirmation(user_id: int) -> str:

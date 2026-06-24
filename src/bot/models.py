@@ -287,6 +287,8 @@ class YoutubePlaylistAdd(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     success: Mapped[bool] = mapped_column(Boolean)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    playlist_item_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    cancel_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
 
 
 class BotError(Base):
