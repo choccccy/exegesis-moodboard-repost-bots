@@ -95,7 +95,7 @@ def queued_notice(
 ) -> str:
     if bluesky_handle:
         bsky_url = f"https://bsky.app/profile/{bluesky_handle}"
-        first = f"Queued - will post to [{bluesky_handle} on Bluesky](<{bsky_url}>) at the next available slot ."
+        first = f"Queued - will post to [{bluesky_handle} on Bluesky](<{bsky_url}>) at the next available slot."
     else:
         first = "Queued - will post at the next available slot."
     parts = [first]
