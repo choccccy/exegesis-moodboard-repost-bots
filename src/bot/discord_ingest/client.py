@@ -339,7 +339,7 @@ class RepostBot(discord.Client):
             SubmissionState.AWAITING_ALT_TEXT.value,
             SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value,
         )
-        _VOTE_EMOJIS = {GRAPHIC_YES_EMOJI, GRAPHIC_NO_EMOJI}
+        _VOTE_EMOJIS = {GRAPHIC_YES_EMOJI}
 
         async with session_scope() as session:
             rows = await session.execute(
