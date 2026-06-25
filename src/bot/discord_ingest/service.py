@@ -1511,7 +1511,11 @@ async def recompute_and_request(
             preview = await _build_post_preview(session, submission, atts, links)
             for page in replies.format_post_preview(preview):
                 await destination.send(page)
-            msg = await destination.send(replies.confirmation_request())
+            board_cfg_conf = settings.board_for_channel(submission.channel_id)
+            msg = await destination.send(replies.confirmation_request(
+                bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+            ))
             try:
                 await msg.add_reaction(replies.CONFIRMATION_EMOJI)
             except (discord.Forbidden, discord.HTTPException) as exc:

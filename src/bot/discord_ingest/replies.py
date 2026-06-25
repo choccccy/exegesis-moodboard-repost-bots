@@ -36,8 +36,16 @@ def graphic_request() -> str:
     return "**react 🩸** if this post contains graphic or gore content"
 
 
-def confirmation_request() -> str:
-    return f"🔎 **react {CONFIRMATION_EMOJI}** to queue this for posting"
+def confirmation_request(
+    bluesky_handle: str | None = None,
+    youtube_playlist_id: str | None = None,
+) -> str:
+    if bluesky_handle:
+        dest = f"[{bluesky_handle} on Bluesky](<https://bsky.app/profile/{bluesky_handle}>)"
+    else:
+        dest = "Bluesky"
+    playlist_part = " (and add to the YouTube playlist)" if youtube_playlist_id else ""
+    return f"**react {CONFIRMATION_EMOJI}** to queue this for posting to {dest}{playlist_part}"
 
 
 def metadata_request(url: str) -> str:
