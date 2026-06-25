@@ -267,9 +267,8 @@ async def _post_thread_anchor(
     content_title: str | None = None,
     bot_id: int | None = None,
 ) -> None:
-    """Anchor the private thread: add curator users, notify curator roles, forward the source message."""
+    """Anchor the private thread: ping OP, forward the source message."""
     cfg = settings.board_for_channel(submission.channel_id)
-    curator_user_ids = cfg.curator_user_ids if cfg else []
 
     board_display = None
     bluesky_handle = None
@@ -283,7 +282,6 @@ async def _post_thread_anchor(
 
     text = replies.thread_anchor(
         author_mention=f"<@{submission.author_id}>",
-        curator_user_mentions=[f"<@{uid}>" for uid in curator_user_ids],
         bot_mention=bot_mention,
         board_display_name=board_display,
         bluesky_handle=bluesky_handle,
@@ -442,7 +440,7 @@ async def handle_reaction_removed(
     thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
     if thread is not None:
         await thread.send(replies.reaction_removed())
-        await _archive_thread(thread)
+        await _archive_thread(thread, notice=replies.closing_notice("submission removed"))
     else:
         log.info("no thread to notify for removed submission %s", sub_id)
 
@@ -623,7 +621,7 @@ async def handle_cancel_reaction(
     thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
     if thread is not None:
         await thread.send(replies.reaction_removed())
-        await _archive_thread(thread)
+        await _archive_thread(thread, notice=replies.closing_notice("submission cancelled"))
 
 
 async def handle_source_cancel_reaction(
@@ -1203,7 +1201,9 @@ def _fire_and_forget(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _archive_thread_after_delay_seconds(thread: discord.Thread, delay: float) -> None:
+async def _archive_thread_after_delay_seconds(
+    thread: discord.Thread, delay: float, *, notice: str | None = None
+) -> None:
     """Archive (close) a private thread after `delay` seconds.
 
     Archiving removes it from members' sidebars without deleting any content.
@@ -1212,25 +1212,35 @@ async def _archive_thread_after_delay_seconds(thread: discord.Thread, delay: flo
     """
     if delay > 0:
         await asyncio.sleep(delay)
+    if notice:
+        try:
+            await thread.send(notice)
+        except Exception:
+            pass
     try:
         await thread.edit(archived=True)
-        log.debug("archived queued thread %s", thread.id)
+        log.debug("archived thread %s", thread.id)
     except Exception:
         log.warning("failed to archive thread %s", thread.id, exc_info=True)
 
 
-def _archive_thread_after_delay(thread: discord.Thread) -> None:
+def _archive_thread_after_delay(thread: discord.Thread, *, notice: str | None = None) -> None:
     """Schedule archival of a thread after the standard close delay."""
-    _fire_and_forget(_archive_thread_after_delay_seconds(thread, _THREAD_CLOSE_DELAY))
+    _fire_and_forget(_archive_thread_after_delay_seconds(thread, _THREAD_CLOSE_DELAY, notice=notice))
 
 
-async def _archive_thread(thread: discord.Thread) -> None:
-    """Immediately archive (close) a thread. Used after cancellation."""
+async def _archive_thread(thread: discord.Thread, *, notice: str | None = None) -> None:
+    """Immediately archive (close) a thread."""
     if thread.archived:
         return
+    if notice:
+        try:
+            await thread.send(notice)
+        except Exception:
+            pass
     try:
         await thread.edit(archived=True)
-        log.debug("archived cancelled thread %s", thread.id)
+        log.debug("archived thread %s", thread.id)
     except Exception:
         log.warning("failed to archive thread %s", thread.id, exc_info=True)
 
@@ -1389,7 +1399,8 @@ async def recompute_and_request(
         if action == "fresh":
             await destination.send(replies.ready_confirmation())
             preview = await _build_post_preview(session, submission, atts, links)
-            await destination.send(replies.format_post_preview(preview))
+            for page in replies.format_post_preview(preview):
+                await destination.send(page)
             queue_url = (
                 f"https://dashboard.exegesis.space/boards/{board_cfg_check.name}"
                 if board_cfg_check else None
@@ -1406,7 +1417,7 @@ async def recompute_and_request(
                 submission.source_discord_message_id, board_cfg_check,
                 playlist_skipped=submission.playlist_skipped,
             ):
-                _archive_thread_after_delay(destination)
+                _archive_thread_after_delay(destination, notice=replies.closing_notice("queued"))
 
     return new_state
 
@@ -1482,6 +1493,8 @@ async def _attempt_publish(
         else:
             await destination.send(replies.published_notice(bsky_url))
         log.info("submission %s published: %s", submission.id, result.at_uri)
+        if isinstance(destination, discord.Thread):
+            _archive_thread_after_delay(destination, notice=replies.closing_notice("published to Bluesky"))
     else:
         submission.state = SubmissionState.PUBLISH_FAILED.value
         await destination.send(replies.publish_failed_notice(result.error))

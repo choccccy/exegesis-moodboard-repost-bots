@@ -157,7 +157,7 @@ class RepostBot(discord.Client):
                         if cancelled_sub:
                             await thread.send(replies.source_cancel_confirmation(payload.user_id))
                             if isinstance(thread, discord.Thread):
-                                await service._archive_thread(thread)
+                                await service._archive_thread(thread, notice=replies.closing_notice("submission cancelled"))
                         for video_id in removed_videos:
                             await thread.send(
                                 f"<@{payload.user_id}> removed https://youtu.be/{video_id} from the playlist via ❌ on the source post"
@@ -425,11 +425,11 @@ class RepostBot(discord.Client):
         service._fire_and_forget(self._archive_queued_threads())
 
     async def _archive_queued_threads(self) -> None:
-        """On startup, archive any QUEUED-submission threads that haven't been closed yet.
+        """On startup, archive any QUEUED or PUBLISHED threads that haven't been closed yet.
 
-        Threads queued more than 15 min ago get archived immediately. Threads queued
-        recently (bot restarted mid-window) get a shortened delay for the remaining time.
-        Threads that still have a pending playlist add (failed ▶️ awaiting retry) are skipped.
+        Threads transitioned more than 15 min ago get archived immediately. Threads
+        transitioned recently (bot restarted mid-window) get a shortened delay for the
+        remaining time. QUEUED threads that still have a pending playlist add are skipped.
 
         Critically: channel resolution (fetch_channel) is deferred into each background
         task so this loop never makes Discord API calls. Bulk fetch_channel calls were
@@ -443,16 +443,21 @@ class RepostBot(discord.Client):
                     Submission.board_id,
                     Submission.source_discord_message_id,
                     Submission.channel_id,
+                    Submission.playlist_skipped,
+                    Submission.state,
                 )
                 .join(
                     Submission,
                     (Submission.board_id == SubmissionThread.board_id)
                     & (Submission.source_discord_message_id == SubmissionThread.source_discord_message_id),
                 )
-                .where(Submission.state == SubmissionState.QUEUED.value)
+                .where(Submission.state.in_([
+                    SubmissionState.QUEUED.value,
+                    SubmissionState.PUBLISHED.value,
+                ]))
             )
             queued = [
-                (r.thread_id, r.updated_at, r.board_id, r.source_discord_message_id, r.channel_id)
+                (r.thread_id, r.updated_at, r.board_id, r.source_discord_message_id, r.channel_id, r.playlist_skipped, r.state)
                 for r in rows
             ]
 
@@ -463,13 +468,17 @@ class RepostBot(discord.Client):
         _ARCHIVE_STAGGER = 2.0  # seconds between immediately-due archives
         scheduled = 0
 
-        for thread_id, queued_at, board_id, source_msg_id, channel_id in queued:
-            # Skip playlist-blocked threads (DB-only check, no Discord API call).
-            async with session_scope() as session:
-                board_cfg = self.settings.board_for_channel(channel_id)
-                if not await service._playlist_close_ready(session, board_id, source_msg_id, board_cfg):
-                    log.debug("skipping thread %s - playlist add still pending", thread_id)
-                    continue
+        for thread_id, queued_at, board_id, source_msg_id, channel_id, playlist_skipped, state in queued:
+            # Published threads are always closeable; queued ones need the playlist check.
+            if state == SubmissionState.QUEUED.value:
+                async with session_scope() as session:
+                    board_cfg = self.settings.board_for_channel(channel_id)
+                    if not await service._playlist_close_ready(
+                        session, board_id, source_msg_id, board_cfg,
+                        playlist_skipped=playlist_skipped,
+                    ):
+                        log.debug("skipping thread %s - playlist add still pending", thread_id)
+                        continue
 
             if queued_at is not None:
                 if queued_at.tzinfo is None:
@@ -483,14 +492,17 @@ class RepostBot(discord.Client):
                 remaining = immediate_stagger
                 immediate_stagger += _ARCHIVE_STAGGER
 
+            reason = "queued" if state == SubmissionState.QUEUED.value else "published to Bluesky"
             # Channel resolution happens inside the background task after the delay,
             # so this loop makes zero Discord API calls (no rate-limit burst).
-            service._fire_and_forget(self._archive_thread_by_id(thread_id, remaining))
+            service._fire_and_forget(self._archive_thread_by_id(
+                thread_id, remaining, notice=replies.closing_notice(reason),
+            ))
             scheduled += 1
 
         log.info("queued thread archival scan: scheduled %d archive(s)", scheduled)
 
-    async def _archive_thread_by_id(self, thread_id: int, delay: float) -> None:
+    async def _archive_thread_by_id(self, thread_id: int, delay: float, *, notice: str | None = None) -> None:
         """Archive a thread by ID, after `delay` seconds.
 
         Channel resolution is deferred until after the delay so the caller
@@ -505,9 +517,14 @@ class RepostBot(discord.Client):
         if isinstance(thread, discord.Thread) and thread.archived:
             log.debug("archive skipped: thread %s already archived", thread_id)
             return
+        if notice and isinstance(thread, discord.Thread):
+            try:
+                await thread.send(notice)
+            except Exception:
+                pass
         try:
             await thread.edit(archived=True)  # type: ignore[union-attr]
-            log.debug("archived queued thread %s", thread_id)
+            log.debug("archived thread %s", thread_id)
         except Exception:
             log.warning("failed to archive thread %s", thread_id, exc_info=True)
 

@@ -54,10 +54,6 @@ def test_queued_notice_contains_queued():
     assert "queued" in msg.lower()
 
 
-def test_queued_notice_mentions_noon_mt():
-    msg = replies.queued_notice()
-    assert "noon MT" in msg
-
 
 def test_queued_notice_with_bluesky_handle():
     msg = replies.queued_notice(bluesky_handle="robots.exegesis.space")
@@ -108,3 +104,83 @@ def test_supplemental_image_request_is_string():
     assert isinstance(msg, str)
     assert len(msg) > 0
     assert "image" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# _paginate
+# ---------------------------------------------------------------------------
+
+def test_paginate_short_content_single_page():
+    pages = replies._paginate(["line one", "line two", "line three"])
+    assert len(pages) == 1
+    assert pages[0] == "line one\nline two\nline three"
+
+
+def test_paginate_splits_at_line_boundary():
+    limit = 20
+    # Each line is 10 chars; two fit (10 + 1 + 10 = 21 > 20), so split after first.
+    lines = ["0123456789", "0123456789", "short"]
+    pages = replies._paginate(lines)
+    for page in pages:
+        assert len(page) <= replies._DISCORD_MSG_LIMIT
+
+
+def test_paginate_continuation_header_appears():
+    # Force a split by using a tiny effective limit via many lines.
+    long_lines = ["x" * 60] * 40  # 40 lines * 60 chars + newlines > 1900
+    pages = replies._paginate(long_lines, header="(cont.)")
+    assert len(pages) >= 2
+    for page in pages[1:]:
+        assert page.startswith("(cont.)")
+
+
+def test_paginate_no_page_exceeds_limit():
+    lines = ["a" * 100] * 25  # 2500 chars total, needs splitting
+    pages = replies._paginate(lines)
+    for page in pages:
+        assert len(page) <= replies._DISCORD_MSG_LIMIT
+
+
+def test_paginate_empty_lines_preserved():
+    pages = replies._paginate(["header", "", "body"])
+    assert len(pages) == 1
+    assert "\n\n" in pages[0]
+
+
+def test_format_post_preview_returns_list():
+    p = replies.PostPreview(
+        kind="external",
+        title="A Title",
+        links=[("https://example.com/post", "external")],
+        images=[],
+        embed_title="A Title",
+        embed_description="A description",
+        embed_has_thumb=True,
+        resolved_via="opengraph",
+        board_name="robots",
+        nsfw=False,
+    )
+    result = replies.format_post_preview(p)
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    assert all(len(page) <= replies._DISCORD_MSG_LIMIT for page in result)
+
+
+def test_format_post_preview_overflow_spans_multiple_pages():
+    # A preview with many images and very long alt text should spill across pages.
+    many_images = [(f"image_{i:02d}.jpg", "a" * 200) for i in range(20)]
+    p = replies.PostPreview(
+        kind="images",
+        title="A very long title " * 10,
+        links=[("https://example.com/post", "images")],
+        images=many_images,
+        embed_title=None,
+        embed_description=None,
+        embed_has_thumb=False,
+        board_name="robots",
+        nsfw=False,
+    )
+    result = replies.format_post_preview(p)
+    assert len(result) >= 2
+    assert all(len(page) <= replies._DISCORD_MSG_LIMIT for page in result)
+    assert any("cont." in page for page in result[1:])

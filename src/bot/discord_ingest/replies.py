@@ -129,7 +129,6 @@ def thread_name(submission_id: int) -> str:
 def thread_anchor(
     *,
     author_mention: str,
-    curator_user_mentions: list[str],
     bot_mention: str = "The bot",
     board_display_name: str | None = None,
     bluesky_handle: str | None = None,
@@ -162,9 +161,11 @@ def thread_anchor(
     )
     if dashboard_url:
         parts.append(f"\nYou can see what else is queued on the [dashboard](<{dashboard_url}>).")
-    if curator_user_mentions:
-        parts.append(f"-# Curators: {' '.join(curator_user_mentions)}")
     return "\n".join(parts)
+
+
+def closing_notice(reason: str) -> str:
+    return f"-# {reason} - closing thread"
 
 
 def supplemental_image_request() -> str:
@@ -216,7 +217,62 @@ class PostPreview:
     image_source: str = "n/a"
 
 
-def format_post_preview(p: PostPreview) -> str:
+_DISCORD_MSG_LIMIT = 1900
+
+
+def _paginate(lines: list[str], *, header: str = "") -> list[str]:
+    """Split lines into Discord-safe pages (≤ _DISCORD_MSG_LIMIT chars each).
+
+    Continuation pages start with `header` so the reader has context.
+    Lines that individually exceed the limit are hard-split as a last resort.
+    """
+    pages: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def _flush() -> None:
+        if current:
+            pages.append("\n".join(current))
+        current.clear()
+        nonlocal current_len
+        current_len = 0
+
+    def _continuation_prefix() -> list[str]:
+        return [header, ""] if header else []
+
+    for line in lines:
+        # Hard-split a single line that's too long to fit in any page.
+        while len(line) > _DISCORD_MSG_LIMIT:
+            chunk = line[:_DISCORD_MSG_LIMIT]
+            line = line[_DISCORD_MSG_LIMIT:]
+            if current:
+                _flush()
+                current.extend(_continuation_prefix())
+                current_len = sum(len(l) + 1 for l in current)
+            current.append(chunk)
+            _flush()
+            current.extend(_continuation_prefix())
+            current_len = sum(len(l) + 1 for l in current)
+
+        needed = len(line) + (1 if current else 0)
+        if current and current_len + needed > _DISCORD_MSG_LIMIT:
+            _flush()
+            current.extend(_continuation_prefix())
+            current_len = sum(len(l) + 1 for l in current)
+
+        current.append(line)
+        current_len += needed
+
+    _flush()
+    return pages or [""]
+
+
+def format_post_preview(p: PostPreview) -> list[str]:
+    """Return one or more Discord messages (≤ 1900 chars each) for the preview.
+
+    Split at line boundaries so no line is ever cut mid-way. Continuation
+    messages carry a small header so the thread stays readable.
+    """
     human, atproto = _KIND_LABELS.get(p.kind, _KIND_LABELS["empty"])
     primary = p.links[0][0] if p.links else None
 
@@ -256,7 +312,4 @@ def format_post_preview(p: PostPreview) -> str:
 
     lines.append(f"image check: {'✓' if p.image_satisfied else '⚠'} {p.image_source}")
 
-    text = "\n".join(lines)
-    if len(text) > 1900:  # Discord hard-caps messages at 2000 chars.
-        text = text[:1900] + "\n… (truncated)"
-    return text
+    return _paginate(lines, header="-# 🔎 (cont.)")

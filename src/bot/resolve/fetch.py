@@ -180,6 +180,40 @@ async def _tumblr_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     )
 
 
+async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Resolve Twitter/X metadata via the fxtwitter JSON API.
+
+    The fxtwitter OG page omits og:image for multi-image tweets, so the bot
+    would fall back to the Discord-embed mosaic URL which 403s. The JSON API
+    returns proper pbs.twimg.com photo URLs that download cleanly.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) < 3 or parts[1] != "status":
+        return None
+    handle, tweet_id = parts[0], parts[2]
+    endpoint = f"https://api.fxtwitter.com/{handle}/status/{tweet_id}"
+    try:
+        resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        log.info("fxtwitter api returned %d for %s", resp.status_code, url)
+        return None
+    tweet = resp.json().get("tweet", {})
+    if not tweet:
+        return None
+    photos = tweet.get("media", {}).get("photos", [])
+    image_url = photos[0]["url"] if photos else None
+    return ResolvedMetadata(
+        title=tweet.get("text"),
+        description=tweet.get("author", {}).get("name"),
+        image_url=image_url,
+        via="fxtwitter_api",
+    )
+
+
 def _twitter_mirror_url(url: str) -> str:
     return url.replace("https://twitter.com/", "https://fxtwitter.com/", 1)
 
@@ -215,6 +249,7 @@ _OEMBED_HANDLERS = {
     "youtube": _youtube_oembed,
     "deviantart": _deviantart_oembed,
     "tumblr": _tumblr_oembed,
+    "twitter": _twitter_fxtwitter_api,
 }
 
 _MIRROR_URL_FUNCS = {

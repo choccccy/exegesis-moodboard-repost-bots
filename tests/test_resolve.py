@@ -166,14 +166,33 @@ async def test_resolve_deviantart_oembed_404_falls_to_mirror():
 
 
 @pytest.mark.asyncio
-async def test_resolve_twitter_uses_fxtwitter_mirror():
+async def test_resolve_twitter_fxtwitter_api_returns_image():
     client = AsyncMock()
-    # Skip oEmbed (no handler), go straight to mirror fetch.
-    client.get.return_value = _html_response("Tweet text here")
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "cool robot pic",
+            "author": {"name": "RobotPoster"},
+            "media": {"photos": [{"url": "https://pbs.twimg.com/media/abc.jpg"}]},
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/media/abc.jpg"
+    assert result.via == "fxtwitter_api"
+    assert "api.fxtwitter.com" in client.get.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_falls_back_to_mirror_when_api_fails():
+    client = AsyncMock()
+    # First call (fxtwitter API) → 404; second call (fxtwitter OG mirror) → HTML
+    client.get.side_effect = [_error_response(404), _html_response("Tweet text here")]
     result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
     assert result.title == "Tweet text here"
-    call_url = client.get.call_args[0][0]
-    assert "fxtwitter.com" in call_url
+    mirror_url = client.get.call_args_list[1][0][0]
+    assert "fxtwitter.com" in mirror_url
 
 
 @pytest.mark.asyncio
