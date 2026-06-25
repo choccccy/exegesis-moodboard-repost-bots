@@ -1487,9 +1487,10 @@ async def recompute_and_request(
                 )
             )
 
-    if snap.graphic_classification_required and not await _has_open_request(
-        session, ContentLabelRequest, submission.id
-    ):
+    has_graphic_notice = await session.scalar(
+        select(ContentLabelRequest.id).where(ContentLabelRequest.submission_id == submission.id)
+    ) is not None
+    if snap.graphic_classification_required and not has_graphic_notice:
         msg = await destination.send(replies.graphic_request())
         try:
             await msg.add_reaction(GRAPHIC_YES_EMOJI)
