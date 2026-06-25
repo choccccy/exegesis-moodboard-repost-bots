@@ -2,6 +2,7 @@
 - https://bsky.app/profile/xxx-robots.exegesis.space
 - https://bsky.app/profile/vehicles.exegesis.space
 - https://bsky.app/profile/doohickeys.exegesis.space
+- https://bsky.app/profile/memes.exegesis.space
 - https://bsky.app/profile/tv.exegesis.space
 
 # Discord → Bluesky Repost Bot
