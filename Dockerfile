@@ -11,6 +11,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 # Project metadata + source are both needed to build/install the wheel.
 COPY pyproject.toml README.md ./
 COPY src/ ./src/

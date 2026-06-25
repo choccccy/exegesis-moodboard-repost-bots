@@ -110,6 +110,9 @@ class Submission(Base):
     supplemental_image_requests: Mapped[list["SupplementalImageRequest"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
+    supplemental_link_requests: Mapped[list["SupplementalLinkRequest"]] = relationship(
+        back_populates="submission", cascade="all, delete-orphan"
+    )
     publish_attempts: Mapped[list["PublishAttempt"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan"
     )
@@ -150,6 +153,7 @@ class Attachment(Base):
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     spoiler: Mapped[bool] = mapped_column(Boolean, default=False)
     is_image: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_video: Mapped[bool] = mapped_column(Boolean, default=False)
 
     alt_text_status: Mapped[str] = mapped_column(String(20), default=AltTextStatus.NEEDED.value)
     alt_text_body: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -225,6 +229,19 @@ class SupplementalImageRequest(_RequestMixin, Base):
 
     submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
     submission: Mapped["Submission"] = relationship(back_populates="supplemental_image_requests")
+
+
+class SupplementalLinkRequest(_RequestMixin, Base):
+    """Standing offer for OP or curator to add extra links as thread-reply posts.
+
+    Unlike SourceRequest (which blocks on a missing-link gap), this is always
+    available once a source link exists and re-posted after each batch is received.
+    """
+
+    __tablename__ = "supplemental_link_requests"
+
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), index=True)
+    submission: Mapped["Submission"] = relationship(back_populates="supplemental_link_requests")
 
 
 class PublishAttempt(Base):

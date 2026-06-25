@@ -26,6 +26,10 @@ def image_not_found() -> str:
     return "no image attached - reply again attaching at least one image"
 
 
+def media_not_found() -> str:
+    return "no image or video attached - reply again attaching at least one"
+
+
 def alt_text_request(filename: str) -> str:
     return f"reply to this message with the alt text for **{filename}**"
 
@@ -172,6 +176,14 @@ def supplemental_image_request() -> str:
     return "📎 Reply to this message with any additional or supplemental images to include in the post."
 
 
+def supplemental_link_request() -> str:
+    return "🔗 Reply to this message with any additional links to include as thread replies in the post."
+
+
+def supplemental_link_not_found() -> str:
+    return "no URLs found in that message - reply again with the link(s) to add"
+
+
 def cancel_request() -> str:
     return f"react {CANCEL_EMOJI} here to cancel, or react {CANCEL_EMOJI} on the original post"
 
@@ -188,6 +200,7 @@ def playlist_opt_out_prompt() -> str:
 _KIND_LABELS = {
     "external": ("external link card", "app.bsky.embed.external"),
     "images": ("image post", "app.bsky.embed.images"),
+    "video": ("video post", "app.bsky.embed.video"),
     "record": ("Bluesky repost/quote", "app.bsky.embed.record"),
     "empty": ("(no source yet)", "-"),
 }
@@ -201,7 +214,7 @@ class PostPreview:
     ordered (canonical_url, domain_family); ``images`` is uploaded (filename, alt).
     """
 
-    kind: str  # external | images | record | empty
+    kind: str  # external | images | video | record | empty
     title: str | None
     links: list[tuple[str, str]]
     images: list[tuple[str, str | None]]
@@ -209,6 +222,7 @@ class PostPreview:
     embed_description: str | None
     embed_has_thumb: bool
     resolved_via: str | None = None
+    videos: list[tuple[str, str | None]] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     board_name: str = ""
     nsfw: bool = False
@@ -286,7 +300,17 @@ def format_post_preview(p: PostPreview) -> list[str]:
     lines.append(f"  {primary}" if primary else "  (none)")
 
     # embed block depends on the chosen mode.
-    if p.kind == "images":
+    if p.kind == "video":
+        lines.append(f"embed.video ({len(p.videos)} video(s)):")
+        for i, (filename, alt) in enumerate(p.videos, start=1):
+            alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
+            lines.append(f"  {i}. {filename} - alt: {alt_text}")
+        if p.images:
+            lines.append(f"reply.images ({len(p.images)}/4):")
+            for i, (filename, alt) in enumerate(p.images, start=1):
+                alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
+                lines.append(f"  {i}. {filename} - alt: {alt_text}")
+    elif p.kind == "images":
         lines.append(f"embed.images ({len(p.images)}/4):")
         for i, (filename, alt) in enumerate(p.images, start=1):
             alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
@@ -306,9 +330,16 @@ def format_post_preview(p: PostPreview) -> list[str]:
     lines.append(f"labels: {labels}  (board: {p.board_name}, {'NSFW' if p.nsfw else 'sfw'})")
     lines.append(f"graphic: {p.graphic_status}")
 
-    # thread structure: first canonical link is the root, the rest become replies.
-    extra = max(len(p.links) - 1, 0)
-    lines.append("thread: " + (f"1 root + {extra} repl{'y' if extra == 1 else 'ies'}" if extra else "single post"))
+    # thread structure depends on kind.
+    if p.kind == "video":
+        extra_vids = max(len(p.videos) - 1, 0)
+        has_img_reply = len(p.images) > 0
+        extra_links = max(len(p.links) - 1, 0)
+        parts_count = 1 + extra_vids + (1 if has_img_reply else 0) + extra_links
+        lines.append(f"thread: 1 root (video) + {parts_count - 1} repl{'y' if parts_count - 1 == 1 else 'ies'}" if parts_count > 1 else "thread: single video post")
+    else:
+        extra = max(len(p.links) - 1, 0)
+        lines.append("thread: " + (f"1 root + {extra} repl{'y' if extra == 1 else 'ies'}" if extra else "single post"))
 
     lines.append(f"image check: {'✓' if p.image_satisfied else '⚠'} {p.image_source}")
 

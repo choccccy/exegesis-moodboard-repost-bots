@@ -11,6 +11,8 @@ from ..state import AltTextStatus
 
 # Discord image content types we treat as requiring alt text.
 IMAGE_MIME_PREFIX = "image/"
+VIDEO_MIME_PREFIX = "video/"
+_VIDEO_EXTS = (".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v")
 
 
 def is_image_attachment(content_type: str | None, filename: str) -> bool:
@@ -20,11 +22,17 @@ def is_image_attachment(content_type: str | None, filename: str) -> bool:
     return lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"))
 
 
+def is_video_attachment(content_type: str | None, filename: str) -> bool:
+    if content_type and content_type.startswith(VIDEO_MIME_PREFIX):
+        return True
+    return filename.lower().endswith(_VIDEO_EXTS)
+
+
 def initial_alt_text(
-    *, is_image: bool, discord_description: str | None
+    *, is_image: bool, is_video: bool = False, discord_description: str | None
 ) -> tuple[AltTextStatus, str | None]:
     """Decide the starting alt-text state for a freshly seen attachment."""
-    if not is_image:
+    if not (is_image or is_video):
         return AltTextStatus.NOT_REQUIRED, None
     description = (discord_description or "").strip()
     if description:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 from datetime import datetime, timezone
 
 import discord
@@ -18,7 +19,7 @@ import httpx
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..accessibility import initial_alt_text, is_image_attachment
+from ..accessibility import initial_alt_text, is_image_attachment, is_video_attachment
 from ..asset_store import (
     StorageFullError,
     download_attachment,
@@ -41,6 +42,7 @@ from ..models import (
     SubmissionLink,
     SubmissionThread,
     SupplementalImageRequest,
+    SupplementalLinkRequest,
     YoutubePlaylistAdd,
 )
 from .. import publish as publisher
@@ -426,6 +428,7 @@ async def handle_reaction_removed(
         ImageRequest,
         MetadataRequest,
         SupplementalImageRequest,
+        SupplementalLinkRequest,
         CancellationRequest,
         PublishAttempt,
         SubmissionLink,
@@ -609,6 +612,7 @@ async def handle_cancel_reaction(
         ImageRequest,
         MetadataRequest,
         SupplementalImageRequest,
+        SupplementalLinkRequest,
         CancellationRequest,
         PublishAttempt,
         SubmissionLink,
@@ -1003,7 +1007,8 @@ async def _ingest_attachment(
 ) -> Attachment:
     """Persist one Discord attachment row and download its bytes to the volume."""
     is_img = is_image_attachment(att.content_type, att.filename)
-    status, body = initial_alt_text(is_image=is_img, discord_description=att.description)
+    is_vid = is_video_attachment(att.content_type, att.filename)
+    status, body = initial_alt_text(is_image=is_img, is_video=is_vid, discord_description=att.description)
     row = Attachment(
         submission_id=submission.id,
         discord_attachment_id=att.id,
@@ -1014,6 +1019,7 @@ async def _ingest_attachment(
         height=att.height,
         spoiler=att.is_spoiler(),
         is_image=is_img,
+        is_video=is_vid,
         alt_text_status=status.value,
         alt_text_body=body,
     )
@@ -1031,6 +1037,8 @@ async def _ingest_attachment(
         )
         row.local_path = path
         row.downloaded_at = _now()
+        if is_vid and row.local_path:
+            row.local_path = await _transcode_video(row.local_path)
     except StorageFullError:
         log.warning(
             "storage full: attachment %s for submission %s not downloaded",
@@ -1041,14 +1049,41 @@ async def _ingest_attachment(
     return row
 
 
+async def _transcode_video(input_path: str) -> str:
+    """Transcode a video to H.264 + AAC MP4 suitable for Bluesky upload.
+
+    Returns the path to the transcoded file. Falls back to the original path
+    if ffmpeg fails so ingest doesn't hard-crash (publish will fail instead).
+    """
+    out_path = input_path.rsplit(".", 1)[0] + "_transcoded.mp4"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", input_path,
+        "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
+        "-y", out_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        log.warning("ffmpeg transcoding failed for %s: %s", input_path, stderr.decode()[-500:])
+        return input_path
+    try:
+        os.remove(input_path)
+    except OSError:
+        pass
+    return out_path
+
+
 # --- readiness evaluation + procedural requests -----------------------------
 
 
-def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool) -> str:
+def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool, has_uploaded_video: bool = False) -> str:
     """Choose the Bluesky embed mode this submission would use."""
     first_family = links[0].domain_family if links else None
     if first_family == "bluesky":
         return "record"  # native repost/quote
+    if has_uploaded_video:
+        return "video"
     if has_uploaded_image:
         return "images"
     if links:
@@ -1067,6 +1102,9 @@ def _image_status(
     uploaded = [a for a in atts if a.is_image]
     if kind == "record":
         return True, "n/a (Bluesky repost preserves original)"
+    if kind == "video":
+        videos = [a for a in atts if a.is_video]
+        return True, f"{len(videos)} video(s)"
     if uploaded:
         return True, f"{len(uploaded)} uploaded image(s)"
     primary = _primary_link(links)
@@ -1095,10 +1133,11 @@ async def _snapshot(
         ).all()
     )
     has_uploaded_image = any(a.is_image for a in atts)
-    kind = _determine_kind(links, has_uploaded_image)
+    has_uploaded_video = any(a.is_video for a in atts)
+    kind = _determine_kind(links, has_uploaded_image, has_uploaded_video)
     primary = _primary_link(links)
     has_embed_image = bool(primary.resolved_image_path) if primary else False
-    image_statuses = [AltTextStatus(a.alt_text_status) for a in atts if a.is_image]
+    media_statuses = [AltTextStatus(a.alt_text_status) for a in atts if a.is_image or a.is_video]
     resolved_via = primary.resolved_via if primary else None
     confirmed_meta = await session.scalar(
         select(MetadataRequest).where(
@@ -1108,11 +1147,11 @@ async def _snapshot(
     )
     snap = SubmissionSnapshot(
         has_canonical_link=len(links) > 0,
-        image_alt_statuses=image_statuses,
+        image_alt_statuses=media_statuses,
         graphic_status=GraphicStatus(submission.graphic_status),
         graphic_classification_required=submission.graphic_classification_required,
         needs_image=kind in ("images", "external"),
-        has_image=has_uploaded_image or has_embed_image,
+        has_image=has_uploaded_image or has_uploaded_video or has_embed_image,
         needs_metadata=kind == "external",
         resolved_via=resolved_via,
         metadata_confirmed=confirmed_meta is not None,
@@ -1326,6 +1365,21 @@ async def recompute_and_request(
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post supplemental image request for submission %s: %s", submission.id, exc)
 
+    # Supplemental link offer: re-posted each time it's answered. Only shown once
+    # a source link exists (SOURCE gap closed), so it doesn't compete with SourceRequest.
+    if old_state not in _QUEUE_TERMINAL and snap.has_canonical_link and not await _has_open_request(
+        session, SupplementalLinkRequest, submission.id
+    ):
+        try:
+            msg = await destination.send(replies.supplemental_link_request())
+            session.add(SupplementalLinkRequest(
+                submission_id=submission.id,
+                bot_message_id=msg.id,
+                prompted_at=_now(),
+            ))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post supplemental link request for submission %s: %s", submission.id, exc)
+
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
@@ -1353,13 +1407,13 @@ async def recompute_and_request(
 
     if Gap.ALT_TEXT in gaps:
         for att in atts:
-            if not att.is_image or att.alt_text_status != AltTextStatus.NEEDED.value:
+            if not (att.is_image or att.is_video) or att.alt_text_status != AltTextStatus.NEEDED.value:
                 continue
             if await _has_open_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
-            if att.local_path:
+            if att.local_path and att.is_image:
                 file = _discord_file_for_attachment(att.local_path, att.filename)
                 msg = await destination.send(replies.alt_text_request(att.filename), file=file)
             else:
@@ -1510,7 +1564,8 @@ async def _build_post_preview(
     board = await session.get(Board, submission.board_id)
     nsfw = board.nsfw if board else False
     has_uploaded_image = any(a.is_image for a in atts)
-    kind = _determine_kind(links, has_uploaded_image)
+    has_uploaded_video = any(a.is_video for a in atts)
+    kind = _determine_kind(links, has_uploaded_image, has_uploaded_video)
     image_satisfied, image_source = _image_status(kind, atts, links)
     primary = _primary_link(links)
 
@@ -1525,6 +1580,7 @@ async def _build_post_preview(
         title=primary.resolved_title if primary else None,
         links=[(link.canonical_url, link.domain_family) for link in links],
         images=[(a.filename, a.alt_text_body) for a in atts if a.is_image],
+        videos=[(a.filename, a.alt_text_body) for a in atts if a.is_video],
         embed_title=primary.resolved_title if primary else None,
         embed_description=primary.resolved_description if primary else None,
         embed_has_thumb=bool(primary.resolved_image_path) if primary else False,
@@ -1569,7 +1625,7 @@ async def handle_reply(
     bot_msg_id = ref.message_id
 
     req = None
-    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest, SupplementalImageRequest):
+    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest, SupplementalImageRequest, SupplementalLinkRequest):
         req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
         if req is not None:
             break
@@ -1608,9 +1664,10 @@ async def _apply_answer(
         image_atts = [
             a for a in message.attachments
             if is_image_attachment(a.content_type, a.filename)
+            or is_video_attachment(a.content_type, a.filename)
         ]
         if not image_atts:
-            await message.reply(replies.image_not_found(), mention_author=False)
+            await message.reply(replies.media_not_found(), mention_author=False)
             return False
         for att in image_atts:
             await _ingest_attachment(session, submission, att, settings, http_client)
@@ -1638,6 +1695,31 @@ async def _apply_answer(
                 )
             )
         await session.flush()  # assign link IDs before resolving
+        await _resolve_links(session, submission, settings, http_client)
+
+    elif isinstance(req, SupplementalLinkRequest):
+        urls = extract_urls(message.content)
+        if not urls:
+            await message.reply(replies.supplemental_link_not_found(), mention_author=False)
+            return False
+        start = await session.scalar(
+            select(SubmissionLink.order_index)
+            .where(SubmissionLink.submission_id == submission.id)
+            .order_by(SubmissionLink.order_index.desc())
+        )
+        next_index = (start + 1) if start is not None else 1
+        for offset, raw in enumerate(urls):
+            res = canonicalize(raw)
+            session.add(
+                SubmissionLink(
+                    submission_id=submission.id,
+                    order_index=next_index + offset,
+                    raw_url=raw,
+                    canonical_url=res.canonical_url,
+                    domain_family=res.domain_family,
+                )
+            )
+        await session.flush()
         await _resolve_links(session, submission, settings, http_client)
 
     elif isinstance(req, AttachmentAltTextRequest):

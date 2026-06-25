@@ -6,6 +6,7 @@ M3: native Bluesky reposts and multi-link reply threads.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import mimetypes
@@ -53,7 +54,8 @@ async def publish_submission(
         return PublishResult(success=False, error=f"login failed: {exc}")
 
     has_uploaded_images = any(a.is_image for a in attachments)
-    kind = _determine_kind(links, has_uploaded_images)
+    has_uploaded_video = any(a.is_video for a in attachments)
+    kind = _determine_kind(links, has_uploaded_images, has_uploaded_video)
     labels = _build_labels(submission, board_cfg)
     all_tags = list(board_cfg.tags)
     if board_cfg.nsfw:
@@ -66,6 +68,8 @@ async def publish_submission(
             result = await _publish_external(client, links, labels, all_tags)
         elif kind == "images":
             result = await _publish_images(client, links, attachments, labels, all_tags)
+        elif kind == "video":
+            result = await _publish_video(client, links, attachments, labels, all_tags)
         else:
             return PublishResult(success=False, error=f"unsupported embed kind: {kind}")
     except Exception as exc:
@@ -82,19 +86,43 @@ async def publish_submission(
             except Exception as exc:
                 log.warning("failed to like own post for submission %s: %s", submission.id, exc)
             result.bsky_url = at_uri_to_url(result.at_uri, board_cfg.bluesky_handle)
+            reply_uri, reply_cid = result.at_uri, result.at_cid
+            if kind == "video":
+                videos = [a for a in attachments if a.is_video]
+                images = [a for a in attachments if a.is_image]
+                for extra_video in videos[1:]:
+                    try:
+                        reply_uri, reply_cid = await _publish_video_reply(
+                            client, extra_video, links, labels, all_tags,
+                            result.at_uri, result.at_cid, reply_uri, reply_cid,
+                        )
+                    except Exception as exc:
+                        log.warning("extra video reply failed for submission %s: %s", submission.id, exc)
+                        break
+                if images:
+                    try:
+                        reply_uri, reply_cid = await _publish_image_reply(
+                            client, images, links, labels, all_tags,
+                            result.at_uri, result.at_cid, reply_uri, reply_cid,
+                        )
+                    except Exception as exc:
+                        log.warning("image reply failed for submission %s: %s", submission.id, exc)
             if len(links) > 1:
                 await _publish_reply_thread(
                     client, links[1:], labels, all_tags,
                     result.at_uri, result.at_cid, submission.id,
+                    parent_uri=reply_uri, parent_cid=reply_cid,
                 )
 
     return result
 
 
-def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool) -> str:
+def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool, has_uploaded_video: bool = False) -> str:
     first_family = links[0].domain_family if links else None
     if first_family == "bluesky":
         return "record"
+    if has_uploaded_video:
+        return "video"
     if has_uploaded_image:
         return "images"
     if links:
@@ -259,10 +287,12 @@ async def _publish_reply_thread(
     root_uri: str,
     root_cid: str,
     submission_id: int,
+    parent_uri: str | None = None,
+    parent_cid: str | None = None,
 ) -> None:
     """Publish additional links as reply posts chained off the root post."""
-    parent_uri = root_uri
-    parent_cid = root_cid
+    parent_uri = parent_uri or root_uri
+    parent_cid = parent_cid or root_cid
     for link in extra_links:
         try:
             reply_uri, reply_cid = await _publish_reply_post(
@@ -376,6 +406,184 @@ async def _publish_images(
 
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels)
+
+
+_BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB — headroom under Bluesky's 100 MB limit
+
+
+async def _upload_video_blob(client: AsyncClient, att: Attachment) -> object | None:
+    """Upload a local video file via Bluesky's job-based API. Returns the blob ref or None."""
+    if not att.local_path:
+        log.warning("video attachment %s has no local_path, skipping", att.id)
+        return None
+    try:
+        data = Path(att.local_path).read_bytes()
+    except OSError as exc:
+        log.warning("could not read video file %s: %s", att.local_path, exc)
+        return None
+
+    if len(data) > _BSKY_MAX_VIDEO:
+        log.warning("video %s is %d bytes (exceeds %d limit), skipping", att.local_path, len(data), _BSKY_MAX_VIDEO)
+        return None
+
+    try:
+        response = await client.app.bsky.video.upload_video(data)
+        job_id = response.job_status.job_id
+    except Exception as exc:
+        log.warning("video upload failed for %s: %s", att.local_path, exc)
+        return None
+
+    for _ in range(150):
+        await asyncio.sleep(2)
+        try:
+            status_resp = await client.app.bsky.video.get_job_status({"job_id": job_id})
+            job = status_resp.job_status
+        except Exception as exc:
+            log.warning("get_job_status failed for %s: %s", job_id, exc)
+            return None
+        if job.state == "JOB_STATE_COMPLETED":
+            return job.blob
+        if job.state == "JOB_STATE_FAILED":
+            log.warning("video processing failed for %s: %s", job_id, job.error)
+            return None
+
+    log.warning("video processing timed out for job %s", job_id)
+    return None
+
+
+async def _publish_video(
+    client: AsyncClient,
+    links: list[SubmissionLink],
+    attachments: list[Attachment],
+    labels,
+    tags: list[str],
+) -> PublishResult:
+    """Publish the first video attachment as the root post."""
+    first_video = next((a for a in attachments if a.is_video), None)
+    if first_video is None:
+        return PublishResult(success=False, error="no video attachment found")
+
+    blob = await _upload_video_blob(client, first_video)
+    if blob is None:
+        return PublishResult(success=False, error="video upload failed")
+
+    aspect_ratio = None
+    if first_video.width and first_video.height:
+        aspect_ratio = models.AppBskyEmbedDefs.AspectRatio(
+            width=first_video.width, height=first_video.height
+        )
+
+    embed = models.AppBskyEmbedVideo.Main(
+        video=blob,
+        alt=first_video.alt_text_body or "",
+        aspect_ratio=aspect_ratio,
+    )
+
+    primary = links[0] if links else None
+    url = primary.canonical_url if primary else None
+    title = primary.resolved_title if primary else None
+    if url:
+        text, facets = _post_text_and_facets(title, url)
+    else:
+        text, facets = "", []
+    text, facets = _append_tags(text, facets, tags)
+    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels)
+
+
+async def _publish_video_reply(
+    client: AsyncClient,
+    att: Attachment,
+    links: list[SubmissionLink],
+    labels,
+    tags: list[str],
+    root_uri: str,
+    root_cid: str,
+    parent_uri: str,
+    parent_cid: str,
+) -> tuple[str, str]:
+    """Post a single video attachment as a reply in the thread. Returns (at_uri, cid)."""
+    blob = await _upload_video_blob(client, att)
+    if blob is None:
+        raise RuntimeError(f"video upload failed for attachment {att.id}")
+
+    aspect_ratio = None
+    if att.width and att.height:
+        from atproto import models as bsky_models
+        aspect_ratio = bsky_models.AppBskyEmbedDefs.AspectRatio(
+            width=att.width, height=att.height
+        )
+
+    embed = models.AppBskyEmbedVideo.Main(
+        video=blob,
+        alt=att.alt_text_body or "",
+        aspect_ratio=aspect_ratio,
+    )
+    primary = links[0] if links else None
+    url = primary.canonical_url if primary else None
+    title = primary.resolved_title if primary else None
+    if url:
+        text, facets = _post_text_and_facets(title, url)
+    else:
+        text, facets = "", []
+    text, facets = _append_tags(text, facets, tags)
+
+    reply_ref = models.AppBskyFeedPost.ReplyRef(
+        root=models.ComAtprotoRepoStrongRef.Main(uri=root_uri, cid=root_cid),
+        parent=models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
+    )
+    result = await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply_ref)
+    if not result.at_uri or not result.at_cid:
+        raise RuntimeError("video reply post returned no URI/CID")
+    return result.at_uri, result.at_cid
+
+
+async def _publish_image_reply(
+    client: AsyncClient,
+    image_atts: list[Attachment],
+    links: list[SubmissionLink],
+    labels,
+    tags: list[str],
+    root_uri: str,
+    root_cid: str,
+    parent_uri: str,
+    parent_cid: str,
+) -> tuple[str, str]:
+    """Post up to 4 images as a reply in the thread. Returns (at_uri, cid)."""
+    images = []
+    for att in image_atts[:4]:
+        if not att.local_path:
+            log.warning("image attachment %s has no local_path, skipping", att.id)
+            continue
+        blob = await _upload_blob(client, att.local_path)
+        if blob is None:
+            continue
+        images.append(
+            models.AppBskyEmbedImages.Image(
+                image=blob,
+                alt=att.alt_text_body or "",
+            )
+        )
+    if not images:
+        raise RuntimeError("no images could be uploaded for image reply")
+
+    embed = models.AppBskyEmbedImages.Main(images=images)
+    primary = links[0] if links else None
+    url = primary.canonical_url if primary else None
+    title = primary.resolved_title if primary else None
+    if url:
+        text, facets = _post_text_and_facets(title, url)
+    else:
+        text, facets = "", []
+    text, facets = _append_tags(text, facets, tags)
+
+    reply_ref = models.AppBskyFeedPost.ReplyRef(
+        root=models.ComAtprotoRepoStrongRef.Main(uri=root_uri, cid=root_cid),
+        parent=models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
+    )
+    result = await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply_ref)
+    if not result.at_uri or not result.at_cid:
+        raise RuntimeError("image reply post returned no URI/CID")
+    return result.at_uri, result.at_cid
 
 
 def _append_tags(text: str, facets: list, tags: list[str]) -> tuple[str, list]:
