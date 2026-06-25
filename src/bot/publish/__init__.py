@@ -163,11 +163,11 @@ def _post_text_and_facets(title: str | None, url: str) -> tuple[str, list]:
     return text, facets
 
 
-_BSKY_MAX_BLOB = 2_000_000  # bytes; Bluesky hard limit
+_BSKY_MAX_BLOB = 975_000  # bytes; Bluesky hard limit is 1,000,000 — stay comfortably under
 
 
 def _compress_for_bsky(data: bytes) -> bytes:
-    """Compress image data to fit within Bluesky's 2MB blob limit.
+    """Compress image data to fit within Bluesky's 1MB blob limit.
 
     Tries successive JPEG quality reductions, then halves resolution until
     it fits. Converts RGBA/P modes to RGB so JPEG encoding works.

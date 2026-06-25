@@ -234,6 +234,7 @@ class QueuedItem:
     queued_since_rel: str
     state: str  # "queued" | "failed"
     error: str | None
+    thread_url: str | None = None
 
 
 async def board_queue(
@@ -275,18 +276,27 @@ async def board_queue(
             Submission.embed_title,
             Submission.source_posted_at,
             Submission.created_at,
+            Submission.source_discord_message_id,
             SubmissionLink.canonical_url,
             SubmissionLink.resolved_title,
             SubmissionLink.resolved_image_path,
             SubmissionLink.domain_family,
             image_count_sq.label("image_count"),
             latest_error_sq.label("error"),
+            SubmissionThread.thread_id,
         )
         .outerjoin(
             SubmissionLink,
             and_(
                 SubmissionLink.submission_id == Submission.id,
                 SubmissionLink.order_index == 0,
+            ),
+        )
+        .outerjoin(
+            SubmissionThread,
+            and_(
+                SubmissionThread.board_id == Submission.board_id,
+                SubmissionThread.source_discord_message_id == Submission.source_discord_message_id,
             ),
         )
         .where(Submission.board_id == board.id, Submission.state.in_(_eligible))
@@ -313,6 +323,10 @@ async def board_queue(
             post_type = "image"
         else:
             post_type = "link"
+        thread_url = (
+            f"https://discord.com/channels/{board.discord_guild_id}/{r.thread_id}"
+            if r.thread_id else None
+        )
         items.append(QueuedItem(
             submission_id=r.id,
             post_type=post_type,
@@ -326,6 +340,7 @@ async def board_queue(
             queued_since_rel=_relative(r.created_at),
             state="failed" if r.state == SubmissionState.PUBLISH_FAILED.value else "queued",
             error=r.error,
+            thread_url=thread_url,
         ))
     return board, items
 

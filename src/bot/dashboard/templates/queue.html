@@ -92,6 +92,7 @@
       <thead>
         <tr>
           <th>#</th>
+          <th>thread</th>
           <th>freshness</th>
           <th>type</th>
           <th>title</th>
@@ -107,6 +108,11 @@
         {% for item in items %}
         <tr>
           <td style="color:#555">#{{ item.submission_id }}</td>
+          <td>
+            {% if item.thread_url %}
+              <a href="{{ item.thread_url }}" target="_blank" style="font-size:12px">open ↗</a>
+            {% else %}-{% endif %}
+          </td>
           <td>
             {% if item.is_fresh %}
               <span class="badge badge-green">fresh</span>

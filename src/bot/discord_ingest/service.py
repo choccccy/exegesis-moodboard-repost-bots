@@ -1379,6 +1379,7 @@ async def recompute_and_request(
     destination: discord.abc.Messageable,
     yt_client=None,
     bot_id: int | None = None,
+    from_reply: bool = False,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
 
@@ -1524,6 +1525,13 @@ async def recompute_and_request(
                 submission_id=submission.id,
                 bot_message_id=msg.id,
             ))
+
+    # When a reply updates an already-queued submission and all pending alt-text gaps
+    # are now resolved, confirm the update and re-schedule thread archiving.
+    if from_reply and old_state in _QUEUE_TERMINAL and Gap.ALT_TEXT not in gaps:
+        await destination.send(replies.updated_notice())
+        if isinstance(destination, discord.Thread):
+            _archive_thread_after_delay(destination, notice=replies.closing_notice("updated"))
 
     return new_state
 
@@ -1699,7 +1707,7 @@ async def handle_reply(
         return True  # we replied with a nudge; leave request open
 
     # Replies arrive in the submission's thread, so post follow-ups right there.
-    await recompute_and_request(session, submission, settings=settings, destination=message.channel, yt_client=yt_client)
+    await recompute_and_request(session, submission, settings=settings, destination=message.channel, yt_client=yt_client, from_reply=True)
     return True
 
 

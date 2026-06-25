@@ -110,6 +110,10 @@ def queued_notice(
     return "\n".join(parts)
 
 
+def updated_notice() -> str:
+    return "post updated — the new content will be included when published"
+
+
 def publish_failed_notice(error: str | None) -> str:
     return (
         f"publish failed: {error or 'unknown error'}\n"

@@ -1,295 +1,289 @@
-- https://bsky.app/profile/robots.exegesis.space
-- https://bsky.app/profile/xxx-robots.exegesis.space
-- https://bsky.app/profile/vehicles.exegesis.space
-- https://bsky.app/profile/doohickeys.exegesis.space
-- https://bsky.app/profile/memes.exegesis.space
-- https://bsky.app/profile/tv.exegesis.space
+<p align="center">
+  <a href="https://exegesis.space">
+    <img
+      src="https://exegesis.space/exegesis_textlogo.svg"
+      alt="Exegesis Logo"
+      width="100%"
+    />
+  </a>
+</p>
 
-# Discord → Bluesky Repost Bot
+**Exegesis** is a hard sci-fi, zone-fiction setting about strange people and stranger AI in mechanical bodies on an existentially important mission to investigate a Dyson sphere that is eating at their minds, 112.21 light-years from home. You can read more about it at the [main website](https://exegesis.space).
 
-A source-first bot that turns curated Discord moodboard posts into Bluesky reposts
-while always preserving the canonical source URL and image alt text.
+## NSFW content warning
+
+**Certain Exegesis content includes explicit features, typically tagged as `[evil]`. These elements are opt-in and can be ignored if not outright disabled, but please be aware of their presence. *If you are underage, you obviously shouldn't touch this stuff. Go away.***
+
+---
+
+# exegesis-moodboard-repost-bots
+
+A source-first Discord → Bluesky moodboard bot. Curators react 🦋 on Discord posts; the bot gathers the necessary metadata via a per-submission thread, then schedules posts to Bluesky at a configurable daily cadence.
+
+**Live examples:**
+- [robots.exegesis.space](https://bsky.app/profile/robots.exegesis.space) — robot bodies and mechanical forms
+- [vehicles.exegesis.space](https://bsky.app/profile/vehicles.exegesis.space) — strange vehicles and transportation
+- [doohickeys.exegesis.space](https://bsky.app/profile/doohickeys.exegesis.space) — gadgets and doohickeys
+- [memes.exegesis.space](https://bsky.app/profile/memes.exegesis.space) — on-topic memes
+- [tv.exegesis.space](https://bsky.app/profile/tv.exegesis.space) — nerd TV
+- [xxx-robots.exegesis.space](https://bsky.app/profile/xxx-robots.exegesis.space) — \[evil\] NSFW robots
+
+---
 
 ## How it works
 
-1. Someone posts a link and/or image attachments in a watched channel.
-2. Someone reacts with 🦋 → the bot creates a `submission` and opens a **private thread**
-   off that message where all the procedural Q&A happens (keeps the main channel clean).
-   Configured curator users (`curator_user_ids`) are pinged and added to the thread.
-   15 minutes after a submission is queued, all human members are removed from the thread
-   to keep the sidebar tidy.
-3. The bot parses + canonicalizes URLs (strips trackers, normalizes known mirrors back to
-   their canonical domains), downloads attachments to `/data/attachments/...`, and reuses
-   Discord alt text when present.
-4. For anything missing, the bot posts one request per gap in the thread:
-   - `reply with the source URL` - when no link was found in the original message
-   - `couldn't get metadata from X - reply with a more embeddable link, or react 🔗 to use as-is`
-   - `this link has no preview image - reply attaching an image to use`
-   - `reply with the alt text for <file>`
-   - `react 🩸 / ✅ to classify graphic content`
-5. A curator replies/reacts; the bot records the answer and re-evaluates. When all
-   requirements are met it queues the submission for scheduled posting.
-6. Posts fire hourly from noon Mountain Time - up to 6/day when fresh content exists,
-   3/day when working through backlog. Freshness is based on the original Discord post time.
-7. For Bluesky posts the bot reposts natively; for everything else it creates an external-link
-   card or image post.
-8. Removing the 🦋 deletes the submission and its thread. Published posts cannot be un-reacted
-   (the Bluesky post is already live - contact an admin to take it down).
-9. If publish fails, the bot retries automatically at the next queue slot.
+1. A curator reacts 🦋 on a Discord post. The bot ingests the message and opens a private thread.
+2. The bot parses the message: extracts and canonicalizes URLs, downloads any attached images or videos.
+3. If any required data is missing, the bot asks for it in the thread — source URL, replacement images, alt text, graphic content flag — one prompt at a time. Curators and the original poster can both answer.
+4. Once all required data is present, the bot posts a preview of the prospective Bluesky post and waits for a ✅ confirmation reaction before queuing.
+5. The scheduler posts from the queue once per hour, starting at `QUEUE_START_HOUR`. Each board has a separate daily cap for fresh content (posted within `QUEUE_FRESH_WINDOW_HOURS`) and backlog content.
+6. The post format is chosen automatically based on what's available:
+   - **Native repost** — for `bsky.app` links
+   - **Video embed** — for uploaded video files (transcoded to H.264/AAC via ffmpeg)
+   - **Image embed** — for uploaded images (up to 4)
+   - **External link card** — for everything else
+7. The published Bluesky URL is posted back to the thread, which then archives automatically.
+8. Removing 🦋 before publishing cancels the submission. After publishing, the post stays.
 
 ---
 
 ## Requirements
 
-- [Docker](https://docs.docker.com/get-docker/) + Docker Compose V2
-- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) - for secret injection
-- Python 3.12 + [`uv`](https://docs.astral.sh/uv/) - for local dev and running migrations
+- Docker and Docker Compose V2
+- A Discord bot token (Message Content and Server Members privileged intents required)
+- One Bluesky app password per board account
+- *(Optional)* [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for secret management in production
+- *(Optional)* YouTube Data API v3 credentials for playlist integration
 
 ---
 
-## First-time setup
+## Setup
 
-### 1. Discord bot
+### 1. Create a Discord bot
 
-1. Go to <https://discord.com/developers/applications> → New Application.
-2. Under **Bot → Privileged Gateway Intents**, enable **Message Content Intent** and
-   **Server Members Intent**.
-3. Invite the bot to your server with scope `bot` and these permissions:
-   View Channels, Read Message History, Add Reactions, Send Messages,
-   Send Messages in Threads, Attach Files, **Create Public Threads**, **Manage Threads**.
-4. Copy the bot token. Store it in 1Password (e.g. item name `exegesis bot`, field `token`).
+1. Create a new application at [discord.com/developers/applications](https://discord.com/developers/applications)
+2. Go to the **Bot** tab and enable these privileged intents:
+   - **Message Content Intent**
+   - **Server Members Intent**
+3. Under **OAuth2 → URL Generator**, select scopes `bot` and the following permissions:
+   - View Channels, Read Message History
+   - Send Messages, Create Private Threads, Manage Threads
+   - Add Reactions
+4. Use the generated URL to invite the bot to your server
+5. Copy the bot token from the Bot tab — this is your `DISCORD_BOT_TOKEN`
 
-### 2. Bluesky app passwords
+### 2. Set up Bluesky accounts and app passwords
 
-For each board account, go to <https://bsky.app/settings/app-passwords>, create an app
-password, and store it in 1Password. The item name is your choice - you'll reference it in
-`op.env`.
+Each board needs its own Bluesky account. Create accounts at [bsky.app](https://bsky.app) (or any PDS). Custom domain handles are configured in Bluesky's own settings and are outside the scope of this setup.
 
-### 3. Configure `op.env`
+For each account:
 
-`op.env` is the source of truth for all config and is safe to commit - it contains
-`op://` references, not real secrets. Secrets are resolved at runtime by `op run`;
-they are never written to disk.
+1. Log in at bsky.app
+2. Go to **Settings → Privacy and Security → App Passwords**
+3. Click **Add App Password**, give it a descriptive name (e.g. `repost-bot`), and copy the generated password
 
-**Secret fields** use 1Password URI syntax:
+App passwords are in the format `xxxx-xxxx-xxxx-xxxx`. They are distinct from the account password and can be revoked independently.
+
+The environment variable name for each board's password is derived from the board's `name` field:
+
 ```
-op://VAULT/ITEM/FIELD
+BSKY_APP_PASSWORD_<NAME_UPPERCASED_HYPHENS_TO_UNDERSCORES>
 ```
-For example, `op://Private/exegesis bot/token` resolves the `token` field from the
-`exegesis bot` item in the `Private` vault.
 
-**Non-secret fields** (board JSON, queue settings, etc.) are plain text edited inline.
-
-Key fields to fill in:
-
-| Field | What to put |
+Examples:
+| Board `name` | Env var |
 |---|---|
-| `DISCORD_BOT_TOKEN` | `op://` reference to the bot token |
-| `BOARDS_JSON` | JSON array - see format below |
-| `BSKY_APP_PASSWORD_<NAME>` | `op://` reference per board (one line each) |
+| `my-board` | `BSKY_APP_PASSWORD_MY_BOARD` |
+| `weird-wheels` | `BSKY_APP_PASSWORD_WEIRD_WHEELS` |
 
-**`BOARDS_JSON` format** (one object per board, kept on one line for env compatibility):
+### 3. Configure boards
+
+`BOARDS_JSON` is a JSON array with one object per watched Discord channel:
+
 ```json
 [
   {
     "name": "my-board",
-    "discord_guild_id": 123456789,
-    "discord_channel_id": 987654321,
+    "discord_guild_id": 123456789012345678,
+    "discord_channel_id": 123456789012345679,
     "nsfw": false,
-    "curator_role_ids": [111222333],
-    "curator_user_ids": [184475973356355584],
-    "bluesky_handle": "my-board.bsky.social",
-    "tags": ["my-board"]
+    "curator_role_ids": [123456789012345680],
+    "curator_user_ids": [],
+    "bluesky_handle": "myboard.bsky.social",
+    "tags": [],
+    "youtube_playlist_id": null,
+    "display_name": "My Board"
   }
 ]
 ```
 
-**`BSKY_APP_PASSWORD_<NAME>`** - board name uppercased with hyphens replaced by
-underscores. Board `my-board` → `BSKY_APP_PASSWORD_MY_BOARD`. Also add the bare key
-to the `bot` service's `environment:` list in `docker-compose.yml`.
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Lowercase, hyphen-separated identifier. Determines the `BSKY_APP_PASSWORD_*` env var name. |
+| `discord_guild_id` | yes | Server (guild) ID. Enable Developer Mode, then right-click the server → **Copy Server ID**. |
+| `discord_channel_id` | yes | The channel to watch. Right-click the channel → **Copy Channel ID**. |
+| `nsfw` | no | `true` adds a `sexual` Bluesky content label and an `nsfw` tag to every post. Default `false`. |
+| `curator_role_ids` | no | Role IDs whose members can answer bot prompts and confirm posts. |
+| `curator_user_ids` | no | Individual user IDs with curator permissions. |
+| `bluesky_handle` | yes | The Bluesky account to post to (e.g. `myboard.bsky.social`). |
+| `tags` | no | Hashtags appended to every post. |
+| `youtube_playlist_id` | no | YouTube playlist ID. If set, YouTube videos are added to this playlist when a submission is confirmed. |
+| `display_name` | no | Human-readable board name shown on the dashboard. Defaults to `name`. |
 
-### 4. Adding a new board
+Multiple boards can share the same `discord_guild_id`; each must have a distinct `discord_channel_id`.
 
-1. Add a new object to `BOARDS_JSON` in `op.env`.
-2. Add `BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>="op://..."` to `op.env`.
-3. Add `- BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>` to the `bot` service environment list in `docker-compose.yml`.
-4. Create the Bluesky app password and store it in 1Password.
-5. Redeploy (see below).
-
-### 5. DNS + TLS (one-time, for the dashboard)
-
-In Porkbun, add an `A` record:
-- **Name:** `dashboard`
-- **Value:** the droplet's IP address
-
-Then on the droplet, set up the nginx vhost and TLS certificate. The droplet runs
-system nginx (which also serves other projects on the same host), so the dashboard
-gets its own vhost config rather than a dedicated reverse proxy container.
+### 4. Set up environment variables
 
 ```bash
-# Install the HTTP-only vhost first (needed for the ACME challenge)
-sudo tee /etc/nginx/sites-enabled/dashboard.exegesis.space > /dev/null << 'EOF'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name dashboard.exegesis.space;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://$server_name$request_uri;
-    }
-}
-EOF
-sudo nginx -t && sudo systemctl reload nginx
-
-# Obtain TLS certificate via webroot
-sudo certbot certonly --webroot -w /var/www/html -d dashboard.exegesis.space \
-  --non-interactive --agree-tos -m osi@levver.io
-
-# Replace with full HTTPS vhost
-sudo tee /etc/nginx/sites-enabled/dashboard.exegesis.space > /dev/null << 'EOF'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name dashboard.exegesis.space;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://$server_name$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name dashboard.exegesis.space;
-
-    ssl_certificate /etc/letsencrypt/live/dashboard.exegesis.space/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/dashboard.exegesis.space/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_redirect off;
-    }
-}
-EOF
-sudo nginx -t && sudo systemctl reload nginx
+cp .env.example .env
+# Fill in .env with your values
 ```
 
-Certbot sets up automatic renewal via a systemd timer - no further action needed.
+See [Configuration reference](#configuration-reference) below for documentation on every variable, or refer to the comments in `.env.example` directly.
 
 ---
 
-## Deploy
+## Configuration reference
 
-The deploy target is the `DigitalOcean-remote` Docker context, which connects to the
-droplet over SSH. All `docker compose` commands run remotely - the build happens on the
-droplet using the local source tree.
-
-Secrets live in `op.env` as `op://` references and are resolved at runtime by the
-1Password CLI - nothing is ever written to disk.
-
-```bash
-# Deploy (builds images on the remote host, starts all three services)
-op run --env-file op.env --no-masking -- docker --context DigitalOcean-remote compose up --build -d
-```
-
-`op run` injects resolved secrets into the subprocess environment. Docker Compose
-inherits them and passes them through to each container via the bare-key `environment:`
-entries in `docker-compose.yml`.
-
-This starts:
-- **`bot`** - the Discord ingestion + Bluesky publish bot
-- **`dashboard`** - read-only web dashboard, bound to `127.0.0.1:8080` (proxied by nginx)
-
-Data (SQLite DB, downloaded attachments, logs) lives in the `bot-data` named volume and
-survives rebuilds.
-
-### Updating
-
-```bash
-# Pull latest code, rebuild, and restart
-op run --env-file op.env --no-masking -- docker --context DigitalOcean-remote compose up --build -d
-```
-
-Running containers are replaced one at a time. The DB volume is preserved.
-
-### Logs
-
-```bash
-# All services
-docker --context DigitalOcean-remote compose logs -f
-
-# Bot only
-docker --context DigitalOcean-remote compose logs -f bot
-
-# Last 100 lines
-docker --context DigitalOcean-remote compose logs --tail=100 bot
-```
-
-### Stopping / restarting
-
-```bash
-docker --context DigitalOcean-remote compose down     # stop and remove containers
-docker --context DigitalOcean-remote compose restart  # restart without rebuild
-```
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_BOT_TOKEN` | yes | — | Discord bot token |
+| `BSKY_APP_PASSWORD_*` | yes | — | One per board; see setup §2 |
+| `BOARDS_JSON` | yes | `[]` | Board config array; see setup §3 |
+| `TRIGGER_EMOJI` | no | `🦋` | Reaction emoji that triggers ingestion |
+| `DATA_DIR` | no | `/data` | Root directory for the database, attachments, and logs |
+| `DATABASE_URL` | no | `sqlite+aiosqlite:////data/db/bot.db` | SQLAlchemy async database URL |
+| `STORAGE_MIN_FREE_MB` | no | `500` | Bot pauses ingestion when free disk space falls below this |
+| `LOG_LEVEL` | no | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `QUEUE_TIMEZONE` | no | `America/Denver` | IANA timezone name for the posting schedule |
+| `QUEUE_START_HOUR` | no | `12` | Hour of day (local time) to begin posting |
+| `QUEUE_FRESH_WINDOW_HOURS` | no | `72` | Posts newer than this many hours are considered "fresh" |
+| `QUEUE_FRESH_DAILY_CAP` | no | `6` | Max fresh posts published per board per day |
+| `QUEUE_BACKLOG_DAILY_CAP` | no | `3` | Max backlog posts published per board per day |
+| `CATCHUP_ENABLED` | no | `true` | Scan channel history for missed reactions on bot startup |
+| `CATCHUP_LOOKBACK_HOURS` | no | `168` | How far back to scan on startup (hours) |
+| `CATCHUP_MAX_MESSAGES` | no | `500` | Max messages to scan per channel on startup |
+| `DASHBOARD_URL` | no | — | When set, queued-notice messages in Discord include a link to this URL |
+| `YOUTUBE_API_KEY` | no | — | YouTube Data API v3 key (read-only: video titles and thumbnails) |
+| `YOUTUBE_CLIENT_ID` | no | — | OAuth2 client ID for playlist writes |
+| `YOUTUBE_CLIENT_SECRET` | no | — | OAuth2 client secret |
+| `YOUTUBE_REFRESH_TOKEN` | no | — | OAuth2 refresh token |
 
 ---
 
-## Database migrations
+## Deployment
 
-Migrations run automatically on container start (`alembic upgrade head` in the Dockerfile
-entrypoint). To generate a new migration after editing `models.py`:
+### Build the image
 
 ```bash
-# Locally, against a local copy of the DB
-DATABASE_URL=sqlite:///./data/db/bot.db uv run alembic revision --autogenerate -m "description"
-
-# Apply locally
-DATABASE_URL=sqlite:///./data/db/bot.db uv run alembic upgrade head
+docker compose build
 ```
 
-Commit the generated file in `migrations/versions/` and the next deploy applies it.
+The image is based on `python:3.12-slim`. `ffmpeg` is included for video transcoding. Dependencies are installed via [`uv`](https://github.com/astral-sh/uv).
+
+### Run locally
+
+```bash
+docker compose up
+```
+
+The container entrypoint runs `alembic upgrade head` before starting the bot, creating and migrating the database automatically on first run.
+
+### Run on a remote server
+
+```bash
+# Create a Docker context pointing at your server (one-time setup)
+docker context create myserver --docker "host=ssh://user@your-server"
+
+# Build and start in the background
+docker --context myserver compose up -d --build
+```
+
+### With 1Password CLI (recommended for production)
+
+Secrets are resolved from 1Password at runtime and never written to disk. Copy `.env.example` to `op.env`, replace the plain values with `op://` URIs, then:
+
+```bash
+# op.env is .gitignored — never commit it
+op run --env-file op.env --no-masking -- docker --context myserver compose up -d --build bot
+```
+
+> **Removing op.env from git tracking:** If you previously committed `op.env`, stop tracking it with `git rm --cached op.env` before your next commit. The file will remain on disk but will no longer appear in `git status`.
+
+### Update a running deployment
+
+```bash
+# Rebuild and restart one service without touching the other
+docker --context myserver compose up -d --build bot
+```
+
+### View logs
+
+```bash
+docker --context myserver compose logs -f bot
+```
+
+### Back up the database
+
+```bash
+docker --context myserver compose cp bot:/data/db/bot.db ./backup-$(date +%Y%m%d).db
+```
+
+A named Docker volume (`bot-data`) holds the SQLite database and downloaded attachments. It persists across container rebuilds.
 
 ---
 
 ## Dashboard
 
-A read-only observability dashboard at **https://dashboard.exegesis.space** shows:
-- Per-board queue depth, today's post count vs daily cap, fresh/backlog mode, and time of last publish
-- Last 30 publishes across all boards
-- Pending submissions still awaiting curator input, with links to their Discord threads
-- Recent bot errors with expandable tracebacks
+The `dashboard` service is a read-only web UI served on port 8080. It shows:
 
-It auto-refreshes every 2 minutes. Timestamps are in Mountain Time. No login required.
+- Queue depth and daily post counts per board
+- Submissions awaiting curator input
+- Recent publishes with post type and source
+- Recent errors from background tasks
 
-To run locally (useful for testing queries against a local DB):
+It auto-refreshes every two minutes.
+
 ```bash
-DATABASE_URL=sqlite+aiosqlite:///./data/db/bot.db DATA_DIR=./data uv run python -m bot.dashboard
-# open http://localhost:8080
+# Local
+docker compose up dashboard
+# Visit http://localhost:8080
+```
+
+For production, proxy port 8080 behind nginx or Caddy with TLS.
+
+---
+
+## Database migrations
+
+Migrations run automatically every time the container starts (`alembic upgrade head` is baked into the entrypoint). No manual steps are needed when upgrading.
+
+To generate a new migration during development:
+
+```bash
+DATABASE_URL=sqlite+aiosqlite:///./data/db/bot.db \
+  alembic revision --autogenerate -m "describe the change"
 ```
 
 ---
 
-## Local development
+## Development
 
 ```bash
 uv sync --extra dev
-uv run pytest        # full test suite
+pytest
+```
+
+Run the bot directly (requires a populated `.env`):
+
+```bash
+uv run python -m bot.main
+```
+
+Run the dashboard:
+
+```bash
+uv run python -m bot.dashboard
 ```
 
 ---
@@ -298,34 +292,31 @@ uv run pytest        # full test suite
 
 ```
 src/bot/
-  main.py config.py db.py models.py state.py logging_setup.py
-  discord_ingest/   reaction + reply handling, procedural requests
-  canonicalize/     per-domain URL canonicalization + known-mirror registry
-  asset_store/      attachment download to the persistent volume
-  accessibility/    per-image alt-text requirements
-  moderation/       NSFW (board-level) + graphic classification
-  scheduler/        storage health heartbeat + queue dispatcher
-  resolve/          three-tier metadata fetch (oEmbed → mirror OpenGraph → direct)
-  publish/          Bluesky publish (external link, image post, native repost)
-  queue/            fresh/backlog queue selection logic
-  dashboard/        read-only observability web dashboard
-  matrix_ingest/ admin/   reserved for later milestones
-Caddyfile           reverse proxy config (dashboard.exegesis.space → dashboard:8080)
-migrations/         alembic
-tests/              canonicalize, resolve, state machine, reply text, queue scheduling
-data/               mounted volume (db/, attachments/, logs/) - gitignored
+├── main.py                  # Process entrypoint; wires config, DB, Discord client, scheduler
+├── config.py                # Pydantic settings; parses BOARDS_JSON into BoardConfig objects
+├── models.py                # SQLAlchemy ORM models (submissions, attachments, requests, etc.)
+├── state.py                 # Submission state machine and gap detection logic
+├── db.py                    # Async engine setup and session factory
+├── discord_ingest/          # Discord event handling and submission lifecycle
+│   ├── client.py            # discord.py event handlers (reactions, messages, bootup scan)
+│   ├── service.py           # DB orchestration: ingest, recompute state, post requests
+│   └── replies.py           # All bot message text (centralised, no strings in service.py)
+├── publish/                 # Bluesky post creation
+│   └── __init__.py          # Formats and publishes posts; handles all embed types
+├── canonicalize.py          # URL canonicalization and domain family detection
+├── resolve.py               # Metadata resolution (oEmbed, OpenGraph, HTML, Discord embeds)
+├── accessibility/           # Alt text utilities and attachment type detection
+├── asset_store.py           # File download, local storage management, disk space checks
+├── moderation/              # Graphic content classification helpers
+├── queue.py                 # Posting cadence: daily caps, fresh vs. backlog logic
+├── scheduler.py             # Background tasks: housekeeping loop and queue dispatcher
+├── youtube.py               # YouTube Data API client (metadata + playlist writes)
+└── dashboard/               # Read-only FastAPI web UI
+    ├── __init__.py           # FastAPI app and route handlers
+    ├── queries.py            # Read-only DB queries for the dashboard
+    └── templates/           # Jinja2 HTML templates
+
+migrations/                  # Alembic migration scripts
+tests/                       # pytest test suite
+data/                        # Runtime volume (db/, attachments/) — not committed
 ```
-
----
-
-## Roadmap
-
-- **M1** - Discord ingestion: 🦋 reaction, thread Q&A, source/alt/graphic requests. ✓
-- **M2** - Bluesky publishing: external link card + image post + graphic labeling. ✓
-- **M3** - Native Bluesky reposts; multi-link reply threads. ✓
-- **M4** - Metadata resolvers: oEmbed, mirror OpenGraph, known-domain canonicalization for
-  20+ platforms and their mirrors (fxtwitter, vxreddit, kkinstagram, fixdeviantart, etc.),
-  path-pattern heuristics for unrecognised mirrors, metadata gap with 🔗 escape hatch,
-  duplicate-URL detection, publish-failure retry, hourly queue with fresh/backlog caps,
-  read-only web dashboard. ✓
-- **M5** - Matrix ingestion adapter (same submission lifecycle, different ingest source).
