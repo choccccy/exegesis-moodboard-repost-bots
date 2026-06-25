@@ -33,6 +33,7 @@ from ..models import (
     Attachment,
     Board,
     CancellationRequest,
+    ConfirmationRequest,
     ContentLabelRequest,
     ImageRequest,
     MetadataRequest,
@@ -47,10 +48,8 @@ from ..models import (
 )
 from .. import publish as publisher
 from ..moderation import (
-    GRAPHIC_NO_EMOJI,
     GRAPHIC_YES_EMOJI,
     graphic_from_emoji,
-    parse_graphic_answer,
 )
 from ..resolve import resolve
 from ..state import (
@@ -430,6 +429,7 @@ async def handle_reaction_removed(
         SupplementalImageRequest,
         SupplementalLinkRequest,
         CancellationRequest,
+        ConfirmationRequest,
         PublishAttempt,
         SubmissionLink,
         Attachment,
@@ -515,6 +515,63 @@ async def handle_metadata_reaction(
     req.answered_at = _now()
     await channel.send(replies.metadata_confirmed())
     await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_confirmation_reaction(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    channel: discord.abc.Messageable,
+    message_id: int,
+    member: discord.Member | None,
+    user_id: int,
+    yt_client=None,
+) -> bool:
+    """A curator or OP reacted ✅ on the confirmation prompt — queue the submission."""
+    req = await session.scalar(
+        select(ConfirmationRequest).where(
+            ConfirmationRequest.bot_message_id == message_id,
+            ConfirmationRequest.confirmed_at.is_(None),
+        )
+    )
+    if req is None:
+        return False
+    submission = await session.get(Submission, req.submission_id)
+    if submission is None or submission.state in _QUEUE_TERMINAL:
+        return False
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    if not _reaction_authorized(member, user_id, submission, board_cfg):
+        return False
+
+    req.confirmed_at = _now()
+    req.confirmed_by = user_id
+    submission.state = SubmissionState.QUEUED.value
+    log.info("submission %s queued by %s via ✅ confirmation", submission.id, user_id)
+
+    _snap, _atts, links = await _snapshot(session, submission)
+    videos_added = 0
+    if not submission.playlist_skipped:
+        videos_added = await _auto_add_to_playlist(
+            session, submission, links, board_cfg, yt_client
+        )
+
+    queue_url = (
+        f"https://dashboard.exegesis.space/boards/{board_cfg.name}" if board_cfg else None
+    )
+    await channel.send(replies.queued_notice(
+        bluesky_handle=board_cfg.bluesky_handle if board_cfg else None,
+        dashboard_url=queue_url,
+        youtube_playlist_id=board_cfg.youtube_playlist_id if board_cfg else None,
+        videos_added=videos_added,
+    ))
+    if isinstance(channel, discord.Thread):
+        if await _playlist_close_ready(
+            session, submission.board_id,
+            submission.source_discord_message_id, board_cfg,
+            playlist_skipped=submission.playlist_skipped,
+        ):
+            _archive_thread_after_delay(channel, notice=replies.closing_notice("queued"))
+    return True
 
 
 def _is_curator(
@@ -614,6 +671,7 @@ async def handle_cancel_reaction(
         SupplementalImageRequest,
         SupplementalLinkRequest,
         CancellationRequest,
+        ConfirmationRequest,
         PublishAttempt,
         SubmissionLink,
         Attachment,
@@ -680,6 +738,7 @@ async def handle_source_cancel_reaction(
                 MetadataRequest,
                 SupplementalImageRequest,
                 CancellationRequest,
+                ConfirmationRequest,
                 PublishAttempt,
                 SubmissionLink,
                 Attachment,
@@ -1428,50 +1487,38 @@ async def recompute_and_request(
                 )
             )
 
-    if Gap.GRAPHIC in gaps and not await _has_open_request(
+    if snap.graphic_classification_required and not await _has_open_request(
         session, ContentLabelRequest, submission.id
     ):
         msg = await destination.send(replies.graphic_request())
-        # Pre-seed the yes/no reactions so a curator just clicks one.
         try:
             await msg.add_reaction(GRAPHIC_YES_EMOJI)
-            await msg.add_reaction(GRAPHIC_NO_EMOJI)
         except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not add graphic-vote reactions: %s", exc)
+            log.warning("could not seed 🩸 reaction: %s", exc)
         session.add(
             ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
         )
 
     action = _queue_action(old_state, new_state)
-    if action != "none":
-        submission.state = SubmissionState.QUEUED.value
-        log.info("submission %s queued", submission.id)
-        board_cfg_check = settings.board_for_channel(submission.channel_id)
-        videos_added = 0
-        if not submission.playlist_skipped:
-            videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg_check, yt_client)
-        if action == "fresh":
-            await destination.send(replies.ready_confirmation())
+    if action in ("fresh", "silent"):
+        has_conf = await session.scalar(
+            select(ConfirmationRequest.id).where(
+                ConfirmationRequest.submission_id == submission.id
+            )
+        ) is not None
+        if not has_conf:
             preview = await _build_post_preview(session, submission, atts, links)
             for page in replies.format_post_preview(preview):
                 await destination.send(page)
-            queue_url = (
-                f"https://dashboard.exegesis.space/boards/{board_cfg_check.name}"
-                if board_cfg_check else None
-            )
-            await destination.send(replies.queued_notice(
-                bluesky_handle=board_cfg_check.bluesky_handle if board_cfg_check else None,
-                dashboard_url=queue_url,
-                youtube_playlist_id=board_cfg_check.youtube_playlist_id if board_cfg_check else None,
-                videos_added=videos_added,
+            msg = await destination.send(replies.confirmation_request())
+            try:
+                await msg.add_reaction(replies.CONFIRMATION_EMOJI)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not seed ✅ on confirmation: %s", exc)
+            session.add(ConfirmationRequest(
+                submission_id=submission.id,
+                bot_message_id=msg.id,
             ))
-        if isinstance(destination, discord.Thread):
-            if await _playlist_close_ready(
-                session, submission.board_id,
-                submission.source_discord_message_id, board_cfg_check,
-                playlist_skipped=submission.playlist_skipped,
-            ):
-                _archive_thread_after_delay(destination, notice=replies.closing_notice("queued"))
 
     return new_state
 
@@ -1625,7 +1672,7 @@ async def handle_reply(
     bot_msg_id = ref.message_id
 
     req = None
-    for model in (SourceRequest, AttachmentAltTextRequest, ContentLabelRequest, ImageRequest, MetadataRequest, SupplementalImageRequest, SupplementalLinkRequest):
+    for model in (SourceRequest, AttachmentAltTextRequest, ImageRequest, MetadataRequest, SupplementalImageRequest, SupplementalLinkRequest):
         req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
         if req is not None:
             break
@@ -1731,13 +1778,6 @@ async def _apply_answer(
             att.alt_text_body = body
             att.alt_text_status = AltTextStatus.PROVIDED.value
             att.alt_text_author = message.author.id
-
-    elif isinstance(req, ContentLabelRequest):
-        status = parse_graphic_answer(message.content)
-        if status is None:
-            await message.reply(replies.graphic_not_understood(), mention_author=False)
-            return False
-        submission.graphic_status = status.value
 
     elif isinstance(req, MetadataRequest):
         urls = extract_urls(message.content)

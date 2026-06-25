@@ -311,6 +311,23 @@ class CancellationRequest(Base):
     prompted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ConfirmationRequest(Base):
+    """Per-thread ✅ confirmation prompt before queuing.
+
+    One row per submission. When OP or a curator reacts ✅, the submission
+    moves to QUEUED. Not cascade-deleted via ORM (manually cleaned up on cancel).
+    """
+
+    __tablename__ = "confirmation_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("submissions.id"), unique=True, index=True)
+    bot_message_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    prompted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
 class YoutubePlaylistAdd(Base):
     """Audit log of ▶️ playlist additions; also serves as the dedup table."""
 

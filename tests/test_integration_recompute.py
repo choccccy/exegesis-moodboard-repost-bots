@@ -77,7 +77,7 @@ async def _recompute(session, submission, board, settings=None):
 # Fresh first-time transition: INTENT_SUBMITTED → QUEUED
 # ---------------------------------------------------------------------------
 
-async def test_fresh_transition_reaches_queued(session, board):
+async def test_fresh_transition_posts_confirmation_prompt(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
@@ -85,16 +85,17 @@ async def test_fresh_transition_reaches_queued(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    assert sub.state == SubmissionState.QUEUED.value
-    assert replies.ready_confirmation() in dest.sent
-    assert any("queued" in m.lower() for m in dest.sent)
+    # State stops at READY_TO_QUEUE — waiting for ✅ reaction.
+    assert sub.state == SubmissionState.READY_TO_QUEUE.value
+    assert replies.confirmation_request() in dest.sent
+    assert not any("queued" in m.lower() for m in dest.sent)
 
 
 # ---------------------------------------------------------------------------
-# Stuck READY_TO_QUEUE → QUEUED silently (no duplicate confirmation messages)
+# Stuck READY_TO_QUEUE — confirmation prompt posted if not already there
 # ---------------------------------------------------------------------------
 
-async def test_stuck_ready_to_queue_transitions_silently(session, board):
+async def test_stuck_ready_to_queue_posts_confirmation_once(session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
     session.add(sub)
     await session.flush()
@@ -102,10 +103,14 @@ async def test_stuck_ready_to_queue_transitions_silently(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    assert sub.state == SubmissionState.QUEUED.value
-    # The confirmation was already sent in a prior run - must not be re-sent.
-    assert replies.ready_confirmation() not in dest.sent
+    # State stays READY_TO_QUEUE; confirmation prompt posted.
+    assert sub.state == SubmissionState.READY_TO_QUEUE.value
+    assert replies.confirmation_request() in dest.sent
     assert not any("queued" in m.lower() for m in dest.sent)
+
+    # Second recompute must not duplicate the prompt.
+    dest2 = await _recompute(session, sub, board)
+    assert replies.confirmation_request() not in dest2.sent
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +218,7 @@ async def test_image_request_suppressed_while_metadata_open(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    assert any("embeddable" in m for m in dest.sent), "expected metadata request"
+    assert any("better link" in m for m in dest.sent), "expected metadata request"
     assert replies.image_request() not in dest.sent, "image request must be suppressed while metadata is open"
 
 

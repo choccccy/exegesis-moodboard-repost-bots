@@ -92,8 +92,6 @@ def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
         gaps.append(Gap.IMAGE)
     if any(s == AltTextStatus.NEEDED for s in snap.image_alt_statuses):
         gaps.append(Gap.ALT_TEXT)
-    if snap.graphic_classification_required and snap.graphic_status == GraphicStatus.UNKNOWN:
-        gaps.append(Gap.GRAPHIC)
     return gaps
 
 

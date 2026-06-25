@@ -41,21 +41,21 @@ def test_provided_alt_text_is_ready():
     assert evaluate_state(s) == SubmissionState.READY_TO_QUEUE
 
 
-def test_graphic_required_blocks_until_answered():
+def test_graphic_required_does_not_block():
+    # Graphic classification is now a non-blocking standing offer; never creates a gap.
     s = snap(graphic_classification_required=True, graphic_status=GraphicStatus.UNKNOWN)
-    assert evaluate_state(s) == SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION
-    s2 = snap(graphic_classification_required=True, graphic_status=GraphicStatus.NOT_GRAPHIC)
-    assert evaluate_state(s2) == SubmissionState.READY_TO_QUEUE
+    assert evaluate_state(s) == SubmissionState.READY_TO_QUEUE
+    assert Gap.GRAPHIC not in missing_gaps(s)
 
 
-def test_source_takes_precedence_over_alt_and_graphic():
+def test_source_takes_precedence_over_alt():
     s = snap(
         has_canonical_link=False,
         image_alt_statuses=[AltTextStatus.NEEDED],
         graphic_classification_required=True,
     )
     assert evaluate_state(s) == SubmissionState.AWAITING_SOURCE
-    assert missing_gaps(s) == [Gap.SOURCE, Gap.ALT_TEXT, Gap.GRAPHIC]
+    assert missing_gaps(s) == [Gap.SOURCE, Gap.ALT_TEXT]
 
 
 def test_missing_image_blocks_when_required():

@@ -79,9 +79,10 @@ def test_source_request_is_string():
     assert "source" in msg.lower() and "url" in msg.lower()
 
 
-def test_ready_confirmation():
-    msg = replies.ready_confirmation()
-    assert "ready" in msg.lower()
+def test_confirmation_request():
+    msg = replies.confirmation_request()
+    assert replies.CONFIRMATION_EMOJI in msg
+    assert len(msg) > 0
 
 
 def test_published_notice_includes_url():

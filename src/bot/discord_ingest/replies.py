@@ -4,51 +4,46 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
+from ..moderation import GRAPHIC_YES_EMOJI
 
 METADATA_CONFIRM_EMOJI = "🔗"
 CANCEL_EMOJI = "❌"
 PLAYLIST_OPT_OUT_EMOJI = "⏹️"
+CONFIRMATION_EMOJI = "✅"
 
 
 def source_request() -> str:
-    return "reply to this message with the source URL"
+    return "**reply to this message** with the source URL"
 
 
 def image_request() -> str:
-    return (
-        "this link has no preview image, so the post would have no image. "
-        "reply to this message attaching an image to use"
-    )
+    return "this link has no preview image. **reply to this message** attaching at least one image to use"
 
 
 def image_not_found() -> str:
-    return "no image attached - reply again attaching at least one image"
+    return "no image attached — **reply again** attaching at least one image"
 
 
 def media_not_found() -> str:
-    return "no image or video attached - reply again attaching at least one"
+    return "no image or video attached — **reply again** attaching at least one"
 
 
 def alt_text_request(filename: str) -> str:
-    return f"reply to this message with the alt text for **{filename}**"
+    return f"**reply to this message** with the alt text for **{filename}**"
 
 
 def graphic_request() -> str:
-    return (
-        f"react {GRAPHIC_YES_EMOJI} if this contains graphic/gore content, "
-        f"{GRAPHIC_NO_EMOJI} if it's safe"
-    )
+    return "**react 🩸** if this post contains graphic or gore content"
 
 
-def ready_confirmation() -> str:
-    return "✓ all required info received - this submission is ready to queue"
+def confirmation_request() -> str:
+    return f"🔎 **react {CONFIRMATION_EMOJI}** to queue this for posting"
 
 
 def metadata_request(url: str) -> str:
     return (
-        f"couldn't get any metadata from **{url}** - reply with a more embeddable "
-        f"link, or react {METADATA_CONFIRM_EMOJI} to use it as-is (at least one image will be required)"
+        f"couldn't get metadata from **{url}** — **reply with a better link**, "
+        f"or **react {METADATA_CONFIRM_EMOJI}** to use it as-is (at least one image will be required)"
     )
 
 
@@ -61,15 +56,11 @@ def metadata_link_updated(new_url: str) -> str:
 
 
 def metadata_url_not_found() -> str:
-    return f"no URL found - reply again with a link, or react {METADATA_CONFIRM_EMOJI} to use the existing one as-is"
+    return f"no URL found — **reply again** with a link, or **react {METADATA_CONFIRM_EMOJI}** to use the existing one as-is"
 
 
 def source_not_found() -> str:
-    return "couldn't find a URL in that reply - reply again with the source URL"
-
-
-def graphic_not_understood() -> str:
-    return "reply with a simple yes or no for graphic content"
+    return "no URL found in that reply — **reply again** with the source URL"
 
 
 def reaction_removed() -> str:
@@ -173,19 +164,19 @@ def closing_notice(reason: str) -> str:
 
 
 def supplemental_image_request() -> str:
-    return "📎 Reply to this message with any additional or supplemental images to include in the post."
+    return "🖼️ **reply to this message** with any additional images or videos to include in the post."
 
 
 def supplemental_link_request() -> str:
-    return "🔗 Reply to this message with any additional links to include as thread replies in the post."
+    return "🔗 **reply to this message** with any additional links to include as thread replies in the post."
 
 
 def supplemental_link_not_found() -> str:
-    return "no URLs found in that message - reply again with the link(s) to add"
+    return "no URLs found — **reply again** with the link(s) to add"
 
 
 def cancel_request() -> str:
-    return f"react {CANCEL_EMOJI} here to cancel, or react {CANCEL_EMOJI} on the original post"
+    return f"**react {CANCEL_EMOJI}** here to cancel, or **react {CANCEL_EMOJI}** on the original post"
 
 
 def source_cancel_confirmation(user_id: int) -> str:
@@ -193,7 +184,7 @@ def source_cancel_confirmation(user_id: int) -> str:
 
 
 def playlist_opt_out_prompt() -> str:
-    return f"this will be added to the YouTube playlist - react {PLAYLIST_OPT_OUT_EMOJI} to skip it"
+    return f"this will be added to the YouTube playlist — **react {PLAYLIST_OPT_OUT_EMOJI}** to skip it"
 
 
 # Human labels + atproto $type per embed mode.

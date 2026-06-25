@@ -14,7 +14,7 @@ from sqlalchemy import select
 from ..config import Settings
 from ..db import session_scope
 from ..models import Submission, SubmissionThread
-from ..moderation import GRAPHIC_NO_EMOJI, GRAPHIC_YES_EMOJI
+from ..moderation import GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
 from . import replies, service
 from .replies import CANCEL_EMOJI
@@ -104,7 +104,7 @@ class RepostBot(discord.Client):
                 )
             return
 
-        if emoji in (GRAPHIC_YES_EMOJI, GRAPHIC_NO_EMOJI):
+        if emoji == GRAPHIC_YES_EMOJI:
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
@@ -186,6 +186,21 @@ class RepostBot(discord.Client):
                     member=payload.member,
                     channel=channel,
                     settings=self.settings,
+                    yt_client=self._yt_client,
+                )
+
+        if emoji == replies.CONFIRMATION_EMOJI:
+            channel = await self._resolve_channel(payload.channel_id)
+            if channel is None:
+                return
+            async with session_scope() as session:
+                await service.handle_confirmation_reaction(
+                    session,
+                    settings=self.settings,
+                    channel=channel,
+                    message_id=payload.message_id,
+                    member=payload.member,
+                    user_id=payload.user_id,
                     yt_client=self._yt_client,
                 )
 
