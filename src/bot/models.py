@@ -80,6 +80,9 @@ class Submission(Base):
     # When the original Discord message was posted (used for freshness / queue ordering).
     # Populated from message.created_at at ingest; kept distinct from created_at (ingest time).
     source_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Discord snowflake of the message this submission is a reply to, if any.
+    # Used to form Bluesky reply chains when both messages are butterflied.
+    reply_to_discord_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -256,6 +259,9 @@ class PublishAttempt(Base):
     # AT URI and CID returned by the Bluesky API on success.
     at_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     at_cid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # For reply chains: the root post's AT URI and CID. Equal to at_uri/at_cid for top-level posts.
+    bsky_root_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bsky_root_cid: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Human-readable bsky.app URL for the published content (handle-based, not DID).
     bsky_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

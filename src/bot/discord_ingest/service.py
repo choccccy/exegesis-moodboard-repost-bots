@@ -166,6 +166,9 @@ async def handle_reaction(
                 cfg.require_graphic_classification if cfg else True
             ),
             source_posted_at=message.created_at,
+            reply_to_discord_message_id=(
+                message.reference.message_id if message.reference else None
+            ),
         )
         session.add(submission)
         await session.flush()  # assign submission.id
@@ -1260,6 +1263,45 @@ _QUEUE_TERMINAL = frozenset({
     SubmissionState.PUBLISH_FAILED.value,
 })
 
+_DEFERRED = object()  # sentinel: parent butterflied but not yet published
+
+
+async def _resolve_parent_ref(session: AsyncSession, submission: Submission):
+    """Resolve the Bluesky reply ref for a submission that is a Discord reply.
+
+    Returns:
+      None       - no parent, or parent not butterflied -> post standalone
+      _DEFERRED  - parent butterflied but not published yet -> skip this tick
+      (parent_uri, parent_cid, root_uri, root_cid) - post as Bluesky reply
+    """
+    if submission.reply_to_discord_message_id is None:
+        return None
+
+    parent_sub = await session.scalar(
+        select(Submission).where(
+            Submission.board_id == submission.board_id,
+            Submission.source_discord_message_id == submission.reply_to_discord_message_id,
+        )
+    )
+    if parent_sub is None:
+        return None
+
+    if parent_sub.state != SubmissionState.PUBLISHED.value:
+        return _DEFERRED
+
+    parent_attempt = await session.scalar(
+        select(PublishAttempt)
+        .where(PublishAttempt.submission_id == parent_sub.id, PublishAttempt.success.is_(True))
+        .order_by(PublishAttempt.attempted_at.desc())
+        .limit(1)
+    )
+    if parent_attempt is None or not parent_attempt.at_uri or not parent_attempt.at_cid:
+        return None
+
+    root_uri = parent_attempt.bsky_root_uri or parent_attempt.at_uri
+    root_cid = parent_attempt.bsky_root_cid or parent_attempt.at_cid
+    return (parent_attempt.at_uri, parent_attempt.at_cid, root_uri, root_cid)
+
 _THREAD_CLOSE_DELAY = 15 * 60  # seconds after queuing before archiving the thread
 
 
@@ -1541,12 +1583,15 @@ async def publish_queued_submission(
     settings: Settings,
     submission: Submission,
     destination: discord.abc.Messageable | None,
-) -> None:
+) -> bool:
     """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
 
     Loads current attachments and links from DB, then delegates to _attempt_publish.
     ``destination`` is the submission thread (or None if the thread can't be resolved -
     publish still proceeds, just without a Discord status notice).
+
+    Returns True if the publish was attempted (success or failure), False if deferred
+    because the parent submission is butterflied but not yet published.
     """
     _snap, atts, links = await _snapshot(session, submission)
     if destination is None:
@@ -1554,7 +1599,7 @@ async def publish_queued_submission(
             async def send(self, *a, **kw):
                 pass
         destination = _DevNull()  # type: ignore[assignment]
-    await _attempt_publish(session, settings, submission, atts, links, destination)
+    return await _attempt_publish(session, settings, submission, atts, links, destination)
 
 
 async def _attempt_publish(
@@ -1564,15 +1609,19 @@ async def _attempt_publish(
     atts: list[Attachment],
     links: list[SubmissionLink],
     destination: discord.abc.Messageable,
-) -> None:
-    """Publish to Bluesky and record the result. Fires once per ready transition."""
+) -> bool:
+    """Publish to Bluesky and record the result.
+
+    Returns True if publish was attempted (success or failure).
+    Returns False if deferred because the parent is butterflied but not yet published.
+    """
     board_cfg = settings.board_for_channel(submission.channel_id)
     if not board_cfg or not board_cfg.bluesky_handle:
         log.info(
             "submission %s ready but board has no bluesky_handle - skipping publish",
             submission.id,
         )
-        return
+        return True
 
     password = settings.bsky_password_for(board_cfg.name)
     if not password:
@@ -1580,7 +1629,22 @@ async def _attempt_publish(
             "submission %s ready but no app password for board %s - skipping publish",
             submission.id, board_cfg.name,
         )
-        return
+        return True
+
+    parent_ref = await _resolve_parent_ref(session, submission)
+    if parent_ref is _DEFERRED:
+        log.info("submission %s deferred: parent not yet published", submission.id)
+        return False
+
+    reply_kwargs: dict = {}
+    if parent_ref is not None:
+        parent_uri, parent_cid, root_uri, root_cid = parent_ref
+        reply_kwargs = dict(
+            reply_parent_uri=parent_uri,
+            reply_parent_cid=parent_cid,
+            reply_root_uri=root_uri,
+            reply_root_cid=root_cid,
+        )
 
     result = await publisher.publish_submission(
         submission=submission,
@@ -1588,6 +1652,7 @@ async def _attempt_publish(
         attachments=atts,
         board_cfg=board_cfg,
         password=password,
+        **reply_kwargs,
     )
     session.add(
         PublishAttempt(
@@ -1595,6 +1660,8 @@ async def _attempt_publish(
             success=result.success,
             at_uri=result.at_uri,
             at_cid=result.at_cid,
+            bsky_root_uri=result.bsky_root_uri,
+            bsky_root_cid=result.bsky_root_cid,
             bsky_url=result.bsky_url,
             error=result.error,
         )
@@ -1613,6 +1680,7 @@ async def _attempt_publish(
         submission.state = SubmissionState.PUBLISH_FAILED.value
         await destination.send(replies.publish_failed_notice(result.error))
         log.error("submission %s publish failed: %s", submission.id, result.error)
+    return True
 
 
 async def _build_post_preview(
@@ -1635,6 +1703,30 @@ async def _build_post_preview(
     if submission.graphic_status == GraphicStatus.GRAPHIC.value:
         labels.append("graphic-media")
 
+    reply_to_bsky_url: str | None = None
+    reply_to_pending = False
+    parent_ref = await _resolve_parent_ref(session, submission)
+    if parent_ref is _DEFERRED:
+        reply_to_pending = True
+    elif parent_ref is not None:
+        parent_sub = await session.scalar(
+            select(Submission).where(
+                Submission.board_id == submission.board_id,
+                Submission.source_discord_message_id == submission.reply_to_discord_message_id,
+            )
+        )
+        if parent_sub is not None:
+            parent_attempt = await session.scalar(
+                select(PublishAttempt)
+                .where(PublishAttempt.submission_id == parent_sub.id, PublishAttempt.success.is_(True))
+                .order_by(PublishAttempt.attempted_at.desc())
+                .limit(1)
+            )
+            if parent_attempt and parent_attempt.bsky_url:
+                reply_to_bsky_url = parent_attempt.bsky_url
+            elif parent_attempt and parent_attempt.at_uri:
+                reply_to_bsky_url = publisher.at_uri_to_url(parent_attempt.at_uri)
+
     return replies.PostPreview(
         kind=kind,
         title=primary.resolved_title if primary else None,
@@ -1651,6 +1743,8 @@ async def _build_post_preview(
         graphic_status=submission.graphic_status,
         image_satisfied=image_satisfied,
         image_source=image_source,
+        reply_to_bsky_url=reply_to_bsky_url,
+        reply_to_pending=reply_to_pending,
     )
 
 

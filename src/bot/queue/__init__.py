@@ -24,11 +24,13 @@ async def pick_next_for_board(
     session: AsyncSession,
     board_id: int,
     fresh_cutoff_utc: datetime,
+    skip_ids: frozenset[int] = frozenset(),
 ) -> Submission | None:
     """Return the next submission to publish for this board, or None if nothing is queued.
 
     Fresh submissions (created_at >= fresh_cutoff_utc) come before backlog, with FIFO
     ordering within each tier. Both QUEUED and PUBLISH_FAILED are included as candidates.
+    Pass skip_ids to exclude specific submission IDs (e.g. deferred reply-chain submissions).
     """
     _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
     cutoff = fresh_cutoff_utc.replace(tzinfo=None) if fresh_cutoff_utc.tzinfo else fresh_cutoff_utc
@@ -39,7 +41,7 @@ async def pick_next_for_board(
         (effective_date >= cutoff, 0),
         else_=1,
     )
-    return await session.scalar(
+    stmt = (
         select(Submission)
         .where(
             Submission.board_id == board_id,
@@ -48,6 +50,9 @@ async def pick_next_for_board(
         .order_by(freshness_priority, effective_date.nulls_last(), Submission.created_at)
         .limit(1)
     )
+    if skip_ids:
+        stmt = stmt.where(Submission.id.not_in(skip_ids))
+    return await session.scalar(stmt)
 
 
 async def count_posts_today(

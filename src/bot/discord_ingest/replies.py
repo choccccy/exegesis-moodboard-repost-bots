@@ -232,6 +232,8 @@ class PostPreview:
     graphic_status: str = "unknown"
     image_satisfied: bool = True
     image_source: str = "n/a"
+    reply_to_bsky_url: str | None = None
+    reply_to_pending: bool = False
 
 
 _DISCORD_MSG_LIMIT = 1900
@@ -295,6 +297,10 @@ def format_post_preview(p: PostPreview) -> list[str]:
 
     lines: list[str] = ["🔎 **prospective Bluesky post**", ""]
     lines.append(f"type:  {human} ({atproto})")
+    if p.reply_to_bsky_url:
+        lines.append(f"reply-to: {p.reply_to_bsky_url}")
+    elif p.reply_to_pending:
+        lines.append("reply-to: (parent queued - will wait to publish)")
 
     # text: source title (when known) followed by the primary canonical URL.
     lines.append("text:")

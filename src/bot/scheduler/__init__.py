@@ -115,30 +115,44 @@ async def _fire_board(
         log.info("queue: board %s at daily cap (%d/%d)", board_cfg.name, today_count, cap)
         return
 
-    submission = await queue_module.pick_next_for_board(session, board.id, fresh_cutoff)
-    if submission is None:
-        log.debug("queue: board %s nothing queued", board_cfg.name)
-        return
-
-    log.info(
-        "queue: board %s publishing submission %s (%d/%d today)",
-        board_cfg.name, submission.id, today_count + 1, cap,
-    )
-
-    destination = None
-    thread_row = await session.scalar(
-        select(SubmissionThread).where(
-            SubmissionThread.board_id == submission.board_id,
-            SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+    _MAX_DEFERRED_TRIES = 5
+    skip_ids: set[int] = set()
+    for _ in range(_MAX_DEFERRED_TRIES):
+        submission = await queue_module.pick_next_for_board(
+            session, board.id, fresh_cutoff, skip_ids=frozenset(skip_ids)
         )
-    )
-    if thread_row is not None:
-        try:
-            destination = await bot.fetch_channel(thread_row.thread_id)
-        except Exception as exc:
-            log.warning(
-                "queue: could not resolve thread for submission %s: %s - publishing silently",
-                submission.id, exc,
-            )
+        if submission is None:
+            log.debug("queue: board %s nothing queued", board_cfg.name)
+            return
 
-    await ingest_service.publish_queued_submission(session, settings, submission, destination)
+        log.info(
+            "queue: board %s publishing submission %s (%d/%d today)",
+            board_cfg.name, submission.id, today_count + 1, cap,
+        )
+
+        destination = None
+        thread_row = await session.scalar(
+            select(SubmissionThread).where(
+                SubmissionThread.board_id == submission.board_id,
+                SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+            )
+        )
+        if thread_row is not None:
+            try:
+                destination = await bot.fetch_channel(thread_row.thread_id)
+            except Exception as exc:
+                log.warning(
+                    "queue: could not resolve thread for submission %s: %s - publishing silently",
+                    submission.id, exc,
+                )
+
+        attempted = await ingest_service.publish_queued_submission(session, settings, submission, destination)
+        if attempted:
+            return
+        skip_ids.add(submission.id)
+        log.info(
+            "queue: board %s submission %s deferred (parent not published), trying next",
+            board_cfg.name, submission.id,
+        )
+
+    log.info("queue: board %s all %d candidates deferred", board_cfg.name, _MAX_DEFERRED_TRIES)

@@ -33,6 +33,8 @@ class PublishResult:
     error: str | None = None
     bsky_url: str | None = None
     is_repost: bool = False
+    bsky_root_uri: str | None = None
+    bsky_root_cid: str | None = None
 
 
 async def publish_submission(
@@ -41,6 +43,11 @@ async def publish_submission(
     attachments: list[Attachment],
     board_cfg: BoardConfig,
     password: str,
+    *,
+    reply_parent_uri: str | None = None,
+    reply_parent_cid: str | None = None,
+    reply_root_uri: str | None = None,
+    reply_root_cid: str | None = None,
 ) -> PublishResult:
     """Authenticate to Bluesky and post the submission. Returns an audit result."""
     if not board_cfg.bluesky_handle:
@@ -61,15 +68,22 @@ async def publish_submission(
     if board_cfg.nsfw:
         all_tags.append("nsfw")
 
+    reply = None
+    if kind != "record" and reply_parent_uri and reply_parent_cid and reply_root_uri and reply_root_cid:
+        reply = models.AppBskyFeedPost.ReplyRef(
+            root=models.ComAtprotoRepoStrongRef.Main(uri=reply_root_uri, cid=reply_root_cid),
+            parent=models.ComAtprotoRepoStrongRef.Main(uri=reply_parent_uri, cid=reply_parent_cid),
+        )
+
     try:
         if kind == "record":
             result = await _publish_record(client, links)
         elif kind == "external":
-            result = await _publish_external(client, links, labels, all_tags)
+            result = await _publish_external(client, links, labels, all_tags, reply=reply)
         elif kind == "images":
-            result = await _publish_images(client, links, attachments, labels, all_tags)
+            result = await _publish_images(client, links, attachments, labels, all_tags, reply=reply)
         elif kind == "video":
-            result = await _publish_video(client, links, attachments, labels, all_tags)
+            result = await _publish_video(client, links, attachments, labels, all_tags, reply=reply)
         else:
             return PublishResult(success=False, error=f"unsupported embed kind: {kind}")
     except Exception as exc:
@@ -77,6 +91,8 @@ async def publish_submission(
         return PublishResult(success=False, error=str(exc))
 
     if result.success and result.at_uri:
+        result.bsky_root_uri = reply_root_uri or result.at_uri
+        result.bsky_root_cid = reply_root_cid or result.at_cid
         if kind == "record":
             # For native reposts, show the original post's URL, not the repost record.
             result.bsky_url = links[0].canonical_url
@@ -346,6 +362,8 @@ async def _publish_external(
     links: list[SubmissionLink],
     labels,
     tags: list[str],
+    *,
+    reply=None,
 ) -> PublishResult:
     primary = links[0]
     url = primary.canonical_url
@@ -366,7 +384,7 @@ async def _publish_external(
     )
     text, facets = _post_text_and_facets(title, url)
     text, facets = _append_tags(text, facets, tags)
-    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels)
+    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 
 
 async def _publish_images(
@@ -375,6 +393,8 @@ async def _publish_images(
     attachments: list[Attachment],
     labels,
     tags: list[str],
+    *,
+    reply=None,
 ) -> PublishResult:
     images = []
     for att in (a for a in attachments if a.is_image):
@@ -405,7 +425,7 @@ async def _publish_images(
         text, facets = "", []
 
     text, facets = _append_tags(text, facets, tags)
-    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels)
+    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 
 
 _BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB — headroom under Bluesky's 100 MB limit
@@ -457,6 +477,8 @@ async def _publish_video(
     attachments: list[Attachment],
     labels,
     tags: list[str],
+    *,
+    reply=None,
 ) -> PublishResult:
     """Publish the first video attachment as the root post."""
     first_video = next((a for a in attachments if a.is_video), None)
@@ -487,7 +509,7 @@ async def _publish_video(
     else:
         text, facets = "", []
     text, facets = _append_tags(text, facets, tags)
-    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels)
+    return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 
 
 async def _publish_video_reply(

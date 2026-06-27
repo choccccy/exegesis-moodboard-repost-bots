@@ -49,6 +49,7 @@ def _message(channel_id: int, msg_id: int = 42, author_id: int = 999) -> MagicMo
     msg.guild = guild
 
     msg.forward = AsyncMock()
+    msg.reference = None
     return msg
 
 
