@@ -79,6 +79,33 @@
   .badge-gray   { background: #1f1f1f; color: #777; }
   .badge-blue   { background: #1e3a5f; color: #93c5fd; }
   .badge-purple { background: #2e1065; color: #c4b5fd; }
+  /* Warm-tone blocker badges */
+  .badge-blocker-submitted    { background: #2e2200; color: #fbbf24; }
+  .badge-blocker-source       { background: #4a1500; color: #ff7040; }
+  .badge-blocker-metadata     { background: #3d2000; color: #fb923c; }
+  .badge-blocker-image        { background: #372800; color: #fcd34d; }
+  .badge-blocker-alt-text     { background: #2e2e00; color: #e8d84a; }
+  .badge-blocker-class        { background: #3d1830; color: #f9a8d4; }
+
+  /* Pending filter bar */
+  .filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .filter-btn {
+    background: #1f1f1f;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #888;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 3px 10px;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+  }
+  .filter-btn:hover { background: #2a2a2a; color: #bbb; }
+  .filter-btn.active { background: #2e2200; border-color: #6b4800; color: #fbbf24; }
 
   /* Tables */
   .table-wrap { overflow-x: auto; }
@@ -315,8 +342,11 @@
 {% if pending %}
 <section>
   <h2>Pending details</h2>
+  <div class="filter-bar" id="pending-filters">
+    <button class="filter-btn active" data-filter="all">All ({{ pending|length }})</button>
+  </div>
   <div class="table-wrap">
-    <table>
+    <table id="pending-table">
       <thead>
         <tr>
           <th>board</th>
@@ -329,9 +359,27 @@
       </thead>
       <tbody>
         {% for p in pending %}
-        <tr>
+        <tr data-blockers="{{ p.blockers | join('|') }}">
           <td style="white-space:nowrap">{{ p.board_name }}</td>
-          <td><span class="badge badge-yellow">{{ p.state_label }}</span></td>
+          <td style="white-space:nowrap">
+            {% for b in p.blockers %}
+              {% if b == "submitted" %}
+                <span class="badge badge-blocker-submitted">{{ b }}</span>
+              {% elif b == "needs source" %}
+                <span class="badge badge-blocker-source">{{ b }}</span>
+              {% elif b == "needs metadata" %}
+                <span class="badge badge-blocker-metadata">{{ b }}</span>
+              {% elif b == "needs image" %}
+                <span class="badge badge-blocker-image">{{ b }}</span>
+              {% elif b == "needs alt text" %}
+                <span class="badge badge-blocker-alt-text">{{ b }}</span>
+              {% elif b == "needs classification" %}
+                <span class="badge badge-blocker-class">{{ b }}</span>
+              {% else %}
+                <span class="badge badge-yellow">{{ b }}</span>
+              {% endif %}
+            {% endfor %}
+          </td>
           <td>
             {% if p.canonical_url %}
               <a href="{{ p.canonical_url }}" target="_blank" title="{{ p.canonical_url }}">{{ p.canonical_url }}</a>
@@ -350,6 +398,46 @@
     </table>
   </div>
 </section>
+<script>
+(function () {
+  const filterBar = document.getElementById('pending-filters');
+  const table = document.getElementById('pending-table');
+  const rows = Array.from(table.querySelectorAll('tbody tr'));
+
+  // Build filter buttons from the blocker types present in the table.
+  const seen = new Set();
+  rows.forEach(row => {
+    (row.dataset.blockers || '').split('|').filter(Boolean).forEach(b => seen.add(b));
+  });
+
+  const order = ['needs source', 'needs metadata', 'needs image', 'needs alt text', 'needs classification', 'submitted'];
+  const present = order.filter(b => seen.has(b));
+
+  present.forEach(blocker => {
+    const count = rows.filter(r => (r.dataset.blockers || '').split('|').includes(blocker)).length;
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn';
+    btn.dataset.filter = blocker;
+    btn.textContent = `${blocker} (${count})`;
+    filterBar.appendChild(btn);
+  });
+
+  filterBar.addEventListener('click', e => {
+    const btn = e.target.closest('.filter-btn');
+    if (!btn) return;
+    filterBar.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const f = btn.dataset.filter;
+    rows.forEach(row => {
+      if (f === 'all') {
+        row.hidden = false;
+      } else {
+        row.hidden = !(row.dataset.blockers || '').split('|').includes(f);
+      }
+    });
+  });
+})();
+</script>
 {% endif %}
 
 {% if errors %}

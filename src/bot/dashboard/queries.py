@@ -9,7 +9,21 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Attachment, Board, BotError, PublishAttempt, Submission, SubmissionLink, SubmissionThread, YoutubePlaylistAdd
+from ..models import (
+    Attachment,
+    AttachmentAltTextRequest,
+    Board,
+    BotError,
+    ContentLabelRequest,
+    ImageRequest,
+    MetadataRequest,
+    PublishAttempt,
+    SourceRequest,
+    Submission,
+    SubmissionLink,
+    SubmissionThread,
+    YoutubePlaylistAdd,
+)
 from ..publish import at_uri_to_url
 from ..queue import count_posts_today, daily_cap, has_fresh_queued
 from ..state import SubmissionState
@@ -373,12 +387,31 @@ _STATE_LABEL = {
     SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value: "needs classification",
 }
 
+# Ordered list of all possible blocker labels (determines display order).
+_BLOCKER_ORDER = [
+    "needs source",
+    "needs metadata",
+    "needs image",
+    "needs alt text",
+    "needs classification",
+    "submitted",
+]
+
+# Maps open request model classes to their blocker label.
+_REQUEST_BLOCKERS: list[tuple[type, str]] = [
+    (SourceRequest, "needs source"),
+    (MetadataRequest, "needs metadata"),
+    (ImageRequest, "needs image"),
+    (AttachmentAltTextRequest, "needs alt text"),
+    (ContentLabelRequest, "needs classification"),
+]
+
 
 @dataclass
 class PendingSubmission:
     submission_id: int
     board_name: str
-    state_label: str
+    blockers: list[str]
     canonical_url: str | None
     author_display: str
     submitted_rel: str
@@ -418,16 +451,39 @@ async def pending_submissions(session: AsyncSession) -> list[PendingSubmission]:
         .order_by(Submission.created_at.asc())
     )
 
+    raw_rows = rows.all()
+    if not raw_rows:
+        return []
+
+    sub_ids = [r.id for r in raw_rows]
+
+    # Collect every open (unanswered) request type per submission.
+    blocker_sets: dict[int, set[str]] = {sid: set() for sid in sub_ids}
+    for model_cls, label in _REQUEST_BLOCKERS:
+        open_sids = await session.scalars(
+            select(model_cls.submission_id)
+            .where(model_cls.submission_id.in_(sub_ids), model_cls.answered_at.is_(None))
+            .distinct()
+        )
+        for sid in open_sids:
+            blocker_sets[sid].add(label)
+
     result = []
-    for r in rows:
+    for r in raw_rows:
         thread_url = (
             f"https://discord.com/channels/{r.discord_guild_id}/{r.thread_id}"
             if r.thread_id else None
         )
+        raw_blockers = blocker_sets.get(r.id, set())
+        if raw_blockers:
+            blockers = [b for b in _BLOCKER_ORDER if b in raw_blockers]
+        else:
+            # No open request rows yet - fall back to the state field.
+            blockers = [_STATE_LABEL.get(r.state, r.state)]
         result.append(PendingSubmission(
             submission_id=r.id,
             board_name=r.board_name,
-            state_label=_STATE_LABEL.get(r.state, r.state),
+            blockers=blockers,
             canonical_url=r.canonical_url,
             author_display=r.author_display or "",
             submitted_rel=_relative(r.created_at),
