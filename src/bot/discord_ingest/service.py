@@ -1730,7 +1730,7 @@ async def _build_post_preview(
     return replies.PostPreview(
         kind=kind,
         title=primary.resolved_title if primary else None,
-        links=[(link.canonical_url, link.domain_family) for link in links],
+        links=[(link.canonical_url, link.domain_family, link.resolved_title) for link in links],
         images=[(a.filename, a.alt_text_body) for a in atts if a.is_image],
         videos=[(a.filename, a.alt_text_body) for a in atts if a.is_video],
         embed_title=primary.resolved_title if primary else None,

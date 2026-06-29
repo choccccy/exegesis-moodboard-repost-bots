@@ -152,7 +152,7 @@ def test_format_post_preview_returns_list():
     p = replies.PostPreview(
         kind="external",
         title="A Title",
-        links=[("https://example.com/post", "external")],
+        links=[("https://example.com/post", "external", "A Title")],
         images=[],
         embed_title="A Title",
         embed_description="A description",
@@ -173,7 +173,7 @@ def test_format_post_preview_overflow_spans_multiple_pages():
     p = replies.PostPreview(
         kind="images",
         title="A very long title " * 10,
-        links=[("https://example.com/post", "images")],
+        links=[("https://example.com/post", "images", None)],
         images=many_images,
         embed_title=None,
         embed_description=None,

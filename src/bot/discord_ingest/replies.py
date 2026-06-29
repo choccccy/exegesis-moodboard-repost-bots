@@ -213,13 +213,13 @@ _KIND_LABELS = {
 class PostPreview:
     """Projection of a submission onto the Bluesky post record it would become.
 
-    This is a verification preview, not the real publish (that's M2). ``links`` is
-    ordered (canonical_url, domain_family); ``images`` is uploaded (filename, alt).
+    ``links`` is ordered (canonical_url, domain_family, resolved_title);
+    ``images`` is uploaded (filename, alt).
     """
 
     kind: str  # external | images | video | record | empty
     title: str | None
-    links: list[tuple[str, str]]
+    links: list[tuple[str, str, str | None]]  # (canonical_url, domain_family, resolved_title)
     images: list[tuple[str, str | None]]
     embed_title: str | None
     embed_description: str | None
@@ -289,36 +289,48 @@ def _paginate(lines: list[str], *, header: str = "") -> list[str]:
 def format_post_preview(p: PostPreview) -> list[str]:
     """Return one or more Discord messages (≤ 1900 chars each) for the preview.
 
-    Split at line boundaries so no line is ever cut mid-way. Continuation
-    messages carry a small header so the thread stays readable.
+    When the submission will produce a Bluesky reply thread (multiple posts),
+    each post gets its own labeled block so the curator can see exactly what
+    will be posted. Single-post submissions get an unlabeled block.
     """
     human, atproto = _KIND_LABELS.get(p.kind, _KIND_LABELS["empty"])
-    primary = p.links[0][0] if p.links else None
+    primary_url = p.links[0][0] if p.links else None
+
+    # Calculate how many Bluesky posts this submission will produce.
+    if p.kind == "video":
+        extra_vids = max(len(p.videos) - 1, 0)
+        has_img_reply = len(p.images) > 0
+        extra_links = max(len(p.links) - 1, 0)
+        total = 1 + extra_vids + (1 if has_img_reply else 0) + extra_links
+    else:
+        total = max(len(p.links), 1)
+
+    def _thread_label(n: int) -> str:
+        return f"**thread {n}/{total}:**" if total > 1 else ""
 
     lines: list[str] = ["🔎 **prospective Bluesky post**", ""]
+
+    # --- Root post ---
+    label = _thread_label(1)
+    if label:
+        lines.append(label)
     lines.append(f"type:  {human} ({atproto})")
     if p.reply_to_bsky_url:
         lines.append(f"reply-to: {p.reply_to_bsky_url}")
     elif p.reply_to_pending:
         lines.append("reply-to: (parent queued - will wait to publish)")
 
-    # text: source title (when known) followed by the primary canonical URL.
     lines.append("text:")
     if p.title:
         lines.append(f"  {p.title}")
-    lines.append(f"  {primary}" if primary else "  (none)")
+    lines.append(f"  {primary_url}" if primary_url else "  (none)")
 
-    # embed block depends on the chosen mode.
     if p.kind == "video":
-        lines.append(f"embed.video ({len(p.videos)} video(s)):")
-        for i, (filename, alt) in enumerate(p.videos, start=1):
+        first_vid = p.videos[0] if p.videos else None
+        if first_vid:
+            filename, alt = first_vid
             alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
-            lines.append(f"  {i}. {filename} - alt: {alt_text}")
-        if p.images:
-            lines.append(f"reply.images ({len(p.images)}/4):")
-            for i, (filename, alt) in enumerate(p.images, start=1):
-                alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
-                lines.append(f"  {i}. {filename} - alt: {alt_text}")
+            lines.append(f"embed.video: {filename} - alt: {alt_text}")
     elif p.kind == "images":
         lines.append(f"embed.images ({len(p.images)}/4):")
         for i, (filename, alt) in enumerate(p.images, start=1):
@@ -326,30 +338,52 @@ def format_post_preview(p: PostPreview) -> list[str]:
             lines.append(f"  {i}. {filename} - alt: {alt_text}")
     elif p.kind == "external":
         lines.append("embed.external:")
-        lines.append(f"  uri:    {primary}")
+        lines.append(f"  uri:    {primary_url}")
         lines.append(f"  title:  {p.embed_title or '(unresolved)'}")
         lines.append(f"  desc:   {p.embed_description or '(none)'}")
         lines.append(f"  thumb:  {'✓ image present' if p.embed_has_thumb else '⚠ MISSING'}")
         lines.append(f"  via:    {p.resolved_via or 'none'}")
     elif p.kind == "record":
         lines.append("embed.record:")
-        lines.append(f"  uri:    {primary}  (native repost/quote of an existing post)")
+        lines.append(f"  uri:    {primary_url}  (native repost/quote of an existing post)")
 
     labels = ", ".join(p.labels) if p.labels else "none"
     lines.append(f"labels: {labels}  (board: {p.board_name}, {'NSFW' if p.nsfw else 'sfw'})")
     lines.append(f"graphic: {p.graphic_status}")
-
-    # thread structure depends on kind.
-    if p.kind == "video":
-        extra_vids = max(len(p.videos) - 1, 0)
-        has_img_reply = len(p.images) > 0
-        extra_links = max(len(p.links) - 1, 0)
-        parts_count = 1 + extra_vids + (1 if has_img_reply else 0) + extra_links
-        lines.append(f"thread: 1 root (video) + {parts_count - 1} repl{'y' if parts_count - 1 == 1 else 'ies'}" if parts_count > 1 else "thread: single video post")
-    else:
-        extra = max(len(p.links) - 1, 0)
-        lines.append("thread: " + (f"1 root + {extra} repl{'y' if extra == 1 else 'ies'}" if extra else "single post"))
-
     lines.append(f"image check: {'✓' if p.image_satisfied else '⚠'} {p.image_source}")
+
+    # --- Reply posts ---
+    reply_num = 2
+
+    if p.kind == "video":
+        # Extra video replies (videos[1:])
+        for filename, alt in p.videos[1:]:
+            lines.append("")
+            lines.append(_thread_label(reply_num))
+            lines.append("type:  video reply")
+            alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
+            lines.append(f"  {filename} - alt: {alt_text}")
+            reply_num += 1
+
+        # Image reply (if images exist alongside videos)
+        if p.images:
+            lines.append("")
+            lines.append(_thread_label(reply_num))
+            lines.append(f"type:  image reply ({len(p.images)}/4):")
+            for i, (filename, alt) in enumerate(p.images, start=1):
+                alt_text = f'"{alt}"' if alt else "⚠ (no alt text)"
+                lines.append(f"  {i}. {filename} - alt: {alt_text}")
+            reply_num += 1
+
+    # Extra link replies (apply to all kinds)
+    for url, _family, title in p.links[1:]:
+        lines.append("")
+        lines.append(_thread_label(reply_num))
+        lines.append("type:  link reply")
+        lines.append("text:")
+        if title:
+            lines.append(f"  {title}")
+        lines.append(f"  {url}")
+        reply_num += 1
 
     return _paginate(lines, header="-# 🔎 (cont.)")
