@@ -36,7 +36,7 @@ def test_metadata_confirm_emoji_is_link():
 def test_metadata_request_includes_url():
     msg = replies.metadata_request("https://example.com/foo")
     assert "https://example.com/foo" in msg
-    assert replies.METADATA_CONFIRM_EMOJI in msg
+    assert "as-is" in msg
 
 
 def test_metadata_confirmed_includes_emoji():
@@ -81,7 +81,7 @@ def test_source_request_is_string():
 
 def test_confirmation_request():
     msg = replies.confirmation_request()
-    assert replies.CONFIRMATION_EMOJI in msg
+    assert "queue" in msg.lower()
     assert len(msg) > 0
 
 

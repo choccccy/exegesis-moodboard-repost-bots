@@ -61,7 +61,7 @@ from ..state import (
     evaluate_state,
     missing_gaps,
 )
-from . import replies
+from . import replies, views
 from .urls import extract_urls
 
 log = logging.getLogger(__name__)
@@ -317,8 +317,10 @@ async def _post_thread_anchor(
     # For playlist-enabled boards, post the opt-out prompt and seed the reaction.
     if cfg and cfg.youtube_playlist_id:
         try:
-            opt_msg = await thread.send(replies.playlist_opt_out_prompt())
-            await opt_msg.add_reaction(replies.PLAYLIST_OPT_OUT_EMOJI)
+            opt_msg = await thread.send(
+                replies.playlist_opt_out_prompt(),
+                view=views.make_playlist_skip_view(submission.id),
+            )
             submission.playlist_opt_out_message_id = opt_msg.id
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post playlist opt-out for submission %s: %s", submission.id, exc)
@@ -923,6 +925,296 @@ async def handle_playlist_opt_out(
             _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
 
 
+async def handle_cancel_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+) -> None:
+    """Cancel button clicked: delete the submission if authorized."""
+    await interaction.response.defer()
+
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        await interaction.followup.send("Submission not found.", ephemeral=True)
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to cancel this submission.", ephemeral=True)
+        return
+
+    if submission.state == SubmissionState.PUBLISHED.value:
+        attempt = await session.scalar(
+            select(PublishAttempt)
+            .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
+            .order_by(PublishAttempt.attempted_at.desc())
+        )
+        bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
+        await interaction.followup.send(replies.cannot_remove_published(bsky_url), ephemeral=True)
+        return
+
+    sub_id = submission.id
+    thread_id = submission.thread_id
+    board = await session.get(Board, submission.board_id)
+    remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+    for model in (
+        SourceRequest,
+        AttachmentAltTextRequest,
+        ContentLabelRequest,
+        ImageRequest,
+        MetadataRequest,
+        SupplementalImageRequest,
+        SupplementalLinkRequest,
+        CancellationRequest,
+        ConfirmationRequest,
+        PublishAttempt,
+        SubmissionLink,
+        Attachment,
+    ):
+        await session.execute(delete(model).where(model.submission_id == sub_id))
+    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    log.info("deleted submission %s after button cancel by user %s", sub_id, user.id)
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Submission cancelled"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone cancel button for submission %s: %s", sub_id, exc)
+
+    channel = interaction.channel
+    if isinstance(channel, discord.Thread):
+        await channel.send(replies.reaction_removed())
+        await _archive_thread(channel, notice=replies.closing_notice("submission cancelled"))
+
+
+async def handle_confirm_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Queue for posting button clicked: queue the submission if authorized."""
+    await interaction.response.defer()
+
+    req = await session.scalar(
+        select(ConfirmationRequest).where(
+            ConfirmationRequest.submission_id == submission_id,
+            ConfirmationRequest.confirmed_at.is_(None),
+        )
+    )
+    if req is None:
+        await interaction.followup.send("Already queued.", ephemeral=True)
+        return
+
+    submission = await session.get(Submission, submission_id)
+    if submission is None or submission.state in _QUEUE_TERMINAL:
+        await interaction.followup.send("Nothing to queue.", ephemeral=True)
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to queue this submission.", ephemeral=True)
+        return
+
+    req.confirmed_at = _now()
+    req.confirmed_by = user.id
+    submission.state = SubmissionState.QUEUED.value
+    log.info("submission %s queued by %s via button", submission.id, user.id)
+
+    _snap, _atts, links = await _snapshot(session, submission)
+    videos_added = 0
+    if not submission.playlist_skipped:
+        videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg, yt_client)
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Queued ✅"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone confirm button for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    queue_url = (
+        f"https://dashboard.exegesis.space/boards/{board_cfg.name}" if board_cfg else None
+    )
+    await channel.send(replies.queued_notice(
+        bluesky_handle=board_cfg.bluesky_handle if board_cfg else None,
+        dashboard_url=queue_url,
+        youtube_playlist_id=board_cfg.youtube_playlist_id if board_cfg else None,
+        videos_added=videos_added,
+    ))
+    if isinstance(channel, discord.Thread):
+        if await _playlist_close_ready(
+            session, submission.board_id,
+            submission.source_discord_message_id, board_cfg,
+            playlist_skipped=submission.playlist_skipped,
+        ):
+            _archive_thread_after_delay(channel, notice=replies.closing_notice("queued"))
+
+
+async def handle_metadata_confirm_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Use link as-is button clicked: confirm current link metadata."""
+    await interaction.response.defer()
+
+    req = await session.scalar(
+        select(MetadataRequest).where(
+            MetadataRequest.submission_id == submission_id,
+            MetadataRequest.answered_at.is_(None),
+        )
+    )
+    if req is None:
+        await interaction.followup.send("Already confirmed.", ephemeral=True)
+        return
+
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to confirm this.", ephemeral=True)
+        return
+
+    req.answer = "confirmed"
+    req.answered_by = user.id
+    req.answered_at = _now()
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Link confirmed 🔗"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone metadata confirm button for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    await channel.send(replies.metadata_confirmed())
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_graphic_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Mark as graphic content button clicked."""
+    await interaction.response.defer()
+
+    req = await session.scalar(
+        select(ContentLabelRequest).where(
+            ContentLabelRequest.submission_id == submission_id,
+            ContentLabelRequest.answered_at.is_(None),
+        )
+    )
+    if req is None:
+        await interaction.followup.send("Already classified.", ephemeral=True)
+        return
+
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to classify this.", ephemeral=True)
+        return
+
+    submission.graphic_status = GraphicStatus.GRAPHIC.value
+    req.answer = GRAPHIC_YES_EMOJI
+    req.answered_by = user.id
+    req.answered_at = _now()
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Marked as graphic 🩸"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone graphic button for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_playlist_skip_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Skip playlist button clicked: opt out and remove if already added."""
+    await interaction.response.defer()
+
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        await interaction.followup.send("Submission not found.", ephemeral=True)
+        return
+
+    if submission.playlist_skipped:
+        await interaction.followup.send("Already opted out.", ephemeral=True)
+        return
+
+    board = await session.get(Board, submission.board_id)
+    board_cfg = settings.board_for_channel(board.discord_channel_id) if board else None
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    is_op = user.id == submission.author_id
+    if not (is_op or _is_curator(member, user.id, board_cfg)):
+        await interaction.followup.send("You're not authorised to skip the playlist.", ephemeral=True)
+        return
+
+    submission.playlist_skipped = True
+    log.info("submission %s playlist opted out via button by user %s", submission.id, user.id)
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Playlist skipped ⏹️"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone playlist skip button for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+
+    playlist_rows = list(await session.scalars(
+        select(YoutubePlaylistAdd).where(
+            YoutubePlaylistAdd.board_id == submission.board_id,
+            YoutubePlaylistAdd.source_discord_message_id == submission.source_discord_message_id,
+            YoutubePlaylistAdd.success.is_(True),
+        )
+    ))
+    for row in playlist_rows:
+        await _do_playlist_remove(row, channel, session, yt_client)
+
+    if submission.state == SubmissionState.QUEUED.value and submission.thread_id:
+        resolved_thread = await _resolve_thread_by_id(channel, submission.thread_id)
+        if resolved_thread is not None and not resolved_thread.archived:
+            queued_at = submission.updated_at
+            if queued_at is not None and queued_at.tzinfo is None:
+                queued_at = queued_at.replace(tzinfo=timezone.utc)
+            elapsed = (
+                (datetime.now(timezone.utc) - queued_at).total_seconds()
+                if queued_at else _THREAD_CLOSE_DELAY
+            )
+            remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
+            _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
+
+
 async def _resolve_thread_by_id(
     channel: discord.abc.Messageable, thread_id: int
 ) -> discord.Thread | None:
@@ -1442,8 +1734,10 @@ async def recompute_and_request(
     ) is not None
     if not has_cancel:
         try:
-            msg = await destination.send(replies.cancel_request())
-            await msg.add_reaction(replies.CANCEL_EMOJI)
+            msg = await destination.send(
+                replies.cancel_request(),
+                view=views.make_cancel_view(submission.id),
+            )
             session.add(CancellationRequest(
                 submission_id=submission.id,
                 bot_message_id=msg.id,
@@ -1493,11 +1787,10 @@ async def recompute_and_request(
     ):
         primary = _primary_link(links)
         url = primary.canonical_url if primary else "?"
-        msg = await destination.send(replies.metadata_request(url))
-        try:
-            await msg.add_reaction(replies.METADATA_CONFIRM_EMOJI)
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not add metadata confirm reaction: %s", exc)
+        msg = await destination.send(
+            replies.metadata_request(url),
+            view=views.make_metadata_confirm_view(submission.id),
+        )
         session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
 
     # IMAGE gap is suppressed while METADATA is open - a better link may provide an image.
@@ -1534,11 +1827,10 @@ async def recompute_and_request(
         select(ContentLabelRequest.id).where(ContentLabelRequest.submission_id == submission.id)
     ) is not None
     if snap.graphic_classification_required and not has_graphic_notice:
-        msg = await destination.send(replies.graphic_request())
-        try:
-            await msg.add_reaction(GRAPHIC_YES_EMOJI)
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not seed 🩸 reaction: %s", exc)
+        msg = await destination.send(
+            replies.graphic_request(),
+            view=views.make_graphic_view(submission.id),
+        )
         session.add(
             ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
         )
@@ -1555,14 +1847,13 @@ async def recompute_and_request(
             for page in replies.format_post_preview(preview):
                 await destination.send(page)
             board_cfg_conf = settings.board_for_channel(submission.channel_id)
-            msg = await destination.send(replies.confirmation_request(
-                bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
-                youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
-            ))
-            try:
-                await msg.add_reaction(replies.CONFIRMATION_EMOJI)
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not seed ✅ on confirmation: %s", exc)
+            msg = await destination.send(
+                replies.confirmation_request(
+                    bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                    youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+                ),
+                view=views.make_confirm_view(submission.id),
+            )
             session.add(ConfirmationRequest(
                 submission_id=submission.id,
                 bot_message_id=msg.id,

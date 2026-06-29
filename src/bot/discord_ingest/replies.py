@@ -33,7 +33,7 @@ def alt_text_request(filename: str) -> str:
 
 
 def graphic_request() -> str:
-    return "**react 🩸** if this post contains graphic or gore content"
+    return "does this post contain graphic or gore content?"
 
 
 def confirmation_request(
@@ -45,13 +45,13 @@ def confirmation_request(
     else:
         dest = "Bluesky"
     playlist_part = " (and add to the YouTube playlist)" if youtube_playlist_id else ""
-    return f"**react {CONFIRMATION_EMOJI}** to queue this for posting to {dest}{playlist_part}"
+    return f"queue this for posting to {dest}{playlist_part}?"
 
 
 def metadata_request(url: str) -> str:
     return (
         f"couldn't get metadata from **{url}** - **reply with a better link**, "
-        f"or **react {METADATA_CONFIRM_EMOJI}** to use it as-is (at least one image will be required)"
+        f"or press **Use link as-is** below (at least one image will be required)"
     )
 
 
@@ -188,7 +188,7 @@ def supplemental_link_not_found() -> str:
 
 
 def cancel_request() -> str:
-    return f"**react {CANCEL_EMOJI}** here to cancel, or **react {CANCEL_EMOJI}** on the original post"
+    return f"or react {CANCEL_EMOJI} on the original post to cancel"
 
 
 def source_cancel_confirmation(user_id: int) -> str:
@@ -196,7 +196,7 @@ def source_cancel_confirmation(user_id: int) -> str:
 
 
 def playlist_opt_out_prompt() -> str:
-    return f"this will be added to the YouTube playlist - **react {PLAYLIST_OPT_OUT_EMOJI}** to skip it"
+    return "this will be added to the YouTube playlist - press **Skip playlist** below to opt out"
 
 
 # Human labels + atproto $type per embed mode.

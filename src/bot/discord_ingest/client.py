@@ -85,6 +85,39 @@ class RepostBot(discord.Client):
             retry_task = asyncio.create_task(self._run_threadless_retry_loop())
             retry_task.add_done_callback(_log_task_exception)
 
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """Route button clicks to service handlers by custom_id prefix."""
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id: str = (interaction.data or {}).get("custom_id", "")
+        async with session_scope() as session:
+            if custom_id.startswith("cancel:"):
+                await service.handle_cancel_button(
+                    session, interaction, int(custom_id.removeprefix("cancel:")), self.settings
+                )
+            elif custom_id.startswith("confirm:"):
+                await service.handle_confirm_button(
+                    session, interaction, int(custom_id.removeprefix("confirm:")),
+                    self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("meta_ok:"):
+                await service.handle_metadata_confirm_button(
+                    session, interaction, int(custom_id.removeprefix("meta_ok:")),
+                    self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("graphic:"):
+                await service.handle_graphic_button(
+                    session, interaction, int(custom_id.removeprefix("graphic:")),
+                    self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("pl_skip:"):
+                await service.handle_playlist_skip_button(
+                    session, interaction, int(custom_id.removeprefix("pl_skip:")),
+                    self.settings, self._yt_client,
+                )
+            else:
+                await interaction.response.defer()
+
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == getattr(self.user, "id", None):
             return  # ignore the bot's own reactions (incl. pre-seeded votes)
