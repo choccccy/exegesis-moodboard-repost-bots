@@ -85,14 +85,14 @@ async def test_fresh_transition_posts_confirmation_prompt(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    # State stops at READY_TO_QUEUE — waiting for ✅ reaction.
+    # State stops at READY_TO_QUEUE - waiting for ✅ reaction.
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
     assert replies.confirmation_request() in dest.sent
     assert not any("queued" in m.lower() for m in dest.sent)
 
 
 # ---------------------------------------------------------------------------
-# Stuck READY_TO_QUEUE — confirmation prompt posted if not already there
+# Stuck READY_TO_QUEUE - confirmation prompt posted if not already there
 # ---------------------------------------------------------------------------
 
 async def test_stuck_ready_to_queue_posts_confirmation_once(session, board):
@@ -315,7 +315,7 @@ async def test_queued_not_downgraded_even_without_link(session, board):
     sub = make_submission(board, state=SubmissionState.QUEUED.value)
     session.add(sub)
     await session.flush()
-    # Intentionally NOT adding a link — evaluate_state sees a SOURCE gap.
+    # Intentionally NOT adding a link - evaluate_state sees a SOURCE gap.
 
     await _recompute(session, sub, board)
 

@@ -179,7 +179,7 @@ def _post_text_and_facets(title: str | None, url: str) -> tuple[str, list]:
     return text, facets
 
 
-_BSKY_MAX_BLOB = 975_000  # bytes; Bluesky hard limit is 1,000,000 — stay comfortably under
+_BSKY_MAX_BLOB = 975_000  # bytes; Bluesky hard limit is 1,000,000 - stay comfortably under
 
 
 def _compress_for_bsky(data: bytes) -> bytes:
@@ -428,7 +428,7 @@ async def _publish_images(
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 
 
-_BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB — headroom under Bluesky's 100 MB limit
+_BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB - headroom under Bluesky's 100 MB limit
 
 
 async def _upload_video_blob(client: AsyncClient, att: Attachment) -> object | None:

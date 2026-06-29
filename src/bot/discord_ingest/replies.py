@@ -21,11 +21,11 @@ def image_request() -> str:
 
 
 def image_not_found() -> str:
-    return "no image attached — **reply again** attaching at least one image"
+    return "no image attached - **reply again** attaching at least one image"
 
 
 def media_not_found() -> str:
-    return "no image or video attached — **reply again** attaching at least one"
+    return "no image or video attached - **reply again** attaching at least one"
 
 
 def alt_text_request(filename: str) -> str:
@@ -50,7 +50,7 @@ def confirmation_request(
 
 def metadata_request(url: str) -> str:
     return (
-        f"couldn't get metadata from **{url}** — **reply with a better link**, "
+        f"couldn't get metadata from **{url}** - **reply with a better link**, "
         f"or **react {METADATA_CONFIRM_EMOJI}** to use it as-is (at least one image will be required)"
     )
 
@@ -64,11 +64,11 @@ def metadata_link_updated(new_url: str) -> str:
 
 
 def metadata_url_not_found() -> str:
-    return f"no URL found — **reply again** with a link, or **react {METADATA_CONFIRM_EMOJI}** to use the existing one as-is"
+    return f"no URL found - **reply again** with a link, or **react {METADATA_CONFIRM_EMOJI}** to use the existing one as-is"
 
 
 def source_not_found() -> str:
-    return "no URL found in that reply — **reply again** with the source URL"
+    return "no URL found in that reply - **reply again** with the source URL"
 
 
 def reaction_removed() -> str:
@@ -111,7 +111,7 @@ def queued_notice(
 
 
 def updated_notice() -> str:
-    return "post updated — the new content will be included when published"
+    return "post updated - the new content will be included when published"
 
 
 def publish_failed_notice(error: str | None) -> str:
@@ -184,7 +184,7 @@ def supplemental_link_request() -> str:
 
 
 def supplemental_link_not_found() -> str:
-    return "no URLs found — **reply again** with the link(s) to add"
+    return "no URLs found - **reply again** with the link(s) to add"
 
 
 def cancel_request() -> str:
@@ -196,7 +196,7 @@ def source_cancel_confirmation(user_id: int) -> str:
 
 
 def playlist_opt_out_prompt() -> str:
-    return f"this will be added to the YouTube playlist — **react {PLAYLIST_OPT_OUT_EMOJI}** to skip it"
+    return f"this will be added to the YouTube playlist - **react {PLAYLIST_OPT_OUT_EMOJI}** to skip it"
 
 
 # Human labels + atproto $type per embed mode.

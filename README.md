@@ -21,12 +21,12 @@
 A source-first Discord → Bluesky moodboard bot. Curators react 🦋 on Discord posts; the bot gathers the necessary metadata via a per-submission thread, then schedules posts to Bluesky at a configurable daily cadence.
 
 **Live examples:**
-- [robots.exegesis.space](https://bsky.app/profile/robots.exegesis.space) — robot bodies and mechanical forms
-- [vehicles.exegesis.space](https://bsky.app/profile/vehicles.exegesis.space) — strange vehicles and transportation
-- [doohickeys.exegesis.space](https://bsky.app/profile/doohickeys.exegesis.space) — gadgets and doohickeys
-- [memes.exegesis.space](https://bsky.app/profile/memes.exegesis.space) — on-topic memes
-- [tv.exegesis.space](https://bsky.app/profile/tv.exegesis.space) — nerd TV
-- [xxx-robots.exegesis.space](https://bsky.app/profile/xxx-robots.exegesis.space) — \[evil\] NSFW robots
+- [robots.exegesis.space](https://bsky.app/profile/robots.exegesis.space) - robot bodies and mechanical forms
+- [vehicles.exegesis.space](https://bsky.app/profile/vehicles.exegesis.space) - strange vehicles and transportation
+- [doohickeys.exegesis.space](https://bsky.app/profile/doohickeys.exegesis.space) - gadgets and doohickeys
+- [memes.exegesis.space](https://bsky.app/profile/memes.exegesis.space) - on-topic memes
+- [tv.exegesis.space](https://bsky.app/profile/tv.exegesis.space) - nerd TV
+- [xxx-robots.exegesis.space](https://bsky.app/profile/xxx-robots.exegesis.space) - \[evil\] NSFW robots
 
 ---
 
@@ -34,14 +34,14 @@ A source-first Discord → Bluesky moodboard bot. Curators react 🦋 on Discord
 
 1. A curator reacts 🦋 on a Discord post. The bot ingests the message and opens a private thread.
 2. The bot parses the message: extracts and canonicalizes URLs, downloads any attached images or videos.
-3. If any required data is missing, the bot asks for it in the thread — source URL, replacement images, alt text, graphic content flag — one prompt at a time. Curators and the original poster can both answer.
+3. If any required data is missing, the bot asks for it in the thread - source URL, replacement images, alt text, graphic content flag - one prompt at a time. Curators and the original poster can both answer.
 4. Once all required data is present, the bot posts a preview of the prospective Bluesky post and waits for a ✅ confirmation reaction before queuing.
 5. The scheduler posts from the queue once per hour, starting at `QUEUE_START_HOUR`. Each board has a separate daily cap for fresh content (posted within `QUEUE_FRESH_WINDOW_HOURS`) and backlog content.
 6. The post format is chosen automatically based on what's available:
-   - **Native repost** — for `bsky.app` links
-   - **Video embed** — for uploaded video files (transcoded to H.264/AAC via ffmpeg)
-   - **Image embed** — for uploaded images (up to 4)
-   - **External link card** — for everything else
+   - **Native repost** - for `bsky.app` links
+   - **Video embed** - for uploaded video files (transcoded to H.264/AAC via ffmpeg)
+   - **Image embed** - for uploaded images (up to 4)
+   - **External link card** - for everything else
 7. The published Bluesky URL is posted back to the thread, which then archives automatically.
 8. Removing 🦋 before publishing cancels the submission. After publishing, the post stays.
 
@@ -70,7 +70,7 @@ A source-first Discord → Bluesky moodboard bot. Curators react 🦋 on Discord
    - Send Messages, Create Private Threads, Manage Threads
    - Add Reactions
 4. Use the generated URL to invite the bot to your server
-5. Copy the bot token from the Bot tab — this is your `DISCORD_BOT_TOKEN`
+5. Copy the bot token from the Bot tab - this is your `DISCORD_BOT_TOKEN`
 
 ### 2. Set up Bluesky accounts and app passwords
 
@@ -147,8 +147,8 @@ See [Configuration reference](#configuration-reference) below for documentation 
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DISCORD_BOT_TOKEN` | yes | — | Discord bot token |
-| `BSKY_APP_PASSWORD_*` | yes | — | One per board; see setup §2 |
+| `DISCORD_BOT_TOKEN` | yes | - | Discord bot token |
+| `BSKY_APP_PASSWORD_*` | yes | - | One per board; see setup §2 |
 | `BOARDS_JSON` | yes | `[]` | Board config array; see setup §3 |
 | `TRIGGER_EMOJI` | no | `🦋` | Reaction emoji that triggers ingestion |
 | `DATA_DIR` | no | `/data` | Root directory for the database, attachments, and logs |
@@ -163,11 +163,11 @@ See [Configuration reference](#configuration-reference) below for documentation 
 | `CATCHUP_ENABLED` | no | `true` | Scan channel history for missed reactions on bot startup |
 | `CATCHUP_LOOKBACK_HOURS` | no | `168` | How far back to scan on startup (hours) |
 | `CATCHUP_MAX_MESSAGES` | no | `500` | Max messages to scan per channel on startup |
-| `DASHBOARD_URL` | no | — | When set, queued-notice messages in Discord include a link to this URL |
-| `YOUTUBE_API_KEY` | no | — | YouTube Data API v3 key (read-only: video titles and thumbnails) |
-| `YOUTUBE_CLIENT_ID` | no | — | OAuth2 client ID for playlist writes |
-| `YOUTUBE_CLIENT_SECRET` | no | — | OAuth2 client secret |
-| `YOUTUBE_REFRESH_TOKEN` | no | — | OAuth2 refresh token |
+| `DASHBOARD_URL` | no | - | When set, queued-notice messages in Discord include a link to this URL |
+| `YOUTUBE_API_KEY` | no | - | YouTube Data API v3 key (read-only: video titles and thumbnails) |
+| `YOUTUBE_CLIENT_ID` | no | - | OAuth2 client ID for playlist writes |
+| `YOUTUBE_CLIENT_SECRET` | no | - | OAuth2 client secret |
+| `YOUTUBE_REFRESH_TOKEN` | no | - | OAuth2 refresh token |
 
 ---
 
@@ -204,7 +204,7 @@ docker --context myserver compose up -d --build
 Secrets are resolved from 1Password at runtime and never written to disk. Copy `.env.example` to `op.env`, replace the plain values with `op://` URIs, then:
 
 ```bash
-# op.env is .gitignored — never commit it
+# op.env is .gitignored - never commit it
 op run --env-file op.env --no-masking -- docker --context myserver compose up -d --build bot
 ```
 
@@ -318,5 +318,5 @@ src/bot/
 
 migrations/                  # Alembic migration scripts
 tests/                       # pytest test suite
-data/                        # Runtime volume (db/, attachments/) — not committed
+data/                        # Runtime volume (db/, attachments/) - not committed
 ```

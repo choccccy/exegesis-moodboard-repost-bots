@@ -1,4 +1,4 @@
-# Secrets — never commit these
+# Secrets - never commit these
 .env
 op.env
 

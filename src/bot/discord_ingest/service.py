@@ -530,7 +530,7 @@ async def handle_confirmation_reaction(
     user_id: int,
     yt_client=None,
 ) -> bool:
-    """A curator or OP reacted ✅ on the confirmation prompt — queue the submission."""
+    """A curator or OP reacted ✅ on the confirmation prompt - queue the submission."""
     req = await session.scalar(
         select(ConfirmationRequest).where(
             ConfirmationRequest.bot_message_id == message_id,

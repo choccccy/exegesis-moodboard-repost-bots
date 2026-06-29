@@ -114,7 +114,7 @@ async def test_thread_creation_timeout_returns_false(session, board):
 
 async def test_existing_thread_skips_create_thread(session, board):
     """When a SubmissionThread mapping already exists, create_thread is never
-    called — so a thread-creation rate limit on a different submission does
+    called - so a thread-creation rate limit on a different submission does
     not affect this one at all.
     """
     msg = _message(channel_id=board.discord_channel_id)
