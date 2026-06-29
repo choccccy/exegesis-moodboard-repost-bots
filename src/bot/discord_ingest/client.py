@@ -227,7 +227,7 @@ class RepostBot(discord.Client):
             else:
                 # ❌ on a bot message inside a thread - submission cancel button
                 async with session_scope() as session:
-                    await service.handle_cancel_reaction(
+                    source_info = await service.handle_cancel_reaction(
                         session,
                         settings=self.settings,
                         channel=channel,
@@ -235,6 +235,11 @@ class RepostBot(discord.Client):
                         member=payload.member,
                         user_id=payload.user_id,
                     )
+                if source_info is not None:
+                    src_channel_id, src_message_id = source_info
+                    src_channel = await self._resolve_channel(src_channel_id)
+                    if src_channel is not None:
+                        await service._clear_trigger_reaction(src_channel, src_message_id, self.settings.trigger_emoji)
 
         if emoji == replies.PLAYLIST_OPT_OUT_EMOJI:
             channel = await self._resolve_channel(payload.channel_id)

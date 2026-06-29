@@ -121,6 +121,58 @@ async def _find_prior_post(
     return attempt.bsky_url or attempt.at_uri
 
 
+_DUPLICATE_TERMINAL_STATES = {SubmissionState.PUBLISHED.value, SubmissionState.PUBLISH_FAILED.value}
+
+
+async def _find_duplicate(
+    session: AsyncSession,
+    canonical_url: str,
+    exclude_submission_id: int,
+    guild_id: int,
+) -> tuple[str, str | None] | None:
+    """Check whether another submission with this canonical URL is already active or posted.
+
+    Returns ("published", bsky_url), ("queued", thread_url), ("pending", thread_url), or None.
+    Published takes priority; among active states, queued takes priority over pending.
+    """
+    attempt = await session.scalar(
+        select(PublishAttempt)
+        .join(Submission, PublishAttempt.submission_id == Submission.id)
+        .join(SubmissionLink, SubmissionLink.submission_id == Submission.id)
+        .where(
+            SubmissionLink.canonical_url == canonical_url,
+            PublishAttempt.success.is_(True),
+            Submission.id != exclude_submission_id,
+        )
+        .order_by(PublishAttempt.id.desc())
+        .limit(1)
+    )
+    if attempt is not None:
+        return "published", attempt.bsky_url or attempt.at_uri
+
+    active = await session.scalar(
+        select(Submission)
+        .join(SubmissionLink, SubmissionLink.submission_id == Submission.id)
+        .where(
+            SubmissionLink.canonical_url == canonical_url,
+            ~Submission.state.in_(_DUPLICATE_TERMINAL_STATES),
+            Submission.id != exclude_submission_id,
+        )
+        .order_by(Submission.state == SubmissionState.QUEUED.value)  # queued first
+        .limit(1)
+    )
+    if active is not None:
+        thread_url = (
+            f"https://discord.com/channels/{guild_id}/{active.thread_id}"
+            if active.thread_id and guild_id
+            else None
+        )
+        kind = "queued" if active.state == SubmissionState.QUEUED.value else "pending"
+        return kind, thread_url
+
+    return None
+
+
 # --- submission creation + content ingest -----------------------------------
 
 
@@ -182,14 +234,40 @@ async def handle_reaction(
         return False
 
     if created:
+        guild_id = message.guild.id if message.guild else 0
         links = list(await session.scalars(
             select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
         ))
         for link in links:
-            prior = await _find_prior_post(session, link.canonical_url, submission.id)
-            if prior:
-                await thread.send(replies.duplicate_warning(prior))
-                break
+            dup = await _find_duplicate(session, link.canonical_url, submission.id, guild_id)
+            if dup is not None:
+                kind, ref_url = dup
+                if kind == "published":
+                    notice = replies.duplicate_posted(ref_url)
+                elif kind == "queued":
+                    notice = replies.duplicate_queued(ref_url)
+                else:
+                    notice = replies.duplicate_pending(ref_url)
+                await thread.send(notice)
+                log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
+                # Clean up the new submission - the thread stays as a record of the notice.
+                sub_id = submission.id
+                board = await session.get(Board, submission.board_id)
+                remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+                for model in (
+                    SourceRequest, AttachmentAltTextRequest, ContentLabelRequest,
+                    ImageRequest, MetadataRequest, SupplementalImageRequest,
+                    SupplementalLinkRequest, CancellationRequest, ConfirmationRequest,
+                    PublishAttempt, SubmissionLink, Attachment,
+                ):
+                    await session.execute(delete(model).where(model.submission_id == sub_id))
+                await session.execute(delete(Submission).where(Submission.id == sub_id))
+                # Remove butterfly so future scans skip this post.
+                await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
+                _fire_and_forget(_archive_thread_after_delay_seconds(
+                    thread, _THREAD_CLOSE_DELAY, notice=replies.closing_notice("duplicate")
+                ))
+                return False
 
     await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id)
     return new_thread
@@ -350,6 +428,16 @@ async def _derive_thread_title(
             # Discord caps thread names at 100 chars.
             return title if len(title) <= 100 else title[:99] + "…"
     return replies.thread_name(submission.id)
+
+
+async def _clear_trigger_reaction(channel: discord.abc.Messageable, message_id: int, trigger_emoji: str) -> None:
+    try:
+        msg = await channel.fetch_message(message_id)  # type: ignore[union-attr]
+        await msg.clear_reaction(trigger_emoji)
+    except discord.Forbidden:
+        log.debug("no Manage Messages permission to clear trigger reaction from message %s", message_id)
+    except (discord.NotFound, discord.HTTPException) as exc:
+        log.debug("could not clear trigger reaction from message %s: %s", message_id, exc)
 
 
 async def _resolve_thread(
@@ -635,21 +723,25 @@ async def handle_cancel_reaction(
     message_id: int,
     member: discord.Member | None,
     user_id: int,
-) -> None:
-    """❌ was reacted on a cancel-request message: delete the submission if authorized."""
+) -> tuple[int, int] | None:
+    """❌ was reacted on a cancel-request message: delete the submission if authorized.
+
+    Returns (source_channel_id, source_message_id) so the caller can clear the
+    trigger reaction from the source post, or None if no cancellation occurred.
+    """
     req = await session.scalar(
         select(CancellationRequest).where(CancellationRequest.bot_message_id == message_id)
     )
     if req is None:
-        return
+        return None
 
     submission = await session.get(Submission, req.submission_id)
     if submission is None:
-        return
+        return None
 
     board_cfg = settings.board_for_channel(submission.channel_id)
     if not _reaction_authorized(member, user_id, submission, board_cfg):
-        return
+        return None
 
     if submission.state == SubmissionState.PUBLISHED.value:
         thread = await _resolve_thread_by_id(channel, submission.thread_id) if submission.thread_id else None
@@ -661,9 +753,11 @@ async def handle_cancel_reaction(
             )
             bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
             await thread.send(replies.cannot_remove_published(bsky_url))
-        return
+        return None
 
     sub_id = submission.id
+    source_channel_id = submission.channel_id
+    source_message_id = submission.source_discord_message_id
     thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
@@ -689,6 +783,8 @@ async def handle_cancel_reaction(
     if thread is not None:
         await thread.send(replies.reaction_removed())
         await _archive_thread(thread, notice=replies.closing_notice("submission cancelled"))
+
+    return source_channel_id, source_message_id
 
 
 async def handle_source_cancel_reaction(
@@ -752,6 +848,7 @@ async def handle_source_cancel_reaction(
             await session.execute(delete(Submission).where(Submission.id == sub_id))
             log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
             cancelled_submission = True
+            await _clear_trigger_reaction(channel, message_id, settings.trigger_emoji)
 
     # Cancel any playlist addition(s) for this source message.
     playlist_rows = list(await session.scalars(
@@ -957,6 +1054,8 @@ async def handle_cancel_button(
         return
 
     sub_id = submission.id
+    source_channel_id = submission.channel_id
+    source_message_id = submission.source_discord_message_id
     thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
@@ -987,6 +1086,15 @@ async def handle_cancel_button(
     if isinstance(channel, discord.Thread):
         await channel.send(replies.reaction_removed())
         await _archive_thread(channel, notice=replies.closing_notice("submission cancelled"))
+
+    source_channel = interaction.client.get_channel(source_channel_id)
+    if source_channel is None:
+        try:
+            source_channel = await interaction.client.fetch_channel(source_channel_id)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    if source_channel is not None:
+        await _clear_trigger_reaction(source_channel, source_message_id, settings.trigger_emoji)
 
 
 async def handle_confirm_button(

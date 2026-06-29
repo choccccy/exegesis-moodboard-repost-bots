@@ -128,6 +128,22 @@ def duplicate_warning(bsky_url: str) -> str:
     )
 
 
+def duplicate_posted(bsky_url: str) -> str:
+    return f"this has already been posted: {bsky_url}\nClosing this thread."
+
+
+def duplicate_queued(thread_url: str | None) -> str:
+    if thread_url:
+        return f"this is already queued for posting: {thread_url}\nClosing this thread."
+    return "this link is already queued for posting.\nClosing this thread."
+
+
+def duplicate_pending(thread_url: str | None) -> str:
+    if thread_url:
+        return f"this link is already being processed: {thread_url}\nClosing this thread."
+    return "this link is already being processed.\nClosing this thread."
+
+
 def thread_name(submission_id: int) -> str:
     # Discord caps thread names at 100 chars; this stays well under.
     return f"🦋 submission {submission_id}"
