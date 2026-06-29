@@ -187,11 +187,15 @@ async def test_resolve_twitter_fxtwitter_api_returns_image():
 @pytest.mark.asyncio
 async def test_resolve_twitter_falls_back_to_mirror_when_api_fails():
     client = AsyncMock()
-    # First call (fxtwitter API) → 404; second call (fxtwitter OG mirror) → HTML
-    client.get.side_effect = [_error_response(404), _html_response("Tweet text here")]
+    # fxtwitter API → 404; vxtwitter API → 404; fxtwitter OG mirror → HTML
+    client.get.side_effect = [
+        _error_response(404),
+        _error_response(404),
+        _html_response("Tweet text here"),
+    ]
     result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
     assert result.title == "Tweet text here"
-    mirror_url = client.get.call_args_list[1][0][0]
+    mirror_url = client.get.call_args_list[2][0][0]
     assert "fxtwitter.com" in mirror_url
 
 

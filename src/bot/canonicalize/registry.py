@@ -60,7 +60,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "reddit": ["reddit.com", "redd.it", "vxreddit.com", "rxddit.com"],
     "twitter": [
         "twitter.com", "x.com",
-        "fxtwitter.com", "fixupx.com", "vxtwitter.com",
+        "fxtwitter.com", "fixupx.com", "vxtwitter.com", "fixvx.com",
         "nitter.net", "girlcockx.com", "xcancel.com",
     ],
     "artstation": ["artstation.com", "artstn.co"],
