@@ -255,3 +255,17 @@ def test_tumblr_non_post_path_strips_query():
 
 def test_tumblr_family():
     assert fam("https://username.tumblr.com/post/123456789") == "tumblr"
+
+
+def test_tiktok_video_url_canonicalized():
+    assert c("https://www.tiktok.com/@izidorsustersic/video/7541890284209179927?_r=1") == (
+        "https://www.tiktok.com/@izidorsustersic/video/7541890284209179927"
+    )
+
+
+def test_tiktok_family():
+    assert fam("https://www.tiktok.com/@user/video/123456") == "tiktok"
+
+
+def test_tiktok_vm_short_link_family():
+    assert fam("https://vm.tiktok.com/ZMAbcDef/") == "tiktok"

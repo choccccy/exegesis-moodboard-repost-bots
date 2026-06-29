@@ -1,6 +1,6 @@
 [project]
 name = "bluesky-repost-bot"
-version = "1.3.3"
+version = "1.4.5"
 description = "Source-first Discord -> Bluesky moodboard repost bot"
 readme = "README.md"
 requires-python = ">=3.12"

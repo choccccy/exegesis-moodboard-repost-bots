@@ -71,6 +71,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "pixiv":   ["pixiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
     "tumblr":  ["tumblr.com"],
+    "tiktok":  ["tiktok.com", "vm.tiktok.com", "m.tiktok.com"],
 }
 
 
@@ -167,6 +168,21 @@ def _canon_tumblr(scheme, host, path, query) -> tuple[str, str]:
     return urlunsplit(("https", host, canonical_path, "", "")), "tumblr"
 
 
+def _canon_tiktok(scheme, host, path, query) -> tuple[str, str]:
+    # Normalize to www.tiktok.com; keep only /@user/video/ID path, strip tracking.
+    segments = [s for s in path.split("/") if s]
+    if (
+        len(segments) >= 3
+        and segments[0].startswith("@")
+        and segments[1] == "video"
+        and segments[2].isdigit()
+    ):
+        clean_path = f"/{segments[0]}/video/{segments[2]}"
+        return urlunsplit(("https", "www.tiktok.com", clean_path, "", "")), "tiktok"
+    # vm.tiktok.com / unknown path forms: keep as-is, strip query.
+    return urlunsplit(("https", host, path, "", "")), "tiktok"
+
+
 _HANDLERS = {
     "bluesky": _canon_bluesky,
     "reddit": _canon_reddit,
@@ -179,6 +195,7 @@ _HANDLERS = {
     "pixiv": _canon_pixiv,
     "flickr": _canon_flickr,
     "tumblr": _canon_tumblr,
+    "tiktok": _canon_tiktok,
 }
 
 

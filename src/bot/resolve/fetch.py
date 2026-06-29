@@ -162,6 +162,23 @@ async def _deviantart_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMet
     )
 
 
+async def _instagram_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    endpoint = f"https://www.instagram.com/api/v1/oembed/?url={quote(url, safe='')}&format=json"
+    resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return ResolvedMetadata(
+        title=data.get("title") or None,
+        description=data.get("author_name"),
+        image_url=data.get("thumbnail_url"),
+        via="oembed",
+    )
+
+
 async def _tumblr_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
     endpoint = f"https://www.tumblr.com/oembed/1.0?url={quote(url, safe='')}"
     resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
@@ -224,13 +241,48 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
     if resp.status_code != 200:
         log.info("vxtwitter api returned %d for %s", resp.status_code, url)
         return None
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        log.info("vxtwitter api returned non-JSON for %s", url)
+        return None
     media_urls = data.get("mediaURLs") or []
     return ResolvedMetadata(
         title=data.get("text"),
         description=data.get("user_name"),
         image_url=media_urls[0] if media_urls else None,
         via="vxtwitter_api",
+    )
+
+
+async def _tiktok_tikwm(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Fetch TikTok cover thumbnail via tikwm.com.
+
+    TikTok serves JS-only pages to bots and its own oEmbed gives only the author
+    name with no caption. tikwm.com returns a stable cover image URL. We return
+    title=None intentionally so that resolve() falls back to the Discord-captured
+    embed_title (which Discord may have fetched via its own TikTok integration).
+    """
+    endpoint = f"https://tikwm.com/api/?url={quote(url, safe='')}"
+    try:
+        resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json().get("data") or {}
+    except ValueError:
+        return None
+    cover = data.get("cover") or data.get("origin_cover")
+    author = (data.get("author") or {}).get("nickname")
+    if not cover and not author:
+        return None
+    return ResolvedMetadata(
+        title=None,
+        description=author,
+        image_url=cover or None,
+        via="tikwm",
     )
 
 
@@ -270,6 +322,8 @@ _OEMBED_HANDLERS = {
     "deviantart": _deviantart_oembed,
     "tumblr": _tumblr_oembed,
     "twitter": _twitter_fxtwitter_api,
+    "instagram": _instagram_oembed,
+    "tiktok": _tiktok_tikwm,
 }
 
 _MIRROR_URL_FUNCS = {

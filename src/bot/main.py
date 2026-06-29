@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from .bot_status import init as init_bot_status
 from .config import get_settings
 from .db import dispose_engine, init_engine
 from .discord_ingest import RepostBot
@@ -19,6 +20,7 @@ async def amain() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.logs_dir)
     init_engine(settings.database_url)
+    init_bot_status(settings.data_dir)
 
     if not settings.boards:
         log.warning("no boards configured (BOARDS_JSON is empty) - nothing will be watched")

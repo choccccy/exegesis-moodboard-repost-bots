@@ -1,5 +1,5 @@
 <title>{{ board_name }} queue - exegesis moodboards</title>
-<meta http-equiv="refresh" content="120">
+<meta http-equiv="refresh" content="15">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -16,7 +16,7 @@
 
   header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 16px;
     margin-bottom: 28px;
     border-bottom: 1px solid #222;
@@ -25,6 +25,44 @@
   }
   header h1 { font-size: 18px; font-weight: 600; color: #fff; }
   .header-meta { font-size: 12px; color: #555; }
+  .header-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .stat-pill {
+    font-size: 12px;
+    color: #666;
+    white-space: nowrap;
+  }
+  .stat-pill strong { color: #aaa; font-weight: 500; }
+  .rate-limit-pill {
+    font-size: 12px;
+    font-weight: 600;
+    color: #fca5a5;
+    background: #2a0808;
+    border: 1px solid #450a0a;
+    border-radius: 6px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .rate-limit-pill.stale {
+    color: #f97316;
+    background: #1c0f00;
+    border-color: #431407;
+  }
+  .scan-pill {
+    font-size: 12px;
+    font-weight: 500;
+    color: #93c5fd;
+    background: #0f172a;
+    border: 1px solid #1e3a5f;
+    border-radius: 6px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
 
   h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
        letter-spacing: 0.06em; color: #777; margin-bottom: 12px; }
@@ -82,7 +120,29 @@
     🦋 {{ board_name }}
     {% if handle %}<span style="font-size:13px; font-weight:400; color:#555">@{{ handle }}</span>{% endif %}
   </h1>
-  <span class="header-meta">queue · {{ items | length }} item{% if items | length != 1 %}s{% endif %} · auto-refreshes every 2 min · {{ loaded_at }}</span>
+  <span class="header-meta">{{ items | length }} item{% if items | length != 1 %}s{% endif %} · {{ loaded_at }}</span>
+  <div class="header-right">
+    {% for scan in stats.active_scans %}
+      <span class="scan-pill" title="scanning since {{ scan.started_rel }}">
+        ⟳ {% if scan.scan_type == "catchup" %}catchup{% else %}scan{% endif %}: #{{ scan.channel_name }}
+      </span>
+    {% endfor %}
+    {% if stats.rate_limited_until %}
+      <span class="rate-limit-pill" title="Route: {{ stats.rate_limited_route }}">
+        ⚠ rate limited until {{ stats.rate_limited_until.strftime("%H:%M:%S") }} UTC
+      </span>
+    {% elif stats.rate_limited_recently %}
+      <span class="rate-limit-pill stale" title="Route: {{ stats.rate_limited_route }}">
+        ⚠ was rate limited recently
+      </span>
+    {% endif %}
+    <span class="stat-pill">queued <strong>{{ stats.total_queued }}</strong></span>
+    <span class="stat-pill">pending <strong>{{ stats.total_pending }}</strong></span>
+    <span class="stat-pill">today <strong>{{ stats.total_today }}</strong></span>
+    {% if stats.bot_started_at %}
+      <span class="stat-pill">up {{ stats.bot_started_rel }}</span>
+    {% endif %}
+  </div>
 </header>
 
 <section>
@@ -141,6 +201,8 @@
           <td>
             {% if item.state == "failed" %}
               <span class="badge badge-red">failed</span>
+            {% elif item.state == "needs confirmation" %}
+              <span class="badge badge-green">needs confirmation</span>
             {% else %}
               <span class="badge badge-yellow">queued</span>
             {% endif %}

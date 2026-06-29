@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     bsky_app_password_robot_fucking: str | None = Field(None, alias="BSKY_APP_PASSWORD_ROBOT_FUCKING")
     bsky_app_password_weird_wheels: str | None = Field(None, alias="BSKY_APP_PASSWORD_WEIRD_WHEELS")
     bsky_app_password_doohickey_posting: str | None = Field(None, alias="BSKY_APP_PASSWORD_DOOHICKEY_POSTING")
-    bsky_app_password_on_topic_memes: str | None = Field(None, alias="BSKY_APP_PASSWORD_MEMES")
+    bsky_app_password_on_topic_memes: str | None = Field(None, alias="BSKY_APP_PASSWORD_ON_TOPIC_MEMES")
     bsky_app_password_nerd_tv: str | None = Field(None, alias="BSKY_APP_PASSWORD_NERD_TV")
 
     # Optional YouTube Data API v3 key (no OAuth - read-only metadata only).

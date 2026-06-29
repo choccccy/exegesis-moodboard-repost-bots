@@ -200,6 +200,35 @@ async def test_resolve_twitter_falls_back_to_mirror_when_api_fails():
 
 
 @pytest.mark.asyncio
+async def test_resolve_twitter_vxtwitter_empty_body_falls_to_mirror():
+    """vxtwitter returns 200 with an empty/non-JSON body - should fall through to mirror."""
+    empty = MagicMock()
+    empty.status_code = 200
+    empty.json.side_effect = ValueError("Expecting value: line 1 column 1 (char 0)")
+    client = AsyncMock()
+    client.get.side_effect = [
+        _error_response(404),       # fxtwitter API
+        empty,                      # vxtwitter API - 200 but bad JSON
+        _html_response("Tweet text here"),  # fxtwitter OG mirror
+    ]
+    result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
+    assert result.title == "Tweet text here"
+    assert client.get.call_count == 3  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_resolve_instagram_uses_oembed():
+    client = AsyncMock()
+    client.get.return_value = _oembed_response("More hands patting Cria", "https://cdn.instagram.com/thumb.jpg")
+    result = await resolve("https://www.instagram.com/reel/DM2dwYTy_6s/", "instagram", client=client)
+    assert result.title == "More hands patting Cria"
+    assert result.via == "oembed"
+    call_url = client.get.call_args[0][0]
+    assert "instagram.com/api/v1/oembed" in call_url
+
+
+
+@pytest.mark.asyncio
 async def test_resolve_reddit_uses_vxreddit_mirror():
     client = AsyncMock()
     client.get.return_value = _html_response("A Reddit post")
@@ -212,12 +241,13 @@ async def test_resolve_reddit_uses_vxreddit_mirror():
 
 
 @pytest.mark.asyncio
-async def test_resolve_instagram_uses_kkinstagram_mirror():
+async def test_resolve_instagram_oembed_404_falls_to_mirror_existing():
+    # Renamed from test_resolve_instagram_uses_kkinstagram_mirror - oEmbed is tried first now.
     client = AsyncMock()
-    client.get.return_value = _html_response("An insta post")
+    client.get.side_effect = [_error_response(404), _html_response("An insta post")]
     result = await resolve("https://www.instagram.com/p/ABC123/", "instagram", client=client)
     assert result.title == "An insta post"
-    call_url = client.get.call_args[0][0]
+    call_url = client.get.call_args_list[1][0][0]
     assert "kkinstagram.com" in call_url
 
 
@@ -288,4 +318,41 @@ async def test_resolve_tumblr_oembed_404_falls_to_opengraph():
         "https://username.tumblr.com/post/123456789", "tumblr", client=client
     )
     assert result.title == "Tumblr OG Title"
+    assert client.get.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_resolve_tiktok_uses_tikwm_for_thumbnail():
+    client = AsyncMock()
+    tikwm_resp = MagicMock()
+    tikwm_resp.status_code = 200
+    tikwm_resp.json = MagicMock(return_value={
+        "code": 0,
+        "data": {
+            "cover": "https://cdn.tiktok.com/cover.jpg",
+            "author": {"nickname": "Izidor Sustersic"},
+        },
+    })
+    client.get.return_value = tikwm_resp
+    result = await resolve(
+        "https://www.tiktok.com/@izidorsustersic/video/7541890284209179927",
+        "tiktok",
+        client=client,
+        fallback_title="Mountain bike reel caption",
+    )
+    assert result.title == "Mountain bike reel caption"
+    assert result.image_url == "https://cdn.tiktok.com/cover.jpg"
+    assert result.description == "Izidor Sustersic"
+    assert result.via == "tikwm"
+    call_url = client.get.call_args[0][0]
+    assert "tikwm.com/api" in call_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_tiktok_tikwm_failure_falls_to_direct_fetch():
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(500), _html_response("TikTok - Make Your Day")]
+    result = await resolve(
+        "https://www.tiktok.com/@someone/video/123", "tiktok", client=client
+    )
     assert client.get.call_count == 2  # noqa: PLR2004

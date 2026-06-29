@@ -1531,14 +1531,18 @@ def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File
     from PIL import Image
 
     with Image.open(local_path) as img:
+        # Capture format before resize - img.resize() returns a new object with format=None.
+        fmt = img.format or "JPEG"
+        if fmt not in ("JPEG", "PNG", "WEBP", "GIF"):
+            fmt = "JPEG"
+        # JPEG can't store alpha; flatten RGBA to RGB before encoding.
+        if fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
         w, h = img.size
         if max(w, h) > _ALT_PREVIEW_MAX_PX:
             scale = _ALT_PREVIEW_MAX_PX / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         buf = io.BytesIO()
-        fmt = img.format or "JPEG"
-        if fmt not in ("JPEG", "PNG", "WEBP", "GIF"):
-            fmt = "JPEG"
         img.save(buf, format=fmt)
         buf.seek(0)
         if buf.getbuffer().nbytes > _DISCORD_MAX_BYTES:
@@ -1809,8 +1813,14 @@ async def recompute_and_request(
             ):
                 continue
             if att.local_path and att.is_image:
-                file = _discord_file_for_attachment(att.local_path, att.filename)
-                msg = await destination.send(replies.alt_text_request(att.filename), file=file)
+                try:
+                    file = _discord_file_for_attachment(att.local_path, att.filename)
+                    msg = await destination.send(replies.alt_text_request(att.filename), file=file)
+                except Exception as exc:
+                    log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
+                    msg = await destination.send(
+                        replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
+                    )
             else:
                 msg = await destination.send(
                     replies.alt_text_request(att.filename) + f"\n{att.discord_url}"

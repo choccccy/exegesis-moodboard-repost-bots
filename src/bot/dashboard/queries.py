@@ -94,7 +94,11 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
     stats: list[BoardStat] = []
 
     for board in boards:
-        _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
+        _eligible = (
+            SubmissionState.QUEUED.value,
+            SubmissionState.PUBLISH_FAILED.value,
+            SubmissionState.READY_TO_QUEUE.value,
+        )
 
         queued_count = await session.scalar(
             select(func.count()).select_from(Submission).where(
@@ -279,7 +283,11 @@ async def board_queue(
         .scalar_subquery()
     )
 
-    _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
+    _eligible = (
+        SubmissionState.QUEUED.value,
+        SubmissionState.PUBLISH_FAILED.value,
+        SubmissionState.READY_TO_QUEUE.value,
+    )
 
     effective_date = func.coalesce(Submission.source_posted_at, Submission.created_at)
     rows = await session.execute(
@@ -352,7 +360,11 @@ async def board_queue(
             source_posted_at=r.source_posted_at,
             source_posted_rel=_relative(r.source_posted_at),
             queued_since_rel=_relative(r.created_at),
-            state="failed" if r.state == SubmissionState.PUBLISH_FAILED.value else "queued",
+            state=(
+                "failed" if r.state == SubmissionState.PUBLISH_FAILED.value
+                else "needs confirmation" if r.state == SubmissionState.READY_TO_QUEUE.value
+                else "queued"
+            ),
             error=r.error,
             thread_url=thread_url,
         ))
@@ -532,6 +544,104 @@ async def recent_playlist_adds(session: AsyncSession, limit: int = 30) -> list[P
             error_message=r.error_message,
         ))
     return result
+
+
+@dataclass
+class ScanInfo:
+    channel_id: int
+    channel_name: str
+    scan_type: str  # "catchup" | "manual"
+    started_rel: str
+
+
+@dataclass
+class GlobalStats:
+    total_queued: int
+    total_pending: int
+    total_today: int
+    rate_limited_until: datetime | None  # None = not currently rate limited
+    rate_limited_route: str | None
+    rate_limited_recently: bool          # True if rate limited within past 2 min (may have already cleared)
+    bot_started_at: datetime | None
+    bot_started_rel: str
+    active_scans: list[ScanInfo]
+
+
+async def global_stats(
+    session: AsyncSession, settings: DashboardSettings, data_dir: str
+) -> GlobalStats:
+    import time
+    from ..bot_status import read as read_bot_status
+
+    tz = ZoneInfo(settings.queue_timezone)
+    now_utc = datetime.now(timezone.utc)
+    mt_midnight = _mt_midnight(now_utc, tz)
+    now_ts = time.time()
+
+    _queue_states = (
+        SubmissionState.QUEUED.value,
+        SubmissionState.PUBLISH_FAILED.value,
+        SubmissionState.READY_TO_QUEUE.value,
+    )
+    total_queued = await session.scalar(
+        select(func.count()).select_from(Submission).where(Submission.state.in_(_queue_states))
+    ) or 0
+
+    total_pending = await session.scalar(
+        select(func.count()).select_from(Submission).where(Submission.state.in_(_PENDING_STATES))
+    ) or 0
+
+    today_rows = await session.scalars(select(Board))
+    boards = list(today_rows)
+    total_today = 0
+    for board in boards:
+        total_today += await count_posts_today(session, board.id, mt_midnight)
+
+    status = read_bot_status(data_dir)
+    rl = status.get("rate_limit") or {}
+    rate_limited_until: datetime | None = None
+    rate_limited_route: str | None = None
+    rate_limited_recently = False
+    if rl:
+        if rl.get("until", 0) > now_ts:
+            rate_limited_until = datetime.fromtimestamp(rl["until"], tz=timezone.utc)
+            rate_limited_route = rl.get("route")
+        # Show "recently rate limited" for up to 2 minutes after it cleared.
+        if rl.get("last_seen_at", 0) > now_ts - 120:
+            rate_limited_recently = True
+            if rate_limited_route is None:
+                rate_limited_route = rl.get("route")
+
+    bot_started_at: datetime | None = None
+    started_str = status.get("started_at")
+    if started_str:
+        try:
+            bot_started_at = datetime.fromisoformat(started_str)
+        except ValueError:
+            pass
+
+    active_scans: list[ScanInfo] = []
+    for s in status.get("active_scans") or []:
+        started_ts = s.get("started_at")
+        started_at_dt = datetime.fromtimestamp(started_ts, tz=timezone.utc) if started_ts else None
+        active_scans.append(ScanInfo(
+            channel_id=s.get("channel_id", 0),
+            channel_name=s.get("channel_name", "?"),
+            scan_type=s.get("type", "catchup"),
+            started_rel=_relative(started_at_dt),
+        ))
+
+    return GlobalStats(
+        total_queued=total_queued,
+        total_pending=total_pending,
+        total_today=total_today,
+        rate_limited_until=rate_limited_until,
+        rate_limited_route=rate_limited_route,
+        rate_limited_recently=rate_limited_recently,
+        bot_started_at=bot_started_at,
+        bot_started_rel=_relative(bot_started_at),
+        active_scans=active_scans,
+    )
 
 
 async def recent_errors(session: AsyncSession, limit: int = 20) -> list[RecentError]:

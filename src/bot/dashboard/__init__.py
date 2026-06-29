@@ -39,6 +39,7 @@ async def index(request: Request):
         pending = await q.pending_submissions(session)
         playlist_adds = await q.recent_playlist_adds(session)
         errors = await q.recent_errors(session)
+        stats = await q.global_stats(session, settings, settings.data_dir)
 
     tz = ZoneInfo(settings.queue_timezone)
     loaded_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M MT")
@@ -53,6 +54,7 @@ async def index(request: Request):
             "errors": errors,
             "loaded_at": loaded_at,
             "version": __version__,
+            "stats": stats,
         },
     )
 
@@ -62,6 +64,7 @@ async def board_queue_view(request: Request, board_name: str):
     settings: DashboardSettings = request.app.state.settings
     async with session_scope() as session:
         board, items = await q.board_queue(session, board_name, settings)
+        stats = await q.global_stats(session, settings, settings.data_dir)
     if board is None:
         return RedirectResponse("/", status_code=302)
     handle = settings.bluesky_handle_for(board_name)
@@ -76,5 +79,6 @@ async def board_queue_view(request: Request, board_name: str):
             "items": items,
             "fresh_window_hours": settings.queue_fresh_window_hours,
             "loaded_at": loaded_at,
+            "stats": stats,
         },
     )

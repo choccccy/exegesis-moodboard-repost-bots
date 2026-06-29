@@ -7,10 +7,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import discord
+from discord import app_commands
 import httpx
 
 from sqlalchemy import select
 
+from ..bot_status import scan_finished, scan_started
 from ..config import Settings
 from ..db import session_scope
 from ..models import Submission, SubmissionThread
@@ -26,6 +28,7 @@ log = logging.getLogger(__name__)
 # creating 19 threads in rapid succession).
 _CATCHUP_INTER_MESSAGE_DELAY = 2.0       # seconds; existing submission, thread reused
 _CATCHUP_NEW_THREAD_DELAY = 6.0          # seconds; new thread created, respect rate limit
+_CATCHUP_CHANNEL_TIMEOUT = 3600.0       # seconds; per-channel scan wall-clock limit (safety only)
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -57,6 +60,7 @@ class RepostBot(discord.Client):
         self._http: httpx.AsyncClient | None = None
         self._watched_channels = {b.discord_channel_id for b in settings.boards}
         self._catchup_started = False
+        self.tree = app_commands.CommandTree(self)
 
     @property
     def httpx_client(self) -> httpx.AsyncClient:
@@ -68,6 +72,28 @@ class RepostBot(discord.Client):
         self._http = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         async with session_scope() as session:
             await service.sync_boards(session, self.settings)
+
+        # Register /scan and sync to every configured guild.
+        bot_ref = self
+
+        @self.tree.command(name="scan", description="Scan this channel for missed 🦋 reactions")
+        @app_commands.describe(days="How many days back to scan (default: 365)")
+        async def _scan(interaction: discord.Interaction, days: int = 365) -> None:
+            await bot_ref._handle_scan_slash(interaction, days)
+
+        guild_ids = {b.discord_guild_id for b in self.settings.boards}
+        log.info("syncing slash commands to %d guild(s): %s", len(guild_ids), guild_ids)
+        for guild_id in guild_ids:
+            try:
+                guild_obj = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
+                log.info("synced %d command(s) to guild %s: %s", len(synced), guild_id, [c.name for c in synced])
+            except discord.Forbidden as exc:
+                log.error("cannot sync commands to guild %s (missing applications.commands scope?): %s", guild_id, exc)
+            except discord.HTTPException as exc:
+                log.error("HTTP error syncing commands to guild %s: %s", guild_id, exc)
+
         log.info("watching %d channel(s): %s", len(self._watched_channels), self._watched_channels)
 
     async def close(self) -> None:
@@ -129,12 +155,15 @@ class RepostBot(discord.Client):
             message = await self._fetch_message(payload.channel_id, payload.message_id)
             if message is None:
                 return
-            async with session_scope() as session:
-                await service.handle_reaction(
-                    session, settings=self.settings, message=message, http_client=self.httpx_client,
-                    member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
-                    bot_id=getattr(self.user, "id", None),
-                )
+            try:
+                async with session_scope() as session:
+                    await service.handle_reaction(
+                        session, settings=self.settings, message=message, http_client=self.httpx_client,
+                        member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
+                        bot_id=getattr(self.user, "id", None),
+                    )
+            except Exception:
+                log.exception("handle_reaction failed for message %s in channel %s", payload.message_id, payload.channel_id)
             return
 
         if emoji == GRAPHIC_YES_EMOJI:
@@ -270,6 +299,94 @@ class RepostBot(discord.Client):
                 http_client=self.httpx_client,
             )
 
+    async def _handle_scan_slash(self, interaction: discord.Interaction, days: int) -> None:
+        """Handle /scan - deep-scan this channel for missed 🦋 reactions."""
+        channel = interaction.channel
+        if channel is None or channel.id not in self._watched_channels:
+            await interaction.response.send_message(
+                "This command only works in watched moodboard channels.", ephemeral=True
+            )
+            return
+
+        board_cfg = self.settings.board_for_channel(channel.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not service._is_curator(member, interaction.user.id, board_cfg):
+            await interaction.response.send_message(
+                "You're not a curator for this board.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        status = await interaction.followup.send(
+            f"Scanning <#{channel.id}> for 🦋 reactions going back {days} day(s)…",
+            ephemeral=True,
+        )
+        task = asyncio.create_task(
+            self._run_channel_scan(channel, cutoff, status),
+            name=f"scan-{channel.id}",
+        )
+        task.add_done_callback(_log_task_exception)
+
+    async def _run_channel_scan(
+        self,
+        channel,
+        cutoff: datetime,
+        status_message: discord.Message | None,
+    ) -> None:
+        """Scan one channel for 🦋 reactions since cutoff; process any found."""
+        channel_name = getattr(channel, "name", str(channel.id))
+        scan_started(channel.id, channel_name, scan_type="manual" if status_message else "catchup")
+        trigger = self.settings.trigger_emoji
+        scanned = 0
+        processed = 0
+        timed_out = False
+        try:
+            async with asyncio.timeout(_CATCHUP_CHANNEL_TIMEOUT):
+                async for message in channel.history(after=cutoff, limit=None):  # type: ignore[union-attr]
+                    scanned += 1
+                    if scanned % 500 == 0 and status_message is not None:
+                        try:
+                            await status_message.edit(
+                                content=f"Scanning <#{channel.id}>… {scanned} messages checked, {processed} processed so far."
+                            )
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+                    if not any(str(r.emoji) == trigger for r in message.reactions):
+                        continue
+                    delay = _CATCHUP_INTER_MESSAGE_DELAY
+                    try:
+                        async with session_scope() as session:
+                            new_thread = await service.handle_reaction(
+                                session,
+                                settings=self.settings,
+                                message=message,
+                                http_client=self.httpx_client,
+                                skip_auth=True,
+                                bot_id=getattr(self.user, "id", None),
+                            )
+                        processed += 1
+                        delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
+                    except Exception as exc:
+                        log.warning("scan: error processing message %s: %s", message.id, exc)
+                    await asyncio.sleep(delay)
+        except TimeoutError:
+            timed_out = True
+        finally:
+            scan_finished(channel.id)
+
+        if status_message is not None:
+            try:
+                summary = f"Scan complete: {scanned} messages checked, {processed} new submission(s) created."
+                if timed_out:
+                    summary = (
+                        f"Scan timed out after {_CATCHUP_CHANNEL_TIMEOUT:.0f}s "
+                        f"({scanned} checked, {processed} processed — some older messages may have been missed)."
+                    )
+                await status_message.edit(content=summary)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
     def _is_watched_location(self, channel) -> bool:
         """A watched channel, or a thread whose parent is a watched channel."""
         if channel.id in self._watched_channels:
@@ -302,58 +419,68 @@ class RepostBot(discord.Client):
     async def _run_catchup(self) -> None:
         """Reconcile 🦋 reactions missed while offline.
 
-        For each watched channel, walk recent history (bounded by lookback window
-        and message cap) and ingest any message currently bearing the trigger
-        emoji. Idempotent: messages that already have a submission are skipped by
-        the service layer, so re-scanning never duplicates or re-prompts.
+        For each watched channel, walk history since the lookback cutoff and
+        ingest any message currently bearing the trigger emoji. Uses the Discord
+        API's `after` parameter so the scan covers ALL messages in the window
+        regardless of channel activity - no message-count cap. Idempotent:
+        messages with an existing submission are skipped by the service layer.
+
+        Posts older than catchup_lookback_hours must be re-butterflied while the
+        bot is live - the catchup window is intentionally bounded.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(
             hours=self.settings.catchup_lookback_hours
         )
         trigger = self.settings.trigger_emoji
-        cap = self.settings.catchup_max_messages
         total = 0
-        log.info("catch-up scan starting (lookback=%sh, cap=%s/channel)",
-                 self.settings.catchup_lookback_hours, cap)
+        log.info("catch-up scan starting (lookback=%sh)", self.settings.catchup_lookback_hours)
 
         for channel_id in self._watched_channels:
             channel = await self._resolve_channel(channel_id)
             if channel is None:
                 continue
+            channel_name = getattr(channel, "name", str(channel_id))
+            log.info("catch-up: scanning channel %s", channel_id)
+            scan_started(channel_id, channel_name, scan_type="catchup")
             scanned = 0
+            channel_total = 0
             try:
-                async for message in channel.history(limit=cap):  # type: ignore[union-attr]
-                    if message.created_at < cutoff:
-                        break
-                    scanned += 1
-                    if not any(str(r.emoji) == trigger for r in message.reactions):
-                        continue
-                    delay = _CATCHUP_INTER_MESSAGE_DELAY
-                    try:
-                        async with session_scope() as session:
-                            new_thread = await service.handle_reaction(
-                                session,
-                                settings=self.settings,
-                                message=message,
-                                http_client=self.httpx_client,
-                                skip_auth=True,
-                                bot_id=getattr(self.user, "id", None),
-                            )
-                        total += 1
-                        delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
-                    except Exception as exc:
-                        log.warning("catch-up: error processing message %s in channel %s: %s", message.id, channel_id, exc)
-                    await asyncio.sleep(delay)
+                async with asyncio.timeout(_CATCHUP_CHANNEL_TIMEOUT):
+                    async for message in channel.history(after=cutoff, limit=None):  # type: ignore[union-attr]
+                        scanned += 1
+                        if not any(str(r.emoji) == trigger for r in message.reactions):
+                            continue
+                        delay = _CATCHUP_INTER_MESSAGE_DELAY
+                        try:
+                            async with session_scope() as session:
+                                new_thread = await service.handle_reaction(
+                                    session,
+                                    settings=self.settings,
+                                    message=message,
+                                    http_client=self.httpx_client,
+                                    skip_auth=True,
+                                    bot_id=getattr(self.user, "id", None),
+                                )
+                            total += 1
+                            channel_total += 1
+                            delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
+                        except Exception as exc:
+                            log.warning("catch-up: error processing message %s in channel %s: %s", message.id, channel_id, exc)
+                        await asyncio.sleep(delay)
+            except TimeoutError:
+                log.warning(
+                    "catch-up: channel %s scan timed out after %.0fs (%d scanned, %d processed) - "
+                    "some 🦋 reactions in this channel may have been missed",
+                    channel_id, _CATCHUP_CHANNEL_TIMEOUT, scanned, channel_total,
+                )
+                scan_finished(channel_id)
+                continue
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("catch-up scan failed for channel %s: %s", channel_id, exc)
+                scan_finished(channel_id)
                 continue
-            # Surface a bounded scan rather than implying full coverage.
-            if scanned >= cap:
-                log.warning(
-                    "catch-up hit the %s-message cap on channel %s; 🦋 reactions on "
-                    "older messages within the lookback window were not scanned",
-                    cap, channel_id,
-                )
+            scan_finished(channel_id)
+            log.info("catch-up: channel %s done (%d scanned, %d processed)", channel_id, scanned, channel_total)
         log.info("catch-up scan complete: processed %d butterflied message(s)", total)
         asyncio.create_task(self._run_thread_catchup())
 
