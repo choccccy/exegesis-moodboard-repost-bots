@@ -10,6 +10,7 @@ import asyncio
 import datetime
 import logging
 import mimetypes
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,10 @@ from ..state import GraphicStatus
 log = logging.getLogger(__name__)
 
 _MAX_GRAPHEMES = 300
+
+# Matches Bluesky hashtags: # followed by at least one letter (not a bare digit-only tag),
+# then any word characters. Negative lookbehind avoids matching inside URLs (#anchor).
+_TAG_RE = re.compile(r"(?<!\w)#([a-zA-Z][a-zA-Z0-9_]*)(?!\w)")
 
 
 @dataclass
@@ -156,7 +161,11 @@ def _build_labels(submission: Submission, board_cfg: BoardConfig):
 
 
 def _post_text_and_facets(title: str | None, url: str) -> tuple[str, list]:
-    """Build post text containing title + URL, with a link facet on the URL."""
+    """Build post text containing title + URL, with a link facet on the URL.
+
+    Also adds tag facets for any #hashtags found in the title so they render
+    as clickable tags in Bluesky clients.
+    """
     if title:
         max_title = _MAX_GRAPHEMES - len(url) - 1  # -1 for newline
         if len(title) > max_title:
@@ -176,6 +185,21 @@ def _post_text_and_facets(title: str | None, url: str) -> tuple[str, list]:
             index=models.AppBskyRichtextFacet.ByteSlice(byte_start=start, byte_end=end),
         )
     ]
+
+    # Emit tag facets for #hashtags in the title. The title always starts at
+    # byte 0, so byte offsets from scanning it directly match the full text.
+    if title:
+        for m in _TAG_RE.finditer(title):
+            tag = m.group(1)
+            tag_start = len(title[: m.start()].encode("utf-8"))
+            tag_end = tag_start + len(m.group(0).encode("utf-8"))
+            facets.append(
+                models.AppBskyRichtextFacet.Main(
+                    features=[models.AppBskyRichtextFacet.Tag(tag=tag)],
+                    index=models.AppBskyRichtextFacet.ByteSlice(byte_start=tag_start, byte_end=tag_end),
+                )
+            )
+
     return text, facets
 
 
