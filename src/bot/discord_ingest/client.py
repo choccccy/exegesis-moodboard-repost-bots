@@ -328,17 +328,21 @@ class RepostBot(discord.Client):
                     scanned += 1
                     if not any(str(r.emoji) == trigger for r in message.reactions):
                         continue
-                    async with session_scope() as session:
-                        new_thread = await service.handle_reaction(
-                            session,
-                            settings=self.settings,
-                            message=message,
-                            http_client=self.httpx_client,
-                            skip_auth=True,
-                            bot_id=getattr(self.user, "id", None),
-                        )
-                    total += 1
-                    delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
+                    delay = _CATCHUP_INTER_MESSAGE_DELAY
+                    try:
+                        async with session_scope() as session:
+                            new_thread = await service.handle_reaction(
+                                session,
+                                settings=self.settings,
+                                message=message,
+                                http_client=self.httpx_client,
+                                skip_auth=True,
+                                bot_id=getattr(self.user, "id", None),
+                            )
+                        total += 1
+                        delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
+                    except Exception as exc:
+                        log.warning("catch-up: error processing message %s in channel %s: %s", message.id, channel_id, exc)
                     await asyncio.sleep(delay)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("catch-up scan failed for channel %s: %s", channel_id, exc)
@@ -624,6 +628,8 @@ class RepostBot(discord.Client):
                         if thread is not None:
                             await service.recompute_and_request(session, fresh, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None))
                             log.info("threadless retry: created thread for submission %s", fresh.id)
+                        else:
+                            log.warning("threadless retry: thread creation still failing for submission %s (will retry)", fresh.id)
                     await asyncio.sleep(_THREAD_DELAY)
             except Exception:
                 log.exception("threadless retry loop encountered an error")

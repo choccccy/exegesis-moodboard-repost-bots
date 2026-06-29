@@ -21,7 +21,7 @@ from conftest import make_submission
 QUEUED = SubmissionState.QUEUED.value
 FAILED = SubmissionState.PUBLISH_FAILED.value
 
-_NOW_NAIVE = datetime(2026, 6, 23, 18, 0, 0)
+_NOW_NAIVE = datetime.now()
 _FRESH_NAIVE = _NOW_NAIVE - timedelta(hours=24)
 _STALE_NAIVE = _NOW_NAIVE - timedelta(hours=96)
 

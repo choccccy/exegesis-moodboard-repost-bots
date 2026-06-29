@@ -139,7 +139,7 @@ async def handle_reaction(
     """Entry point for a 🦋 reaction on a watched channel message."""
     board = await _board_for_channel(session, message.channel.id)
     if board is None:
-        return  # not a watched channel
+        return False  # not a watched channel
 
     if not skip_auth:
         board_cfg = settings.board_for_channel(message.channel.id)
@@ -1908,18 +1908,20 @@ async def _attempt_publish(
     """
     board_cfg = settings.board_for_channel(submission.channel_id)
     if not board_cfg or not board_cfg.bluesky_handle:
-        log.info(
-            "submission %s ready but board has no bluesky_handle - skipping publish",
-            submission.id,
-        )
+        err = "board has no Bluesky handle configured"
+        log.warning("submission %s: %s", submission.id, err)
+        submission.state = SubmissionState.PUBLISH_FAILED.value
+        session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
+        await destination.send(replies.publish_failed_notice(err))
         return True
 
     password = settings.bsky_password_for(board_cfg.name)
     if not password:
-        log.warning(
-            "submission %s ready but no app password for board %s - skipping publish",
-            submission.id, board_cfg.name,
-        )
+        err = f"no app password configured for board {board_cfg.name}"
+        log.warning("submission %s: %s", submission.id, err)
+        submission.state = SubmissionState.PUBLISH_FAILED.value
+        session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
+        await destination.send(replies.publish_failed_notice(err))
         return True
 
     parent_ref = await _resolve_parent_ref(session, submission)
