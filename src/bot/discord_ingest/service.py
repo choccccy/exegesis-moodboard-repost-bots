@@ -12,6 +12,7 @@ import asyncio
 import io
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import discord
@@ -98,6 +99,84 @@ async def _board_for_channel(session: AsyncSession, channel_id: int) -> Board | 
     return await session.scalar(
         select(Board).where(Board.discord_channel_id == channel_id)
     )
+
+
+@dataclass
+class TriageItem:
+    thread_url: str
+    title: str
+    author_display: str
+    state: str
+    submitted_rel: str
+
+
+def _triage_relative(dt: datetime | None) -> str:
+    if dt is None:
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+_TRIAGE_TERMINAL_STATES = {SubmissionState.PUBLISHED.value, SubmissionState.PUBLISH_FAILED.value}
+
+
+async def fetch_triage_items(
+    session: AsyncSession,
+    *,
+    board_id: int,
+    guild_id: int,
+    state_filter: str | None = None,
+) -> list[TriageItem]:
+    """Fetch open submissions for a board, optionally filtered by state."""
+    filters = [
+        Submission.board_id == board_id,
+        ~Submission.state.in_(_TRIAGE_TERMINAL_STATES),
+    ]
+    if state_filter is not None:
+        filters.append(Submission.state == state_filter)
+
+    rows = list(await session.execute(
+        select(
+            Submission.id,
+            Submission.state,
+            Submission.author_display,
+            Submission.created_at,
+            Submission.thread_id,
+            SubmissionLink.resolved_title,
+        )
+        .outerjoin(
+            SubmissionLink,
+            (SubmissionLink.submission_id == Submission.id)
+            & (SubmissionLink.order_index == 0),
+        )
+        .where(*filters)
+        .order_by(Submission.created_at.asc())
+    ))
+
+    items = []
+    for row in rows:
+        thread_url = (
+            f"https://discord.com/channels/{guild_id}/{row.thread_id}"
+            if row.thread_id
+            else None
+        )
+        title = row.resolved_title or f"submission {row.id}"
+        items.append(TriageItem(
+            thread_url=thread_url or "",
+            title=title,
+            author_display=row.author_display or "unknown",
+            state=row.state,
+            submitted_rel=_triage_relative(row.created_at),
+        ))
+    return items
 
 
 async def _find_prior_post(
@@ -1323,6 +1402,54 @@ async def handle_playlist_skip_button(
             _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
 
 
+async def handle_edit_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+) -> None:
+    """Edit button clicked: send a modal to update the post text."""
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        await interaction.response.send_message("Submission not found.", ephemeral=True)
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.response.send_message(
+            "You're not authorised to edit this submission.", ephemeral=True
+        )
+        return
+
+    primary = await session.scalar(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
+    )
+    modal = views.PostEditModal(
+        submission_id=submission_id,
+        current_title=primary.resolved_title if primary else None,
+    )
+    await interaction.response.send_modal(modal)
+
+
+async def apply_post_edits(
+    session: AsyncSession,
+    *,
+    submission_id: int,
+    new_title: str,
+) -> None:
+    """Apply curator edits to the post text (resolved_title on primary link)."""
+    primary = await session.scalar(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
+    )
+    if primary is not None:
+        primary.resolved_title = new_title.strip() or None
+    log.info("applied post text edit for submission %s", submission_id)
+
+
 async def _resolve_thread_by_id(
     channel: discord.abc.Messageable, thread_id: int
 ) -> discord.Thread | None:
@@ -1634,6 +1761,46 @@ _DISCORD_MAX_BYTES = 8 * 1024 * 1024  # 8 MB free-tier upload limit
 _ALT_PREVIEW_MAX_PX = 1920
 
 
+def _discord_file_for_animated_gif(img: object, filename: str) -> discord.File:
+    """Convert an open animated GIF to animated WebP for Discord upload.
+
+    Tries successively lower WebP quality settings to fit within 8 MB.
+    Falls back to a static first-frame JPEG if nothing fits.
+    """
+    from PIL import Image, ImageSequence
+
+    w, h = img.size
+    scale = min(1.0, _ALT_PREVIEW_MAX_PX / max(w, h))
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+
+    frames: list = []
+    durations: list = []
+    for frame in ImageSequence.Iterator(img):
+        rgba = frame.convert("RGBA")
+        if scale < 1.0:
+            rgba = rgba.resize((new_w, new_h), Image.LANCZOS)
+        frames.append(rgba)
+        durations.append(frame.info.get("duration", 100))
+
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+    for quality in (80, 60, 40):
+        buf = io.BytesIO()
+        frames[0].save(
+            buf, format="WEBP", save_all=True, append_images=frames[1:],
+            duration=durations, loop=0, quality=quality,
+        )
+        buf.seek(0)
+        if buf.getbuffer().nbytes <= _DISCORD_MAX_BYTES:
+            return discord.File(buf, filename=f"{stem}.webp")
+
+    # Nothing fit as animated WebP - show first frame only.
+    buf = io.BytesIO()
+    frames[0].convert("RGB").save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return discord.File(buf, filename=f"{stem}.jpg")
+
+
 def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File:
     """Return a discord.File for the image, resizing in-memory if it exceeds 8 MB."""
     from PIL import Image
@@ -1643,6 +1810,11 @@ def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File
         fmt = img.format or "JPEG"
         if fmt not in ("JPEG", "PNG", "WEBP", "GIF"):
             fmt = "JPEG"
+
+        # Animated GIFs need per-frame processing; delegate to a dedicated helper.
+        if fmt == "GIF" and getattr(img, "n_frames", 1) > 1:
+            return _discord_file_for_animated_gif(img, filename)
+
         # JPEG can't store alpha; flatten RGBA to RGB before encoding.
         if fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
             img = img.convert("RGB")

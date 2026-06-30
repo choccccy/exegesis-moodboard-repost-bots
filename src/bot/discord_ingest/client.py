@@ -30,6 +30,74 @@ _CATCHUP_INTER_MESSAGE_DELAY = 2.0       # seconds; existing submission, thread 
 _CATCHUP_NEW_THREAD_DELAY = 6.0          # seconds; new thread created, respect rate limit
 _CATCHUP_CHANNEL_TIMEOUT = 3600.0       # seconds; per-channel scan wall-clock limit (safety only)
 
+_TRIAGE_STATE_LABELS = {
+    "ready_to_queue":                  "Needs confirmation",
+    "awaiting_source":                 "Awaiting source",
+    "awaiting_better_link":            "Awaiting metadata",
+    "awaiting_image":                  "Awaiting image",
+    "awaiting_alt_text":               "Awaiting alt text",
+    "awaiting_graphic_classification": "Awaiting classification",
+    "queued":                          "Queued",
+    "intent_submitted":                "Just submitted",
+}
+
+_TRIAGE_CHOICES = [
+    app_commands.Choice(name="needs confirmation",       value="ready_to_queue"),
+    app_commands.Choice(name="awaiting source",          value="awaiting_source"),
+    app_commands.Choice(name="awaiting metadata",        value="awaiting_better_link"),
+    app_commands.Choice(name="awaiting image",           value="awaiting_image"),
+    app_commands.Choice(name="awaiting alt text",        value="awaiting_alt_text"),
+    app_commands.Choice(name="awaiting classification",  value="awaiting_graphic_classification"),
+    app_commands.Choice(name="queued",                   value="queued"),
+]
+
+_TRIAGE_MAX_ITEMS = 30
+
+
+def _format_triage(
+    items: list,
+    *,
+    channel_name: str,
+    filter_label: str | None,
+) -> str:
+    if not items:
+        qualifier = f" matching '{filter_label}'" if filter_label else ""
+        return f"All clear — nothing open{qualifier} for **#{channel_name}**."
+
+    truncated = len(items) > _TRIAGE_MAX_ITEMS
+    shown = items[:_TRIAGE_MAX_ITEMS]
+
+    if filter_label:
+        header = f"**🦋 #{channel_name}** — {len(items)} open · {filter_label}"
+        lines = [header, ""]
+        for item in shown:
+            link = f"[{item.title}](<{item.thread_url}>)" if item.thread_url else item.title
+            lines.append(f"• {link} — {item.author_display} · {item.submitted_rel}")
+    else:
+        from collections import defaultdict
+        grouped: dict[str, list] = defaultdict(list)
+        for item in shown:
+            grouped[item.state].append(item)
+
+        # Order groups by state priority
+        state_order = list(_TRIAGE_STATE_LABELS.keys())
+        sorted_states = sorted(grouped, key=lambda s: state_order.index(s) if s in state_order else 99)
+
+        header = f"**🦋 #{channel_name}** — {len(items)} open"
+        lines = [header]
+        for state in sorted_states:
+            group = grouped[state]
+            label = _TRIAGE_STATE_LABELS.get(state, state)
+            lines.append(f"\n**{label}** ({len(group)})")
+            for item in group:
+                link = f"[{item.title}](<{item.thread_url}>)" if item.thread_url else item.title
+                lines.append(f"• {link} — {item.author_display} · {item.submitted_rel}")
+
+    if truncated:
+        lines.append(f"\n… and {len(items) - _TRIAGE_MAX_ITEMS} more (use a filter to narrow down)")
+
+    return "\n".join(lines)
+
 
 def _log_task_exception(task: asyncio.Task) -> None:
     """Done-callback: surface silent asyncio task exceptions in the log."""
@@ -73,13 +141,22 @@ class RepostBot(discord.Client):
         async with session_scope() as session:
             await service.sync_boards(session, self.settings)
 
-        # Register /scan and sync to every configured guild.
+        # Register slash commands and sync to every configured guild.
         bot_ref = self
 
         @self.tree.command(name="scan", description="Scan this channel for missed 🦋 reactions")
         @app_commands.describe(days="How many days back to scan (default: 365)")
         async def _scan(interaction: discord.Interaction, days: int = 365) -> None:
             await bot_ref._handle_scan_slash(interaction, days)
+
+        @self.tree.command(name="triage", description="List open submission threads for this board")
+        @app_commands.describe(filter="Filter by state (omit to show all)")
+        @app_commands.choices(filter=_TRIAGE_CHOICES)
+        async def _triage(
+            interaction: discord.Interaction,
+            filter: app_commands.Choice[str] | None = None,
+        ) -> None:
+            await bot_ref._handle_triage_slash(interaction, filter)
 
         guild_ids = {b.discord_guild_id for b in self.settings.boards}
         log.info("syncing slash commands to %d guild(s): %s", len(guild_ids), guild_ids)
@@ -140,6 +217,10 @@ class RepostBot(discord.Client):
                 await service.handle_playlist_skip_button(
                     session, interaction, int(custom_id.removeprefix("pl_skip:")),
                     self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("edit:"):
+                await service.handle_edit_button(
+                    session, interaction, int(custom_id.removeprefix("edit:")), self.settings
                 )
             else:
                 await interaction.response.defer()
@@ -332,6 +413,47 @@ class RepostBot(discord.Client):
             name=f"scan-{channel.id}",
         )
         task.add_done_callback(_log_task_exception)
+
+    async def _handle_triage_slash(
+        self,
+        interaction: discord.Interaction,
+        filter: app_commands.Choice[str] | None,
+    ) -> None:
+        """Handle /triage - list open submission threads for this board."""
+        channel = interaction.channel
+        if channel is None or channel.id not in self._watched_channels:
+            await interaction.response.send_message(
+                "This command only works in watched moodboard channels.", ephemeral=True
+            )
+            return
+
+        board_cfg = self.settings.board_for_channel(channel.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not service._is_curator(member, interaction.user.id, board_cfg):
+            await interaction.response.send_message(
+                "You're not a curator for this board.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        async with session_scope() as session:
+            board = await service._board_for_channel(session, channel.id)
+            if board is None:
+                await interaction.followup.send("Board not found.", ephemeral=True)
+                return
+            items = await service.fetch_triage_items(
+                session,
+                board_id=board.id,
+                guild_id=board_cfg.discord_guild_id,
+                state_filter=filter.value if filter else None,
+            )
+
+        content = _format_triage(
+            items,
+            channel_name=getattr(channel, "name", str(channel.id)),
+            filter_label=filter.name if filter else None,
+        )
+        await interaction.followup.send(content, ephemeral=True)
 
     async def _run_channel_scan(
         self,

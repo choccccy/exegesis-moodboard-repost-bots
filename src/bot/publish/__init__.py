@@ -209,13 +209,47 @@ _BSKY_MAX_BLOB = 975_000  # bytes; Bluesky hard limit is 1,000,000 - stay comfor
 def _compress_for_bsky(data: bytes) -> bytes:
     """Compress image data to fit within Bluesky's 1MB blob limit.
 
-    Tries successive JPEG quality reductions, then halves resolution until
-    it fits. Converts RGBA/P modes to RGB so JPEG encoding works.
+    Animated GIFs are converted to animated WebP (far smaller) at successively
+    lower quality levels, then with halved resolution, before giving up and
+    falling through to a static JPEG. Static images go straight to JPEG.
     """
     import io
-    from PIL import Image
+    from PIL import Image, ImageSequence
 
     img = Image.open(io.BytesIO(data))
+
+    if img.format == "GIF" and getattr(img, "n_frames", 1) > 1:
+        frames: list = []
+        durations: list = []
+        for frame in ImageSequence.Iterator(img):
+            frames.append(frame.convert("RGBA"))
+            durations.append(frame.info.get("duration", 100))
+
+        scale = 1.0
+        while scale > 0.05:
+            new_w = max(1, int(frames[0].width * scale))
+            new_h = max(1, int(frames[0].height * scale))
+            scaled = (
+                frames if scale == 1.0
+                else [f.resize((new_w, new_h), Image.LANCZOS) for f in frames]
+            )
+            for quality in (80, 60, 40, 20):
+                buf = io.BytesIO()
+                scaled[0].save(
+                    buf, format="WEBP", save_all=True, append_images=scaled[1:],
+                    duration=durations, loop=0, quality=quality,
+                )
+                if buf.tell() <= _BSKY_MAX_BLOB:
+                    log.info(
+                        "compressed animated GIF to WebP: %d bytes (scale=%.2f q=%d)",
+                        buf.tell(), scale, quality,
+                    )
+                    return buf.getvalue()
+            scale *= 0.5
+
+        log.warning("animated GIF could not be compressed to WebP within limit; falling back to static JPEG")
+        img = frames[0]
+
     if img.mode in ("RGBA", "P", "LA"):
         img = img.convert("RGB")
     for quality in (85, 70, 55, 40, 25):

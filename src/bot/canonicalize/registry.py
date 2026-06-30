@@ -71,7 +71,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "pixiv":   ["pixiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
     "tumblr":  ["tumblr.com"],
-    "tiktok":  ["tiktok.com", "vm.tiktok.com", "m.tiktok.com"],
+    "tiktok":  ["tiktok.com", "vm.tiktok.com", "m.tiktok.com", "kktiktok.com"],
 }
 
 
@@ -211,6 +211,7 @@ _PATH_HEURISTICS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^/shorts/[A-Za-z0-9_-]{11}(/|$)"), "youtube"),      # /shorts/11-char-ID
     (re.compile(r"^/artworks/\d+"), "pixiv"),                           # /artworks/12345678
     (re.compile(r"^/photos/[^/]+/\d+"), "flickr"),                     # /photos/user/ID
+    (re.compile(r"^/@[^/]+/video/\d+"), "tiktok"),                     # /@user/video/ID
 ]
 
 

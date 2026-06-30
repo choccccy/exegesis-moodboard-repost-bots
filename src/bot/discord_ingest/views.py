@@ -1,4 +1,4 @@
-"""Discord UI button factories for submission interactions.
+"""Discord UI button factories and modal classes for submission interactions.
 
 Each factory returns a View with timeout=None (persistent). Buttons carry
 explicit custom_ids so on_interaction can route them after any restart.
@@ -9,6 +9,8 @@ Custom ID scheme (must stay stable — old buttons carry these forever):
   meta_ok:{submission_id}   — confirm current link as best available
   graphic:{submission_id}   — mark as graphic/gore content
   pl_skip:{submission_id}   — skip YouTube playlist addition
+  edit:{submission_id}      — open edit-post-text modal
+  edit_post:{submission_id} — modal custom_id for post text editing
 """
 
 from __future__ import annotations
@@ -35,7 +37,40 @@ def make_confirm_view(submission_id: int) -> discord.ui.View:
         emoji="✅",
         custom_id=f"confirm:{submission_id}",
     ))
+    view.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.secondary,
+        label="Edit before queuing",
+        emoji="✏️",
+        custom_id=f"edit:{submission_id}",
+    ))
     return view
+
+
+class PostEditModal(discord.ui.Modal, title="Edit post text"):
+    caption_input: discord.ui.TextInput = discord.ui.TextInput(
+        label="Post text",
+        placeholder="Caption / title in the Bluesky post",
+        required=False,
+        max_length=280,
+        style=discord.TextStyle.paragraph,
+        custom_id="caption",
+    )
+
+    def __init__(self, submission_id: int, current_title: str | None) -> None:
+        super().__init__(custom_id=f"edit_post:{submission_id}")
+        self.submission_id = submission_id
+        self.caption_input.default = current_title or ""
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from ..db import session_scope
+        from . import service as _service
+        async with session_scope() as session:
+            await _service.apply_post_edits(
+                session,
+                submission_id=self.submission_id,
+                new_title=self.caption_input.value,
+            )
+        await interaction.response.send_message("Post text updated.", ephemeral=True)
 
 
 def make_metadata_confirm_view(submission_id: int) -> discord.ui.View:
