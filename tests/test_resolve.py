@@ -185,6 +185,29 @@ async def test_resolve_twitter_fxtwitter_api_returns_image():
 
 
 @pytest.mark.asyncio
+async def test_resolve_twitter_fxtwitter_api_qrt_uses_quoted_image():
+    client = AsyncMock()
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "me and who",
+            "author": {"name": "skyacinth_"},
+            "media": {},
+            "quote": {
+                "text": "removing ram from a computer while it's on",
+                "author": {"name": "pc_98s"},
+                "media": {"photos": [{"url": "https://pbs.twimg.com/media/qrt.jpg"}]},
+            },
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/skyacinth_/status/1802338297739436052", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/media/qrt.jpg"
+    assert result.via == "fxtwitter_api"
+
+
+@pytest.mark.asyncio
 async def test_resolve_twitter_falls_back_to_mirror_when_api_fails():
     client = AsyncMock()
     # fxtwitter API → 404; vxtwitter API → 404; fxtwitter OG mirror → HTML

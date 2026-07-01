@@ -62,6 +62,7 @@ from ..state import (
     evaluate_state,
     missing_gaps,
 )
+from ..notifier import NullNotifier, Notifier
 from . import replies, views
 from .urls import extract_urls
 
@@ -303,8 +304,8 @@ async def handle_reaction(
         )
         session.add(submission)
         await session.flush()  # assign submission.id
-        await _ingest_content(session, submission, message, settings, http_client)
-        await _resolve_links(session, submission, settings, http_client)
+        thumb_proxy_url = await _ingest_content(session, submission, message, settings, http_client)
+        await _resolve_links(session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url)
         log.info("created submission %s for message %s", submission.id, message.id)
 
     thread, new_thread = await _ensure_thread(session, settings, message, submission, post_anchor=created, bot_id=bot_id)
@@ -1108,8 +1109,6 @@ async def handle_cancel_button(
     settings: Settings,
 ) -> None:
     """Cancel button clicked: delete the submission if authorized."""
-    await interaction.response.defer()
-
     submission = await session.get(Submission, submission_id)
     if submission is None:
         await interaction.followup.send("Submission not found.", ephemeral=True)
@@ -1184,8 +1183,6 @@ async def handle_confirm_button(
     yt_client=None,
 ) -> None:
     """Queue for posting button clicked: queue the submission if authorized."""
-    await interaction.response.defer()
-
     req = await session.scalar(
         select(ConfirmationRequest).where(
             ConfirmationRequest.submission_id == submission_id,
@@ -1252,8 +1249,6 @@ async def handle_metadata_confirm_button(
     yt_client=None,
 ) -> None:
     """Use link as-is button clicked: confirm current link metadata."""
-    await interaction.response.defer()
-
     req = await session.scalar(
         select(MetadataRequest).where(
             MetadataRequest.submission_id == submission_id,
@@ -1299,8 +1294,6 @@ async def handle_graphic_button(
     yt_client=None,
 ) -> None:
     """Mark as graphic content button clicked."""
-    await interaction.response.defer()
-
     req = await session.scalar(
         select(ContentLabelRequest).where(
             ContentLabelRequest.submission_id == submission_id,
@@ -1346,8 +1339,6 @@ async def handle_playlist_skip_button(
     yt_client=None,
 ) -> None:
     """Skip playlist button clicked: opt out and remove if already added."""
-    await interaction.response.defer()
-
     submission = await session.get(Submission, submission_id)
     if submission is None:
         await interaction.followup.send("Submission not found.", ephemeral=True)
@@ -1472,8 +1463,12 @@ async def _ingest_content(
     message: discord.Message,
     settings: Settings,
     http_client: httpx.AsyncClient,
-) -> None:
-    """One-time parse of links + embed capture + attachment download."""
+) -> str | None:
+    """One-time parse of links + embed capture + attachment download.
+
+    Returns the Discord thumbnail proxy_url (if any) for use as a download
+    fallback in _resolve_links when the original URL requires site auth.
+    """
     raw_urls = extract_urls(message.content)
     # Mobile share sheets send an embed URL without URL text in message.content.
     if not raw_urls:
@@ -1507,7 +1502,7 @@ async def _ingest_content(
             )
         )
 
-    _capture_embed(submission, message)
+    thumb_proxy_url = _capture_embed(submission, message)
 
     all_attachments = list(message.attachments)
     for snap in getattr(message, 'message_snapshots', []):
@@ -1515,13 +1510,18 @@ async def _ingest_content(
     for att in all_attachments:
         await _ingest_attachment(session, submission, att, settings, http_client)
 
+    return thumb_proxy_url
 
-def _capture_embed(submission: Submission, message: discord.Message) -> None:
+
+def _capture_embed(submission: Submission, message: discord.Message) -> str | None:
     """Store the Discord-generated link embed's title/description/thumb.
 
     Drives the external-embed preview and the at-least-one-image check. Embeds
     populate a beat after posting, so this may be empty if 🦋 was very fast.
     Also checks message_snapshots for forwarded messages.
+
+    Returns the Discord proxy_url for the thumbnail if one exists, so callers
+    can use it as a download fallback when the original URL requires site auth.
     """
     all_embeds = list(message.embeds)
     for snap in getattr(message, 'message_snapshots', []):
@@ -1530,11 +1530,15 @@ def _capture_embed(submission: Submission, message: discord.Message) -> None:
         thumb = (embed.thumbnail.url if embed.thumbnail else None) or (
             embed.image.url if embed.image else None
         )
+        thumb_proxy = (embed.thumbnail.proxy_url if embed.thumbnail else None) or (
+            embed.image.proxy_url if embed.image else None
+        ) or None
         if embed.title or embed.description or thumb:
             submission.embed_title = embed.title
             submission.embed_description = embed.description
             submission.embed_thumb_url = thumb
-            return
+            return thumb_proxy
+    return None
 
 
 async def _resolve_links(
@@ -1542,11 +1546,14 @@ async def _resolve_links(
     submission: Submission,
     settings: Settings,
     http_client: httpx.AsyncClient,
+    embed_thumb_proxy_url: str | None = None,
 ) -> None:
     """Resolve per-link metadata and download each thumbnail to the volume.
 
     The primary (first) link falls back to the Discord-captured embed when our
-    own fetch comes up empty.
+    own fetch comes up empty. embed_thumb_proxy_url is Discord's CDN copy of
+    the thumbnail - used as a download fallback when the source site's CDN
+    blocks unauthenticated requests (e.g. FurAffinity).
     """
     links = list(
         (
@@ -1585,6 +1592,25 @@ async def _resolve_links(
                 )
             except (StorageFullError, httpx.HTTPError, OSError) as exc:
                 log.info("thumbnail download failed for link %s: %s", link.id, exc)
+                # If the original URL failed and we have a Discord proxy copy, try that.
+                # Handles sites (e.g. FurAffinity) whose CDN requires auth or Referer.
+                if (
+                    is_primary
+                    and embed_thumb_proxy_url
+                    and embed_thumb_proxy_url != meta.image_url
+                ):
+                    try:
+                        link.resolved_image_path = await download_attachment(
+                            url=embed_thumb_proxy_url,
+                            dest_dir=dest,
+                            filename=f"thumb_{link.id}",
+                            data_dir=settings.data_dir,
+                            min_free_mb=settings.storage_min_free_mb,
+                            client=http_client,
+                        )
+                        log.info("thumbnail downloaded via Discord proxy for link %s", link.id)
+                    except (StorageFullError, httpx.HTTPError, OSError) as exc2:
+                        log.info("Discord proxy thumbnail also failed for link %s: %s", link.id, exc2)
 
 
 async def _ingest_attachment(
@@ -1994,7 +2020,7 @@ async def recompute_and_request(
     submission: Submission,
     *,
     settings: Settings,
-    destination: discord.abc.Messageable,
+    destination: Notifier,
     yt_client=None,
     bot_id: int | None = None,
     from_reply: bool = False,
@@ -2063,26 +2089,35 @@ async def recompute_and_request(
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
-        msg = await destination.send(replies.source_request())
-        session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
+        try:
+            msg = await destination.send(replies.source_request())
+            session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post source request for submission %s: %s", submission.id, exc)
 
     if Gap.METADATA in gaps and not await _has_open_request(
         session, MetadataRequest, submission.id
     ):
         primary = _primary_link(links)
         url = primary.canonical_url if primary else "?"
-        msg = await destination.send(
-            replies.metadata_request(url),
-            view=views.make_metadata_confirm_view(submission.id),
-        )
-        session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
+        try:
+            msg = await destination.send(
+                replies.metadata_request(url),
+                view=views.make_metadata_confirm_view(submission.id),
+            )
+            session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post metadata request for submission %s: %s", submission.id, exc)
 
     # IMAGE gap is suppressed while METADATA is open - a better link may provide an image.
     if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
         session, ImageRequest, submission.id
     ):
-        msg = await destination.send(replies.image_request())
-        session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
+        try:
+            msg = await destination.send(replies.image_request())
+            session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post image request for submission %s: %s", submission.id, exc)
 
     if Gap.ALT_TEXT in gaps:
         for att in atts:
@@ -2092,38 +2127,44 @@ async def recompute_and_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
-            if att.local_path and att.is_image:
-                try:
-                    file = _discord_file_for_attachment(att.local_path, att.filename)
-                    msg = await destination.send(replies.alt_text_request(att.filename), file=file)
-                except Exception as exc:
-                    log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
+            try:
+                if att.local_path and att.is_image:
+                    try:
+                        file = _discord_file_for_attachment(att.local_path, att.filename)
+                        msg = await destination.send(replies.alt_text_request(att.filename), file=file)
+                    except Exception as exc:
+                        log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
+                        msg = await destination.send(
+                            replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
+                        )
+                else:
                     msg = await destination.send(
                         replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                     )
-            else:
-                msg = await destination.send(
-                    replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
+                session.add(
+                    AttachmentAltTextRequest(
+                        submission_id=submission.id,
+                        attachment_id=att.id,
+                        bot_message_id=msg.id,
+                    )
                 )
-            session.add(
-                AttachmentAltTextRequest(
-                    submission_id=submission.id,
-                    attachment_id=att.id,
-                    bot_message_id=msg.id,
-                )
-            )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post alt text request for submission %s, att %s: %s", submission.id, att.id, exc)
 
     has_graphic_notice = await session.scalar(
         select(ContentLabelRequest.id).where(ContentLabelRequest.submission_id == submission.id)
     ) is not None
     if snap.graphic_classification_required and not has_graphic_notice:
-        msg = await destination.send(
-            replies.graphic_request(),
-            view=views.make_graphic_view(submission.id),
-        )
-        session.add(
-            ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
-        )
+        try:
+            msg = await destination.send(
+                replies.graphic_request(),
+                view=views.make_graphic_view(submission.id),
+            )
+            session.add(
+                ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post graphic request for submission %s: %s", submission.id, exc)
 
     action = _queue_action(old_state, new_state)
     if action in ("fresh", "silent"):
@@ -2133,28 +2174,33 @@ async def recompute_and_request(
             )
         ) is not None
         if not has_conf:
-            preview = await _build_post_preview(session, submission, atts, links)
-            for page in replies.format_post_preview(preview):
-                await destination.send(page)
-            board_cfg_conf = settings.board_for_channel(submission.channel_id)
-            msg = await destination.send(
-                replies.confirmation_request(
-                    bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
-                    youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
-                ),
-                view=views.make_confirm_view(submission.id),
-            )
-            session.add(ConfirmationRequest(
-                submission_id=submission.id,
-                bot_message_id=msg.id,
-            ))
+            try:
+                preview = await _build_post_preview(session, submission, atts, links)
+                for page in replies.format_post_preview(preview):
+                    await destination.send(page)
+                board_cfg_conf = settings.board_for_channel(submission.channel_id)
+                msg = await destination.send(
+                    replies.confirmation_request(
+                        bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                        youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+                    ),
+                    view=views.make_confirm_view(submission.id),
+                )
+                session.add(ConfirmationRequest(
+                    submission_id=submission.id,
+                    bot_message_id=msg.id,
+                ))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post confirmation request for submission %s: %s", submission.id, exc)
 
     # When a reply updates an already-queued submission and all pending alt-text gaps
     # are now resolved, confirm the update and re-schedule thread archiving.
     if from_reply and old_state in _QUEUE_TERMINAL and Gap.ALT_TEXT not in gaps:
-        await destination.send(replies.updated_notice())
-        if isinstance(destination, discord.Thread):
-            _archive_thread_after_delay(destination, notice=replies.closing_notice("updated"))
+        try:
+            await destination.send(replies.updated_notice())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("could not post updated notice for submission %s: %s", submission.id, exc)
+        await destination.archive(replies.closing_notice("updated"))
 
     return new_state
 
@@ -2163,7 +2209,7 @@ async def publish_queued_submission(
     session: AsyncSession,
     settings: Settings,
     submission: Submission,
-    destination: discord.abc.Messageable | None,
+    destination: Notifier | None,
 ) -> bool:
     """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
 
@@ -2176,10 +2222,7 @@ async def publish_queued_submission(
     """
     _snap, atts, links = await _snapshot(session, submission)
     if destination is None:
-        class _DevNull:
-            async def send(self, *a, **kw):
-                pass
-        destination = _DevNull()  # type: ignore[assignment]
+        destination = NullNotifier()
     return await _attempt_publish(session, settings, submission, atts, links, destination)
 
 
@@ -2189,7 +2232,7 @@ async def _attempt_publish(
     submission: Submission,
     atts: list[Attachment],
     links: list[SubmissionLink],
-    destination: discord.abc.Messageable,
+    destination: Notifier,
 ) -> bool:
     """Publish to Bluesky and record the result.
 
@@ -2202,7 +2245,10 @@ async def _attempt_publish(
         log.warning("submission %s: %s", submission.id, err)
         submission.state = SubmissionState.PUBLISH_FAILED.value
         session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
-        await destination.send(replies.publish_failed_notice(err))
+        try:
+            await destination.send(replies.publish_failed_notice(err))
+        except Exception as exc:
+            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
         return True
 
     password = settings.bsky_password_for(board_cfg.name)
@@ -2211,7 +2257,10 @@ async def _attempt_publish(
         log.warning("submission %s: %s", submission.id, err)
         submission.state = SubmissionState.PUBLISH_FAILED.value
         session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
-        await destination.send(replies.publish_failed_notice(err))
+        try:
+            await destination.send(replies.publish_failed_notice(err))
+        except Exception as exc:
+            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
         return True
 
     parent_ref = await _resolve_parent_ref(session, submission)
@@ -2252,17 +2301,24 @@ async def _attempt_publish(
     if result.success and result.at_uri:
         submission.state = SubmissionState.PUBLISHED.value
         bsky_url = result.bsky_url or publisher.at_uri_to_url(result.at_uri)
-        if result.is_repost:
-            await destination.send(replies.reposted_notice(bsky_url))
-        else:
-            await destination.send(replies.published_notice(bsky_url))
         log.info("submission %s published: %s", submission.id, result.at_uri)
-        if isinstance(destination, discord.Thread):
-            _archive_thread_after_delay(destination, notice=replies.closing_notice("published to Bluesky"))
+        # Send Discord notice separately - failure here must NOT roll back the publish.
+        try:
+            if result.is_repost:
+                await destination.send(replies.reposted_notice(bsky_url))
+            else:
+                await destination.send(replies.published_notice(bsky_url))
+        except Exception as exc:
+            log.warning("submission %s: published to Bluesky but Discord notice failed: %s", submission.id, exc)
+        # Archive unconditionally - even if the notice send failed, close the thread.
+        await destination.archive(replies.closing_notice("published to Bluesky"))
     else:
         submission.state = SubmissionState.PUBLISH_FAILED.value
-        await destination.send(replies.publish_failed_notice(result.error))
         log.error("submission %s publish failed: %s", submission.id, result.error)
+        try:
+            await destination.send(replies.publish_failed_notice(result.error))
+        except Exception as exc:
+            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
     return True
 
 

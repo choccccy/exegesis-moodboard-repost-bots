@@ -38,6 +38,8 @@
     white-space: nowrap;
   }
   .stat-pill strong { color: #aaa; font-weight: 500; }
+  .stat-pill.warn { color: #f97316; }
+  .stat-pill.warn strong { color: #f97316; }
   .rate-limit-pill {
     font-size: 12px;
     font-weight: 600;
@@ -221,6 +223,7 @@
     <span class="stat-pill">queued <strong>{{ stats.total_queued }}</strong></span>
     <span class="stat-pill">pending <strong>{{ stats.total_pending }}</strong></span>
     <span class="stat-pill">today <strong>{{ stats.total_today }}</strong></span>
+    <span class="stat-pill{% if stats.active_thread_count >= stats.discord_thread_limit * 0.9 %} warn{% endif %}" title="Discord limit: {{ stats.discord_thread_limit }} active threads per server">threads <strong>{{ stats.active_thread_count }}/{{ stats.discord_thread_limit }}</strong></span>
     {% if stats.bot_started_at %}
       <span class="stat-pill">up {{ stats.bot_started_rel }}</span>
     {% endif %}

@@ -71,7 +71,8 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "pixiv":   ["pixiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
     "tumblr":  ["tumblr.com"],
-    "tiktok":  ["tiktok.com", "vm.tiktok.com", "m.tiktok.com", "kktiktok.com"],
+    "tiktok":      ["tiktok.com", "vm.tiktok.com", "m.tiktok.com", "kktiktok.com"],
+    "furaffinity": ["furaffinity.net"],
 }
 
 
@@ -183,6 +184,11 @@ def _canon_tiktok(scheme, host, path, query) -> tuple[str, str]:
     return urlunsplit(("https", host, path, "", "")), "tiktok"
 
 
+def _canon_furaffinity(scheme, host, path, query) -> tuple[str, str]:
+    # Strip query params; normalise to www.furaffinity.net.
+    return urlunsplit(("https", "www.furaffinity.net", path.rstrip("/"), "", "")), "furaffinity"
+
+
 _HANDLERS = {
     "bluesky": _canon_bluesky,
     "reddit": _canon_reddit,
@@ -196,6 +202,7 @@ _HANDLERS = {
     "flickr": _canon_flickr,
     "tumblr": _canon_tumblr,
     "tiktok": _canon_tiktok,
+    "furaffinity": _canon_furaffinity,
 }
 
 

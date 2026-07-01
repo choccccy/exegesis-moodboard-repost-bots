@@ -220,6 +220,9 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
             tweet = resp.json().get("tweet", {})
             if tweet:
                 photos = tweet.get("media", {}).get("photos", [])
+                if not photos:
+                    quoted = tweet.get("quote") or {}
+                    photos = quoted.get("media", {}).get("photos", [])
                 image_url = photos[0]["url"] if photos else None
                 return ResolvedMetadata(
                     title=tweet.get("text"),

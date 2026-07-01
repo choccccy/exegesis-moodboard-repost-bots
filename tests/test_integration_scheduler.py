@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from bot.discord_ingest.discord_notifier import DiscordNotifier
 from bot.models import PublishAttempt, SubmissionThread
 from bot.scheduler import _fire_board
 from bot.state import SubmissionState
@@ -96,7 +97,8 @@ async def test_fire_board_with_thread_fetches_channel(session, board):
 
     bot.fetch_channel.assert_awaited_once_with(9999)
     _, _, _, destination = mock_pub.await_args.args
-    assert destination is fake_channel
+    assert isinstance(destination, DiscordNotifier)
+    assert destination._channel is fake_channel
 
 
 async def test_fire_board_thread_fetch_failure_still_publishes(session, board):

@@ -193,6 +193,33 @@ class RepostBot(discord.Client):
         if interaction.type != discord.InteractionType.component:
             return
         custom_id: str = (interaction.data or {}).get("custom_id", "")
+
+        # The edit button's initial response IS the modal — defer() is not allowed first.
+        # All other buttons defer immediately before any DB work so we stay within
+        # Discord's 3-second acknowledgement window even when the bot is rate-limited.
+        if custom_id.startswith("edit:"):
+            async with session_scope() as session:
+                await service.handle_edit_button(
+                    session, interaction, int(custom_id.removeprefix("edit:")), self.settings
+                )
+            return
+
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            log.warning("on_interaction: interaction %s expired before defer", interaction.id)
+            # The interaction token is dead so we can't send an ephemeral.
+            # Fall back to a plain channel message so the user knows to retry.
+            try:
+                channel = interaction.channel
+                if channel is not None:
+                    await channel.send(
+                        f"{interaction.user.mention} I'm overloaded right now - please try again in a moment.",
+                    )
+            except Exception:
+                pass
+            return
+
         async with session_scope() as session:
             if custom_id.startswith("cancel:"):
                 await service.handle_cancel_button(
@@ -218,12 +245,6 @@ class RepostBot(discord.Client):
                     session, interaction, int(custom_id.removeprefix("pl_skip:")),
                     self.settings, self._yt_client,
                 )
-            elif custom_id.startswith("edit:"):
-                await service.handle_edit_button(
-                    session, interaction, int(custom_id.removeprefix("edit:")), self.settings
-                )
-            else:
-                await interaction.response.defer()
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == getattr(self.user, "id", None):

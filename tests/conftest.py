@@ -62,3 +62,6 @@ class MockDest:
         msg.id = next(_msg_id)
         msg.add_reaction = AsyncMock()
         return msg
+
+    async def archive(self, notice: str) -> None:
+        self.sent.append(f"[archive] {notice}")

@@ -554,11 +554,16 @@ class ScanInfo:
     started_rel: str
 
 
+_DISCORD_THREAD_LIMIT = 1000  # active threads per guild
+
+
 @dataclass
 class GlobalStats:
     total_queued: int
     total_pending: int
     total_today: int
+    active_thread_count: int
+    discord_thread_limit: int
     rate_limited_until: datetime | None  # None = not currently rate limited
     rate_limited_route: str | None
     rate_limited_recently: bool          # True if rate limited within past 2 min (may have already cleared)
@@ -589,6 +594,17 @@ async def global_stats(
 
     total_pending = await session.scalar(
         select(func.count()).select_from(Submission).where(Submission.state.in_(_PENDING_STATES))
+    ) or 0
+
+    active_thread_count = await session.scalar(
+        select(func.count())
+        .select_from(SubmissionThread)
+        .join(
+            Submission,
+            (SubmissionThread.board_id == Submission.board_id)
+            & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
+        )
+        .where(Submission.state != SubmissionState.PUBLISHED.value)
     ) or 0
 
     today_rows = await session.scalars(select(Board))
@@ -635,6 +651,8 @@ async def global_stats(
         total_queued=total_queued,
         total_pending=total_pending,
         total_today=total_today,
+        active_thread_count=active_thread_count,
+        discord_thread_limit=_DISCORD_THREAD_LIMIT,
         rate_limited_until=rate_limited_until,
         rate_limited_route=rate_limited_route,
         rate_limited_recently=rate_limited_recently,

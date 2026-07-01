@@ -13,6 +13,7 @@ from ..asset_store import has_free_space
 from ..config import BoardConfig, Settings
 from ..db import session_scope
 from ..discord_ingest import service as ingest_service
+from ..discord_ingest.discord_notifier import DiscordNotifier
 from .. import errors as errors_module
 from ..models import Board, Submission, SubmissionThread
 from .. import queue as queue_module
@@ -139,7 +140,8 @@ async def _fire_board(
         )
         if thread_row is not None:
             try:
-                destination = await bot.fetch_channel(thread_row.thread_id)
+                channel = await bot.fetch_channel(thread_row.thread_id)
+                destination = DiscordNotifier(channel)
             except Exception as exc:
                 log.warning(
                     "queue: could not resolve thread for submission %s: %s - publishing silently",
