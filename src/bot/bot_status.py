@@ -54,6 +54,12 @@ def _record_rate_limit(retry_after: float, route: str) -> None:
     _write()
 
 
+def record_thread_count(active: int) -> None:
+    """Write the current Discord active-thread count, as reported by the API."""
+    _status["discord_active_threads"] = active
+    _write()
+
+
 def scan_started(channel_id: int, channel_name: str, scan_type: str = "catchup") -> None:
     """Record that a channel scan is now active (catchup or /scan)."""
     scans: list = _status.setdefault("active_scans", [])

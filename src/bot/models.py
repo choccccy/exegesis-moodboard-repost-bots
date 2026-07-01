@@ -289,6 +289,7 @@ class SubmissionThread(Base):
     source_discord_message_id: Mapped[int] = mapped_column(BigInteger, index=True)
     thread_id: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Curator(Base):

@@ -185,6 +185,30 @@ async def test_resolve_twitter_fxtwitter_api_returns_image():
 
 
 @pytest.mark.asyncio
+async def test_resolve_twitter_fxtwitter_api_gif_uses_thumbnail():
+    client = AsyncMock()
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "lol look at this",
+            "author": {"name": "SussySpongey"},
+            "media": {
+                "videos": [{
+                    "url": "https://video.twimg.com/tweet_video/G7lhWQHXAAEfxeK.mp4",
+                    "thumbnail_url": "https://pbs.twimg.com/tweet_video_thumb/G7lhWQHXAAEfxeK.jpg",
+                    "type": "gif",
+                }]
+            },
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/i/status/1997734955288612915", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/tweet_video_thumb/G7lhWQHXAAEfxeK.jpg"
+    assert result.via == "fxtwitter_api"
+
+
+@pytest.mark.asyncio
 async def test_resolve_twitter_fxtwitter_api_qrt_uses_quoted_image():
     client = AsyncMock()
     api_resp = MagicMock()
@@ -251,16 +275,121 @@ async def test_resolve_instagram_uses_oembed():
 
 
 
+def _reddit_api_response(post_data: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json = MagicMock(return_value=[{"data": {"children": [{"data": post_data}]}}])
+    return resp
+
+
 @pytest.mark.asyncio
-async def test_resolve_reddit_uses_vxreddit_mirror():
+async def test_resolve_reddit_json_api_direct_image():
     client = AsyncMock()
-    client.get.return_value = _html_response("A Reddit post")
+    client.get.return_value = _reddit_api_response({
+        "title": "A cool car",
+        "subreddit_name_prefixed": "r/WeirdWheels",
+        "url": "https://i.redd.it/abc123.jpg",
+        "crosspost_parent_list": [],
+    })
+    result = await resolve("https://www.reddit.com/r/WeirdWheels/comments/abc/cool_car/", "reddit", client=client)
+    assert result.title == "A cool car"
+    assert result.image_url == "https://i.redd.it/abc123.jpg"
+    assert result.via == "reddit_api"
+    assert "reddit.com" in client.get.call_args[0][0]
+    assert client.get.call_args[0][0].endswith(".json?limit=1")
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_json_api_crosspost_uses_parent_image():
+    """Crossposts have no direct image; the original post's image is in crosspost_parent_list."""
+    client = AsyncMock()
+    client.get.return_value = _reddit_api_response({
+        "title": "German Land Rover enthusiasts",
+        "subreddit_name_prefixed": "r/WeirdWheels",
+        "url": "https://www.reddit.com/r/LandRover/comments/original/",
+        "crosspost_parent_list": [{
+            "url": "https://i.redd.it/the_real_image.jpg",
+            "preview": {},
+        }],
+    })
+    result = await resolve(
+        "https://www.reddit.com/r/WeirdWheels/comments/1ps0nb9/german_land_rover_enthusiasts/",
+        "reddit",
+        client=client,
+    )
+    assert result.title == "German Land Rover enthusiasts"
+    assert result.image_url == "https://i.redd.it/the_real_image.jpg"
+    assert result.via == "reddit_api"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_api_failure_falls_to_vxreddit_mirror():
+    client = AsyncMock()
+    # JSON API fails; vxreddit mirror succeeds.
+    client.get.side_effect = [_error_response(429), _html_response("A Reddit post")]
     result = await resolve(
         "https://www.reddit.com/r/art/comments/abc/title/", "reddit", client=client
     )
     assert result.title == "A Reddit post"
-    call_url = client.get.call_args[0][0]
-    assert "vxreddit.com" in call_url
+    assert client.get.call_count == 2  # noqa: PLR2004
+    mirror_url = client.get.call_args_list[1][0][0]
+    assert "vxreddit.com" in mirror_url
+
+
+def _wikipedia_api_response(title, description, image_url=None) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    data = {"title": title, "description": description}
+    if image_url:
+        data["originalimage"] = {"source": image_url, "width": 1280, "height": 720}
+    resp.json = MagicMock(return_value=data)
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_uses_rest_api():
+    client = AsyncMock()
+    client.get.return_value = _wikipedia_api_response(
+        "Oshkosh NGDV",
+        "2020s replacement for the US Postal Service's local delivery fleet",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg/1280px-USPS.jpg",
+    )
+    result = await resolve(
+        "https://en.wikipedia.org/wiki/Oshkosh_NGDV", "wikipedia", client=client
+    )
+    assert result.title == "Oshkosh NGDV"
+    assert result.image_url == "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg/1280px-USPS.jpg"
+    assert result.via == "wikipedia_api"
+    api_url = client.get.call_args[0][0]
+    assert "en.wikipedia.org/api/rest_v1/page/summary/Oshkosh_NGDV" in api_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_no_image_returns_title_only():
+    client = AsyncMock()
+    client.get.return_value = _wikipedia_api_response(
+        "Halting problem",
+        "Undecidable problem in computability theory",
+    )
+    result = await resolve(
+        "https://en.wikipedia.org/wiki/Halting_problem", "wikipedia", client=client
+    )
+    assert result.title == "Halting problem"
+    assert result.image_url is None
+    assert result.via == "wikipedia_api"
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_api_failure_falls_to_opengraph():
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(503), _html_response("Halting problem")]
+    result = await resolve(
+        "https://en.wikipedia.org/wiki/Halting_problem", "wikipedia", client=client
+    )
+    assert result.title == "Halting problem"
+    assert client.get.call_count == 2  # noqa: PLR2004
+    # Second call should be the direct OpenGraph fetch
+    assert "en.wikipedia.org/wiki/Halting_problem" in client.get.call_args_list[1][0][0]
 
 
 @pytest.mark.asyncio

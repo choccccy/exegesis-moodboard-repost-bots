@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import discord
 from sqlalchemy import select
 
 from ..asset_store import has_free_space
@@ -15,12 +16,168 @@ from ..db import session_scope
 from ..discord_ingest import service as ingest_service
 from ..discord_ingest.discord_notifier import DiscordNotifier
 from .. import errors as errors_module
-from ..models import Board, Submission, SubmissionThread
+from ..models import Board, Submission, SubmissionThread, YoutubePlaylistAdd
+from ..state import SubmissionState
 from .. import queue as queue_module
 
 log = logging.getLogger(__name__)
 
 _HEARTBEAT_SECONDS = 300
+_THREAD_CLEANUP_INTERVAL = 300   # seconds between cleanup runs
+_THREAD_CLEANUP_BATCH = 50       # threads to inspect per run
+
+# States where the Discord thread should be closed.
+_CLOSED_STATES = (
+    SubmissionState.PUBLISHED.value,
+    SubmissionState.QUEUED.value,
+    SubmissionState.PUBLISH_FAILED.value,
+)
+
+
+async def _archive_stale_threads(bot, session) -> int:
+    """Archive Discord threads for submissions that are closed on our side.
+
+    Published and queued submissions should have archived threads; if they
+    don't (archive call failed, historical accumulation, etc.) we close them
+    here in batches to keep the guild's active-thread count in check.
+    Returns the number of threads successfully archived this run.
+    """
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc)
+
+    rows = (await session.scalars(
+        select(SubmissionThread)
+        .join(
+            Submission,
+            (SubmissionThread.board_id == Submission.board_id)
+            & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
+        )
+        .where(
+            Submission.state.in_(_CLOSED_STATES),
+            SubmissionThread.archived_at.is_(None),
+        )
+        .limit(_THREAD_CLEANUP_BATCH)
+    )).all()
+
+    archived = 0
+    for row in rows:
+        try:
+            channel = await bot.fetch_channel(row.thread_id)
+        except Exception as exc:
+            log.debug("thread cleanup: could not fetch %s: %s", row.thread_id, exc)
+            continue
+        if not isinstance(channel, discord.Thread):
+            # Not a thread (e.g. already deleted); mark done so we don't retry.
+            row.archived_at = now
+            continue
+        if channel.archived:
+            row.archived_at = now
+            continue
+        try:
+            await channel.edit(archived=True)
+            row.archived_at = now
+            archived += 1
+            log.info("thread cleanup: archived thread %s", row.thread_id)
+        except Exception as exc:
+            log.warning("thread cleanup: failed to archive thread %s: %s", row.thread_id, exc)
+
+    return archived
+
+
+async def _record_discord_thread_count(bot) -> None:
+    """Fetch the real active-thread count from Discord and write it to bot_status."""
+    from ..bot_status import record_thread_count
+    total = 0
+    for guild in bot.guilds:
+        try:
+            result = await guild.fetch_active_threads()
+            total += len(result.threads)
+        except Exception as exc:
+            log.warning("thread cleanup: could not fetch active threads for guild %s: %s", guild.id, exc)
+    record_thread_count(total)
+    log.debug("thread cleanup: Discord reports %d active threads across %d guild(s)", total, len(bot.guilds))
+
+
+async def run_thread_cleanup(bot, stop: asyncio.Event) -> None:
+    """Periodically archive Discord threads for closed submissions and record the real count."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_THREAD_CLEANUP_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            async with session_scope() as session:
+                n = await _archive_stale_threads(bot, session)
+                if n:
+                    log.info("thread cleanup: archived %d stale threads this run", n)
+        except Exception:
+            log.exception("thread cleanup run failed")
+        try:
+            await _record_discord_thread_count(bot)
+        except Exception:
+            log.exception("thread cleanup: failed to record Discord thread count")
+
+
+async def _retry_failed_playlist_adds(yt_client, session) -> int:
+    """Retry YoutubePlaylistAdd rows that failed and have no subsequent success.
+
+    Updates the existing row in place so the dashboard reflects the outcome
+    without accumulating duplicate records.
+    """
+    from sqlalchemy.orm import aliased
+    SuccessPA = aliased(YoutubePlaylistAdd)
+    # Find failed rows for which no successful row exists for the same (board_id, video_id).
+    success_exists = (
+        select(SuccessPA.id)
+        .where(
+            SuccessPA.board_id == YoutubePlaylistAdd.board_id,
+            SuccessPA.video_id == YoutubePlaylistAdd.video_id,
+            SuccessPA.success.is_(True),
+        )
+        .correlate(YoutubePlaylistAdd)
+        .exists()
+    )
+    failed_rows = (await session.scalars(
+        select(YoutubePlaylistAdd)
+        .where(YoutubePlaylistAdd.success.is_(False), ~success_exists)
+        .limit(50)
+    )).all()
+
+    loop = asyncio.get_running_loop()
+    recovered = 0
+    for row in failed_rows:
+        try:
+            item_id = await loop.run_in_executor(
+                None, yt_client.add_to_playlist, row.playlist_id, row.video_id
+            )
+            row.success = True
+            row.playlist_item_id = item_id
+            row.error_message = None
+            recovered += 1
+            log.info("playlist retry: added video %s to %s", row.video_id, row.playlist_id)
+        except Exception as exc:
+            row.error_message = str(exc)
+            log.warning("playlist retry: still failing for video %s: %s", row.video_id, exc)
+    return recovered
+
+
+async def run_playlist_retry(yt_client, stop: asyncio.Event) -> None:
+    """Once per hour, retry any failed playlist adds that haven't since succeeded."""
+    _RETRY_INTERVAL = 3600
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_RETRY_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            async with session_scope() as session:
+                n = await _retry_failed_playlist_adds(yt_client, session)
+                if n:
+                    log.info("playlist retry: recovered %d failed add(s)", n)
+        except Exception:
+            log.exception("playlist retry run failed")
 
 
 async def run_housekeeping(settings: Settings, stop: asyncio.Event) -> None:

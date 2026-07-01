@@ -68,6 +68,11 @@ from .urls import extract_urls
 
 log = logging.getLogger(__name__)
 
+# Keyed by Discord message ID. Prevents two concurrent handle_reaction calls for
+# the same message from both seeing submission=None, both posting anchor pings,
+# and then one failing the unique constraint after the ping is already sent.
+_message_processing_locks: dict[int, asyncio.Lock] = {}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -278,79 +283,81 @@ async def handle_reaction(
         if not _is_curator(member, user_id, board_cfg):
             return False
 
-    submission = await session.scalar(
-        select(Submission).where(
-            Submission.board_id == board.id,
-            Submission.source_discord_message_id == message.id,
+    async with _message_processing_locks.setdefault(message.id, asyncio.Lock()):
+        submission = await session.scalar(
+            select(Submission).where(
+                Submission.board_id == board.id,
+                Submission.source_discord_message_id == message.id,
+            )
         )
-    )
-    created = submission is None
-    if created:
-        cfg = settings.board_for_channel(message.channel.id)
-        submission = Submission(
-            board_id=board.id,
-            source_discord_message_id=message.id,
-            channel_id=message.channel.id,
-            author_id=message.author.id,
-            author_display=getattr(message.author, "display_name", str(message.author)),
-            state=SubmissionState.INTENT_SUBMITTED.value,
-            graphic_classification_required=(
-                cfg.require_graphic_classification if cfg else True
-            ),
-            source_posted_at=message.created_at,
-            reply_to_discord_message_id=(
-                message.reference.message_id if message.reference else None
-            ),
-        )
-        session.add(submission)
-        await session.flush()  # assign submission.id
-        thumb_proxy_url = await _ingest_content(session, submission, message, settings, http_client)
-        await _resolve_links(session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url)
-        log.info("created submission %s for message %s", submission.id, message.id)
+        created = submission is None
+        if created:
+            cfg = settings.board_for_channel(message.channel.id)
+            submission = Submission(
+                board_id=board.id,
+                source_discord_message_id=message.id,
+                channel_id=message.channel.id,
+                author_id=message.author.id,
+                author_display=getattr(message.author, "display_name", str(message.author)),
+                state=SubmissionState.INTENT_SUBMITTED.value,
+                graphic_classification_required=(
+                    cfg.require_graphic_classification if cfg else True
+                ),
+                source_posted_at=message.created_at,
+                reply_to_discord_message_id=(
+                    message.reference.message_id if message.reference else None
+                ),
+            )
+            session.add(submission)
+            await session.flush()  # assign submission.id
+            thumb_proxy_url = await _ingest_content(session, submission, message, settings, http_client)
+            await _resolve_links(session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url)
+            log.info("created submission %s for message %s", submission.id, message.id)
 
-    thread, new_thread = await _ensure_thread(session, settings, message, submission, post_anchor=created, bot_id=bot_id)
-    if thread is None:
-        log.warning("could not create/resolve thread for submission %s", submission.id)
-        return False
+        thread, new_thread = await _ensure_thread(session, settings, message, submission, post_anchor=created, bot_id=bot_id)
+        if thread is None:
+            log.warning("could not create/resolve thread for submission %s", submission.id)
+            return False
 
-    if created:
-        guild_id = message.guild.id if message.guild else 0
-        links = list(await session.scalars(
-            select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
-        ))
-        for link in links:
-            dup = await _find_duplicate(session, link.canonical_url, submission.id, guild_id)
-            if dup is not None:
-                kind, ref_url = dup
-                if kind == "published":
-                    notice = replies.duplicate_posted(ref_url)
-                elif kind == "queued":
-                    notice = replies.duplicate_queued(ref_url)
-                else:
-                    notice = replies.duplicate_pending(ref_url)
-                await thread.send(notice)
-                log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
-                # Clean up the new submission - the thread stays as a record of the notice.
-                sub_id = submission.id
-                board = await session.get(Board, submission.board_id)
-                remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-                for model in (
-                    SourceRequest, AttachmentAltTextRequest, ContentLabelRequest,
-                    ImageRequest, MetadataRequest, SupplementalImageRequest,
-                    SupplementalLinkRequest, CancellationRequest, ConfirmationRequest,
-                    PublishAttempt, SubmissionLink, Attachment,
-                ):
-                    await session.execute(delete(model).where(model.submission_id == sub_id))
-                await session.execute(delete(Submission).where(Submission.id == sub_id))
-                # Remove butterfly so future scans skip this post.
-                await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
-                _fire_and_forget(_archive_thread_after_delay_seconds(
-                    thread, _THREAD_CLOSE_DELAY, notice=replies.closing_notice("duplicate")
-                ))
-                return False
+        if created:
+            guild_id = message.guild.id if message.guild else 0
+            links = list(await session.scalars(
+                select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
+            ))
+            for link in links:
+                dup = await _find_duplicate(session, link.canonical_url, submission.id, guild_id)
+                if dup is not None:
+                    kind, ref_url = dup
+                    if kind == "published":
+                        notice = replies.duplicate_posted(ref_url)
+                    elif kind == "queued":
+                        notice = replies.duplicate_queued(ref_url)
+                    else:
+                        notice = replies.duplicate_pending(ref_url)
+                    await thread.send(notice)
+                    log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
+                    # Clean up the new submission - the thread stays as a record of the notice.
+                    sub_id = submission.id
+                    board = await session.get(Board, submission.board_id)
+                    remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+                    for model in (
+                        SourceRequest, AttachmentAltTextRequest, ContentLabelRequest,
+                        ImageRequest, MetadataRequest, SupplementalImageRequest,
+                        SupplementalLinkRequest, CancellationRequest, ConfirmationRequest,
+                        PublishAttempt, SubmissionLink, Attachment,
+                    ):
+                        await session.execute(delete(model).where(model.submission_id == sub_id))
+                    await session.execute(delete(Submission).where(Submission.id == sub_id))
+                    # Remove butterfly so future scans skip this post.
+                    await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
+                    # Archive immediately - the notice above already says "Closing this thread."
+                    # A fire-and-forget delay would be lost on bot restart, and the submission
+                    # row is gone so the cleanup scheduler can't recover it either.
+                    await _archive_thread(thread)
+                    return False
 
-    await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id)
-    return new_thread
+        await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id)
+        return new_thread
 
 
 async def _ensure_thread(

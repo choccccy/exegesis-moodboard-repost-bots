@@ -554,7 +554,7 @@ class ScanInfo:
     started_rel: str
 
 
-_DISCORD_THREAD_LIMIT = 1000  # active threads per guild
+_DISCORD_THREAD_LIMIT = 1000  # active threads per guild; not exposed by Discord API
 
 
 @dataclass
@@ -596,15 +596,12 @@ async def global_stats(
         select(func.count()).select_from(Submission).where(Submission.state.in_(_PENDING_STATES))
     ) or 0
 
-    active_thread_count = await session.scalar(
+    # Prefer the Discord-fetched count written by the cleanup scheduler; fall back
+    # to our DB approximation (threads not yet confirmed archived) if not yet available.
+    db_thread_count = await session.scalar(
         select(func.count())
         .select_from(SubmissionThread)
-        .join(
-            Submission,
-            (SubmissionThread.board_id == Submission.board_id)
-            & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
-        )
-        .where(Submission.state != SubmissionState.PUBLISHED.value)
+        .where(SubmissionThread.archived_at.is_(None))
     ) or 0
 
     today_rows = await session.scalars(select(Board))
@@ -614,6 +611,9 @@ async def global_stats(
         total_today += await count_posts_today(session, board.id, mt_midnight)
 
     status = read_bot_status(data_dir)
+    discord_thread_count = status.get("discord_active_threads")
+    active_thread_count = discord_thread_count if discord_thread_count is not None else db_thread_count
+
     rl = status.get("rate_limit") or {}
     rate_limited_until: datetime | None = None
     rate_limited_route: str | None = None

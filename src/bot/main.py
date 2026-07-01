@@ -10,7 +10,7 @@ from .config import get_settings
 from .db import dispose_engine, init_engine
 from .discord_ingest import RepostBot
 from .logging_setup import configure_logging
-from .scheduler import run_housekeeping, run_queue_dispatcher
+from .scheduler import run_housekeeping, run_queue_dispatcher, run_thread_cleanup, run_playlist_retry
 from .youtube import YouTubeClient
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,8 @@ async def amain() -> None:
     stop = asyncio.Event()
     housekeeping = asyncio.create_task(run_housekeeping(settings, stop))
     queue_dispatcher = asyncio.create_task(run_queue_dispatcher(bot, settings, stop))
+    thread_cleanup = asyncio.create_task(run_thread_cleanup(bot, stop))
+    playlist_retry = asyncio.create_task(run_playlist_retry(yt_client, stop)) if yt_client else None
 
     try:
         await bot.start(settings.discord_bot_token)
@@ -47,6 +49,9 @@ async def amain() -> None:
         stop.set()
         housekeeping.cancel()
         queue_dispatcher.cancel()
+        thread_cleanup.cancel()
+        if playlist_retry:
+            playlist_retry.cancel()
         if not bot.is_closed():
             await bot.close()
         await dispose_engine()

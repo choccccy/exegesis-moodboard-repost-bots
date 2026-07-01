@@ -197,6 +197,22 @@ async def _tumblr_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     )
 
 
+def _fxtwitter_image(tweet: dict) -> str | None:
+    """Return the best available static image URL from an fxtwitter tweet dict.
+
+    Photos: use the direct URL. Videos and GIFs: use thumbnail_url, which is a
+    JPEG still that Bluesky can embed (the actual video can't be uploaded anyway).
+    """
+    media = tweet.get("media") or {}
+    photos = media.get("photos") or []
+    if photos:
+        return photos[0].get("url")
+    videos = media.get("videos") or []
+    if videos:
+        return videos[0].get("thumbnail_url")
+    return None
+
+
 async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
     """Resolve Twitter/X metadata via the fxtwitter JSON API, with vxtwitter fallback.
 
@@ -219,11 +235,9 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
         if resp.status_code == 200:
             tweet = resp.json().get("tweet", {})
             if tweet:
-                photos = tweet.get("media", {}).get("photos", [])
-                if not photos:
-                    quoted = tweet.get("quote") or {}
-                    photos = quoted.get("media", {}).get("photos", [])
-                image_url = photos[0]["url"] if photos else None
+                image_url = _fxtwitter_image(tweet)
+                if not image_url:
+                    image_url = _fxtwitter_image(tweet.get("quote") or {})
                 return ResolvedMetadata(
                     title=tweet.get("text"),
                     description=tweet.get("author", {}).get("name"),
@@ -289,6 +303,109 @@ async def _tiktok_tikwm(url: str, client: httpx.AsyncClient) -> ResolvedMetadata
     )
 
 
+async def _wikipedia_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Resolve metadata via the Wikipedia REST API summary endpoint.
+
+    Preferred over raw HTML scraping: the REST API is documented for programmatic
+    use, more lenient on datacenter IPs, and returns structured thumbnail data
+    without HTML parsing.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    parts = parsed.path.split("/wiki/", 1)
+    if len(parts) < 2 or not parts[1]:
+        return None
+    title = parts[1].rstrip("/")
+    api_url = f"https://{parsed.netloc}/api/rest_v1/page/summary/{title}"
+    headers = {**_HEADERS, "Accept": "application/json"}
+    try:
+        resp = await client.get(api_url, headers=headers, timeout=_FETCH_TIMEOUT)
+    except httpx.HTTPError as exc:
+        log.info("wikipedia api request failed for %s: %s", url, exc)
+        return None
+    if resp.status_code != 200:
+        log.info("wikipedia api returned %d for %s", resp.status_code, url)
+        return None
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        log.info("wikipedia api parse error for %s: %s", url, exc)
+        return None
+    image_url = (data.get("originalimage") or data.get("thumbnail") or {}).get("source")
+    return ResolvedMetadata(
+        title=data.get("title"),
+        description=data.get("description"),
+        image_url=image_url,
+        via="wikipedia_api",
+    )
+
+
+def _reddit_image_url(post: dict) -> str | None:
+    """Extract the best available image URL from a Reddit post data dict."""
+    url = post.get("url", "")
+    if url and any(url.startswith(p) for p in ("https://i.redd.it/", "https://preview.redd.it/")):
+        return url
+    if url and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
+        return url
+    # Preview images exist for most post types (link posts, crossposts, etc.)
+    # Reddit HTML-encodes & as &amp; inside the JSON strings.
+    try:
+        source = post["preview"]["images"][0]["source"]
+        img = source.get("url", "").replace("&amp;", "&")
+        if img:
+            return img
+    except (KeyError, IndexError):
+        pass
+    return None
+
+
+async def _reddit_json_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Fetch Reddit post metadata via the JSON API.
+
+    Handles crossposts (Reddit reposts) by falling through to
+    crosspost_parent_list[0] when the outer post has no direct image.
+    The vxreddit OpenGraph mirror only sees the crosspost wrapper and
+    returns a low-res thumbnail; the JSON API returns the original image.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    # Build .json endpoint; limit=1 skips loading all comments.
+    json_url = f"https://www.reddit.com{parsed.path.rstrip('/')}.json?limit=1"
+    headers = {**_HEADERS, "Accept": "application/json"}
+    try:
+        resp = await client.get(json_url, headers=headers, timeout=_FETCH_TIMEOUT)
+    except httpx.HTTPError as exc:
+        log.info("reddit json api request failed for %s: %s", url, exc)
+        return None
+    if resp.status_code != 200:
+        log.info("reddit json api returned %d for %s", resp.status_code, url)
+        return None
+    try:
+        data = resp.json()
+        post = data[0]["data"]["children"][0]["data"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        log.info("reddit json api unexpected shape for %s: %s", url, exc)
+        return None
+
+    title = post.get("title")
+    subreddit = post.get("subreddit_name_prefixed")
+
+    # Try to get an image from the post itself first.
+    image_url = _reddit_image_url(post)
+
+    # For crossposts, fall through to the original post's images.
+    if not image_url and post.get("crosspost_parent_list"):
+        parent = post["crosspost_parent_list"][0]
+        image_url = _reddit_image_url(parent)
+
+    return ResolvedMetadata(
+        title=title,
+        description=subreddit,
+        image_url=image_url,
+        via="reddit_api",
+    )
+
+
 def _twitter_mirror_url(url: str) -> str:
     return url.replace("https://twitter.com/", "https://fxtwitter.com/", 1)
 
@@ -327,6 +444,8 @@ _OEMBED_HANDLERS = {
     "twitter": _twitter_fxtwitter_api,
     "instagram": _instagram_oembed,
     "tiktok": _tiktok_tikwm,
+    "reddit": _reddit_json_api,
+    "wikipedia": _wikipedia_api,
 }
 
 _MIRROR_URL_FUNCS = {
