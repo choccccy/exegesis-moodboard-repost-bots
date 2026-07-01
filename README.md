@@ -132,7 +132,40 @@ Examples:
 
 Multiple boards can share the same `discord_guild_id`; each must have a distinct `discord_channel_id`.
 
-### 4. Set up environment variables
+### 4. (Optional) Set up YouTube playlist integration
+
+If you want YouTube videos automatically added to a playlist when a submission is confirmed, you need OAuth2 credentials from Google Cloud.
+
+#### Create credentials
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (or reuse one)
+2. Enable the **YouTube Data API v3** under APIs & Services
+3. Go to **APIs & Services - OAuth consent screen**:
+   - Choose **External**
+   - Fill in app name and your email
+   - Add the scope `https://www.googleapis.com/auth/youtube`
+   - Under "Publishing status", click **Publish App** to set it to **Production** - this is important; Testing apps have tokens that expire after 7 days
+4. Go to **APIs & Services - Credentials - Create Credentials - OAuth client ID**:
+   - Application type: **Desktop app**
+   - Copy the client ID and client secret into your `op.env` / 1Password as `YOUTUBE_CLIENT_ID` and `YOUTUBE_CLIENT_SECRET`
+
+#### Obtain the refresh token
+
+With credentials in your environment, run:
+
+```bash
+op run --env-file=op.env -- uv run python -m bot.admin.reauth_youtube
+```
+
+This opens a browser for the Google sign-in flow. After approving access, the script prints a refresh token - copy it into 1Password as `YOUTUBE_REFRESH_TOKEN`.
+
+#### Re-authorizing
+
+If the refresh token is ever revoked (password change, manual revocation), re-run the same command above and update `YOUTUBE_REFRESH_TOKEN` in 1Password, then redeploy. The scheduler retries all failed playlist adds automatically within the hour.
+
+> **Note:** Keep the app in Production status. If it's in Testing, Google revokes tokens after 7 days regardless.
+
+### 5. Set up environment variables
 
 ```bash
 cp .env.example .env
