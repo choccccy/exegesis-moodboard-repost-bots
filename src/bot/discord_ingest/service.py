@@ -2275,6 +2275,43 @@ async def _attempt_publish(
         log.info("submission %s deferred: parent not yet published", submission.id)
         return False
 
+    # Guard against duplicates that slipped into the queue (e.g. from the old warning-only
+    # duplicate check that didn't reject queued-but-not-yet-published content).
+    for link in links:
+        prior_attempt = await session.scalar(
+            select(PublishAttempt)
+            .join(Submission, PublishAttempt.submission_id == Submission.id)
+            .join(SubmissionLink, SubmissionLink.submission_id == Submission.id)
+            .where(
+                SubmissionLink.canonical_url == link.canonical_url,
+                PublishAttempt.success.is_(True),
+                Submission.id != submission.id,
+            )
+            .order_by(PublishAttempt.id.desc())
+            .limit(1)
+        )
+        if prior_attempt is not None:
+            bsky_url = prior_attempt.bsky_url or prior_attempt.at_uri
+            log.warning("submission %s skipped at publish time - duplicate of %s", submission.id, bsky_url)
+            # Mark as PUBLISHED (not PUBLISH_FAILED) so it is not retried.
+            submission.state = SubmissionState.PUBLISHED.value
+            session.add(PublishAttempt(
+                submission_id=submission.id,
+                success=True,
+                at_uri=prior_attempt.at_uri,
+                at_cid=prior_attempt.at_cid,
+                bsky_root_uri=prior_attempt.bsky_root_uri,
+                bsky_root_cid=prior_attempt.bsky_root_cid,
+                bsky_url=prior_attempt.bsky_url,
+                error="duplicate: content already published by another submission",
+            ))
+            try:
+                await destination.send(replies.duplicate_posted(bsky_url))
+            except Exception as exc:
+                log.warning("submission %s: could not send duplicate notice: %s", submission.id, exc)
+            await destination.archive(replies.closing_notice("duplicate"))
+            return True
+
     reply_kwargs: dict = {}
     if parent_ref is not None:
         parent_uri, parent_cid, root_uri, root_cid = parent_ref
