@@ -60,7 +60,11 @@ async def count_posts_today(
     board_id: int,
     since_utc: datetime,
 ) -> int:
-    """Count successful publishes for this board on the current local day (since MT midnight)."""
+    """Count successful publishes for this board on the current local day (since MT midnight).
+
+    Excludes synthetic duplicate-suppression rows (which have a 'duplicate:' error message)
+    so they don't count against the daily cap.
+    """
     result = await session.scalar(
         select(func.count())
         .select_from(PublishAttempt)
@@ -69,6 +73,7 @@ async def count_posts_today(
             Submission.board_id == board_id,
             PublishAttempt.success.is_(True),
             PublishAttempt.attempted_at >= since_utc,
+            PublishAttempt.error.is_(None),
         )
     )
     return result or 0

@@ -73,6 +73,7 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "tumblr":  ["tumblr.com"],
     "tiktok":      ["tiktok.com", "vm.tiktok.com", "m.tiktok.com", "kktiktok.com"],
     "furaffinity": ["furaffinity.net"],
+    "substack": ["substack.com"],
 }
 
 
@@ -189,6 +190,11 @@ def _canon_furaffinity(scheme, host, path, query) -> tuple[str, str]:
     return urlunsplit(("https", "www.furaffinity.net", path.rstrip("/"), "", "")), "furaffinity"
 
 
+def _canon_substack(scheme, host, path, query) -> tuple[str, str]:
+    # Preserve the author subdomain (it's the blog identity) and strip query params.
+    return urlunsplit(("https", host, path.rstrip("/"), "", "")), "substack"
+
+
 _HANDLERS = {
     "bluesky": _canon_bluesky,
     "reddit": _canon_reddit,
@@ -203,6 +209,7 @@ _HANDLERS = {
     "tumblr": _canon_tumblr,
     "tiktok": _canon_tiktok,
     "furaffinity": _canon_furaffinity,
+    "substack": _canon_substack,
 }
 
 
