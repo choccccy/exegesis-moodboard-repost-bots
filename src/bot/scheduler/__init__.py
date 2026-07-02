@@ -266,16 +266,16 @@ async def _fire_board(
         return
 
     today_count = await queue_module.count_posts_today(session, board.id, mt_midnight)
-    fresh_available = await queue_module.has_fresh_queued(session, board.id, fresh_cutoff)
-    cap = queue_module.daily_cap(fresh_available, settings)
+    queue_size = await queue_module.count_queued_for_board(session, board.id)
+    cap = queue_module.daily_cap(queue_size, settings)
 
     if today_count >= cap:
-        log.info("queue: board %s at daily cap (%d/%d)", board_cfg.name, today_count, cap)
+        log.info("queue: board %s at daily cap (%d/%d, %d queued)", board_cfg.name, today_count, cap, queue_size)
         return
 
-    _MAX_DEFERRED_TRIES = 5
+    _MAX_SKIP_TRIES = 25
     skip_ids: set[int] = set()
-    for _ in range(_MAX_DEFERRED_TRIES):
+    for _ in range(_MAX_SKIP_TRIES):
         submission = await queue_module.pick_next_for_board(
             session, board.id, fresh_cutoff, skip_ids=frozenset(skip_ids)
         )
@@ -284,8 +284,8 @@ async def _fire_board(
             return
 
         log.info(
-            "queue: board %s publishing submission %s (%d/%d today)",
-            board_cfg.name, submission.id, today_count + 1, cap,
+            "queue: board %s publishing submission %s (%d/%d today, %d queued)",
+            board_cfg.name, submission.id, today_count + 1, cap, queue_size,
         )
 
         destination = None
@@ -306,12 +306,18 @@ async def _fire_board(
                 )
 
         attempted = await ingest_service.publish_queued_submission(session, settings, submission, destination)
-        if attempted:
-            return
+        if attempted is True:
+            return  # real publish attempt (success or failure) - done for this tick
         skip_ids.add(submission.id)
-        log.info(
-            "queue: board %s submission %s deferred (parent not published), trying next",
-            board_cfg.name, submission.id,
-        )
+        if attempted is None:
+            log.info(
+                "queue: board %s submission %s was a duplicate, trying next in queue",
+                board_cfg.name, submission.id,
+            )
+        else:
+            log.info(
+                "queue: board %s submission %s deferred (parent not published), trying next",
+                board_cfg.name, submission.id,
+            )
 
-    log.info("queue: board %s all %d candidates deferred", board_cfg.name, _MAX_DEFERRED_TRIES)
+    log.info("queue: board %s hit skip limit (%d) - deferreds/duplicates blocking queue", board_cfg.name, _MAX_SKIP_TRIES)

@@ -55,6 +55,19 @@ async def pick_next_for_board(
     return await session.scalar(stmt)
 
 
+async def count_queued_for_board(
+    session: AsyncSession,
+    board_id: int,
+) -> int:
+    """Count submissions currently waiting to be published (QUEUED or PUBLISH_FAILED)."""
+    _eligible = (SubmissionState.QUEUED.value, SubmissionState.PUBLISH_FAILED.value)
+    result = await session.scalar(
+        select(func.count()).select_from(Submission)
+        .where(Submission.board_id == board_id, Submission.state.in_(_eligible))
+    )
+    return result or 0
+
+
 async def count_posts_today(
     session: AsyncSession,
     board_id: int,
@@ -100,6 +113,11 @@ async def has_fresh_queued(
     return (result or 0) > 0
 
 
-def daily_cap(fresh_available: bool, settings: Settings) -> int:
-    """Return the daily post cap for this board given whether fresh content is available."""
-    return settings.queue_fresh_daily_cap if fresh_available else settings.queue_backlog_daily_cap
+def daily_cap(queue_size: int, settings: Settings) -> int:
+    """Return the daily post cap based on how many items are queued.
+
+    Targets draining the queue over approximately ``queue_target_days`` days,
+    clamped to [queue_min_daily, queue_max_daily].
+    """
+    raw = round(queue_size / settings.queue_target_days)
+    return max(settings.queue_min_daily, min(settings.queue_max_daily, raw))

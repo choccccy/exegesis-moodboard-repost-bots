@@ -27,8 +27,9 @@ _MT_MIDNIGHT = _NOW.replace(hour=0, minute=0, second=0)
 
 
 class _FakeSettings:
-    queue_fresh_daily_cap = 6
-    queue_backlog_daily_cap = 3
+    queue_target_days = 90
+    queue_min_daily = 1
+    queue_max_daily = 6
 
 
 def _board_cfg(board):
@@ -137,14 +138,14 @@ async def test_fire_board_at_daily_cap_skips_publish(session, board):
     session.add(sub)
     await session.flush()
 
-    # 6 successful publishes today = hits fresh cap
-    for i in range(6):
-        attempt = PublishAttempt(
-            submission_id=sub.id,
-            success=True,
-            attempted_at=_NOW - timedelta(minutes=i + 1),
-        )
-        session.add(attempt)
+    # 1 queued item → cap = max(1, round(1/90)) = 1.
+    # 1 successful publish today meets the cap, so the next tick should skip.
+    attempt = PublishAttempt(
+        submission_id=sub.id,
+        success=True,
+        attempted_at=_NOW - timedelta(minutes=1),
+    )
+    session.add(attempt)
     await session.flush()
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:

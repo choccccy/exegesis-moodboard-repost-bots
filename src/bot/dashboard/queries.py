@@ -25,7 +25,7 @@ from ..models import (
     YoutubePlaylistAdd,
 )
 from ..publish import at_uri_to_url
-from ..queue import count_posts_today, daily_cap, has_fresh_queued
+from ..queue import count_posts_today, count_queued_for_board, daily_cap, has_fresh_queued
 from ..state import SubmissionState
 from .settings import DashboardSettings
 
@@ -116,7 +116,8 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
 
         today_count = await count_posts_today(session, board.id, mt_midnight)
         fresh_available = await has_fresh_queued(session, board.id, fresh_cutoff)
-        cap = daily_cap(fresh_available, settings)
+        queue_size_for_cap = await count_queued_for_board(session, board.id)
+        cap = daily_cap(queue_size_for_cap, settings)
 
         last_attempt = await session.scalar(
             select(PublishAttempt)

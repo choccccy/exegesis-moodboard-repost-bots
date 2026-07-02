@@ -23,8 +23,9 @@ class DashboardSettings(BaseSettings):
 
     queue_timezone: str = Field("America/Denver", alias="QUEUE_TIMEZONE")
     queue_fresh_window_hours: int = Field(72, alias="QUEUE_FRESH_WINDOW_HOURS")
-    queue_fresh_daily_cap: int = Field(6, alias="QUEUE_FRESH_DAILY_CAP")
-    queue_backlog_daily_cap: int = Field(3, alias="QUEUE_BACKLOG_DAILY_CAP")
+    queue_target_days: int = Field(90, alias="QUEUE_TARGET_DAYS")
+    queue_min_daily: int = Field(1, alias="QUEUE_MIN_DAILY")
+    queue_max_daily: int = Field(6, alias="QUEUE_MAX_DAILY")
 
     @property
     def boards(self) -> list[BoardConfig]:

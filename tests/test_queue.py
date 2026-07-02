@@ -17,16 +17,28 @@ MT = ZoneInfo("America/Denver")
 
 
 class _FakeSettings:
-    queue_fresh_daily_cap = 6
-    queue_backlog_daily_cap = 3
+    queue_target_days = 90
+    queue_min_daily = 1
+    queue_max_daily = 6
 
 
-def test_daily_cap_when_fresh_available():
-    assert daily_cap(True, _FakeSettings()) == 6
+def test_daily_cap_floor():
+    assert daily_cap(0, _FakeSettings()) == 1
+    assert daily_cap(1, _FakeSettings()) == 1
 
 
-def test_daily_cap_when_only_backlog():
-    assert daily_cap(False, _FakeSettings()) == 3
+def test_daily_cap_ceiling():
+    assert daily_cap(1000, _FakeSettings()) == 6
+
+
+def test_daily_cap_midrange():
+    # 270 items / 90 days = 3/day
+    assert daily_cap(270, _FakeSettings()) == 3
+
+
+def test_daily_cap_rounding():
+    # 135 / 90 = 1.5 → rounds to 2
+    assert daily_cap(135, _FakeSettings()) == 2
 
 
 # ---------------------------------------------------------------------------

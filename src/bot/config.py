@@ -69,8 +69,11 @@ class Settings(BaseSettings):
     queue_timezone: str = Field("America/Denver", alias="QUEUE_TIMEZONE")
     queue_start_hour: int = Field(12, alias="QUEUE_START_HOUR")
     queue_fresh_window_hours: int = Field(72, alias="QUEUE_FRESH_WINDOW_HOURS")
-    queue_fresh_daily_cap: int = Field(6, alias="QUEUE_FRESH_DAILY_CAP")
-    queue_backlog_daily_cap: int = Field(3, alias="QUEUE_BACKLOG_DAILY_CAP")
+    # Dynamic cap: post roughly queue_size / queue_target_days times per day,
+    # clamped to [queue_min_daily, queue_max_daily].
+    queue_target_days: int = Field(90, alias="QUEUE_TARGET_DAYS")
+    queue_min_daily: int = Field(1, alias="QUEUE_MIN_DAILY")
+    queue_max_daily: int = Field(6, alias="QUEUE_MAX_DAILY")
 
     # Per-board Bluesky app passwords. Named BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>
     # where BOARD_NAME_UPPER is the board name uppercased with hyphens replaced by underscores.

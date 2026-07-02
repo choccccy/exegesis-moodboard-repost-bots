@@ -63,7 +63,9 @@ from ..state import (
     missing_gaps,
 )
 from ..notifier import NullNotifier, Notifier
+from ..ingest.types import InboundAttachment, InboundMessage
 from . import replies, views
+from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
 from .urls import extract_urls
 
 log = logging.getLogger(__name__)
@@ -310,7 +312,8 @@ async def handle_reaction(
             )
             session.add(submission)
             await session.flush()  # assign submission.id
-            thumb_proxy_url = await _ingest_content(session, submission, message, settings, http_client)
+            inbound = discord_message_to_inbound(message)
+            thumb_proxy_url = await _ingest_content(session, submission, inbound, settings, http_client)
             await _resolve_links(session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url)
             log.info("created submission %s for message %s", submission.id, message.id)
 
@@ -375,7 +378,8 @@ async def _ensure_thread(
     when False (catchup re-scan of an already-live submission).
     """
     # Derive the content title once - used for both the thread name and the anchor message.
-    content_title = await _derive_thread_title(session, message, submission)
+    inbound = discord_message_to_inbound(message)
+    content_title = await _derive_thread_title(session, inbound, submission)
     # Strip fallback sentinel ("🦋 submission N") before passing to anchor - title=None
     # tells the anchor to omit the 📌 line rather than show the generic placeholder.
     anchor_title: str | None = content_title if not content_title.startswith("🦋 submission") else None
@@ -492,12 +496,12 @@ async def _post_thread_anchor(
 
 
 async def _derive_thread_title(
-    session: AsyncSession, message: discord.Message, submission: Submission
+    session: AsyncSession, message: InboundMessage, submission: Submission
 ) -> str:
     """Name the thread after the resolved post title.
 
     Prefers the title our resolver produced (oembed/opengraph/etc.; resolution
-    runs before the thread is created), then the Discord-generated embed title,
+    runs before the thread is created), then the embed title or author name,
     then a generic fallback.
     """
     primary = await session.scalar(
@@ -508,11 +512,10 @@ async def _derive_thread_title(
     )
     candidates: list[str | None] = [primary.resolved_title if primary else None]
     for embed in message.embeds:
-        candidates.append(embed.title or (embed.author.name if embed.author else None))
+        candidates.append(embed.title or embed.author_name)
     for candidate in candidates:
         if candidate and candidate.strip():
             title = candidate.strip()
-            # Discord caps thread names at 100 chars.
             return title if len(title) <= 100 else title[:99] + "…"
     return replies.thread_name(submission.id)
 
@@ -1467,14 +1470,14 @@ async def _resolve_thread_by_id(
 async def _ingest_content(
     session: AsyncSession,
     submission: Submission,
-    message: discord.Message,
+    message: InboundMessage,
     settings: Settings,
     http_client: httpx.AsyncClient,
 ) -> str | None:
     """One-time parse of links + embed capture + attachment download.
 
-    Returns the Discord thumbnail proxy_url (if any) for use as a download
-    fallback in _resolve_links when the original URL requires site auth.
+    Returns the thumbnail proxy_url (if any) for use as a download fallback
+    in _resolve_links when the original URL requires site auth.
     """
     raw_urls = extract_urls(message.content)
     # Mobile share sheets send an embed URL without URL text in message.content.
@@ -1484,14 +1487,14 @@ async def _ingest_content(
             if embed.url and embed.url not in seen:
                 seen.add(embed.url)
                 raw_urls.append(embed.url)
-    # Forwarded messages (HAS_SNAPSHOT flag) store content/embeds in message_snapshots.
+    # Forwarded messages store content/embeds in snapshots.
     if not raw_urls:
-        for snap in getattr(message, 'message_snapshots', []):
-            snap_urls = extract_urls(getattr(snap, 'content', '') or '')
+        for snap in message.snapshots:
+            snap_urls = extract_urls(snap.content or "")
             if snap_urls:
                 raw_urls.extend(snap_urls)
                 break
-            for embed in getattr(snap, 'embeds', []):
+            for embed in snap.embeds:
                 if embed.url:
                     raw_urls.append(embed.url)
                     break
@@ -1512,34 +1515,29 @@ async def _ingest_content(
     thumb_proxy_url = _capture_embed(submission, message)
 
     all_attachments = list(message.attachments)
-    for snap in getattr(message, 'message_snapshots', []):
-        all_attachments.extend(getattr(snap, 'attachments', []))
+    for snap in message.snapshots:
+        all_attachments.extend(snap.attachments)
     for att in all_attachments:
         await _ingest_attachment(session, submission, att, settings, http_client)
 
     return thumb_proxy_url
 
 
-def _capture_embed(submission: Submission, message: discord.Message) -> str | None:
-    """Store the Discord-generated link embed's title/description/thumb.
+def _capture_embed(submission: Submission, message: InboundMessage) -> str | None:
+    """Store the link embed's title/description/thumb on the submission.
 
     Drives the external-embed preview and the at-least-one-image check. Embeds
-    populate a beat after posting, so this may be empty if 🦋 was very fast.
-    Also checks message_snapshots for forwarded messages.
+    may be absent if ingestion ran before Discord had time to generate them.
+    Also checks forwarded-message snapshots.
 
-    Returns the Discord proxy_url for the thumbnail if one exists, so callers
-    can use it as a download fallback when the original URL requires site auth.
+    Returns the thumbnail proxy_url (if any) as a download fallback for callers.
     """
     all_embeds = list(message.embeds)
-    for snap in getattr(message, 'message_snapshots', []):
-        all_embeds.extend(getattr(snap, 'embeds', []))
+    for snap in message.snapshots:
+        all_embeds.extend(snap.embeds)
     for embed in all_embeds:
-        thumb = (embed.thumbnail.url if embed.thumbnail else None) or (
-            embed.image.url if embed.image else None
-        )
-        thumb_proxy = (embed.thumbnail.proxy_url if embed.thumbnail else None) or (
-            embed.image.proxy_url if embed.image else None
-        ) or None
+        thumb = embed.thumbnail_url or embed.image_url
+        thumb_proxy = embed.thumbnail_proxy_url or embed.image_proxy_url or None
         if embed.title or embed.description or thumb:
             submission.embed_title = embed.title
             submission.embed_description = embed.description
@@ -1629,11 +1627,11 @@ async def _resolve_links(
 async def _ingest_attachment(
     session: AsyncSession,
     submission: Submission,
-    att: discord.Attachment,
+    att: InboundAttachment,
     settings: Settings,
     http_client: httpx.AsyncClient,
 ) -> Attachment:
-    """Persist one Discord attachment row and download its bytes to the volume."""
+    """Persist one attachment row and download its bytes to the volume."""
     is_img = is_image_attachment(att.content_type, att.filename)
     is_vid = is_video_attachment(att.content_type, att.filename)
     status, body = initial_alt_text(is_image=is_img, is_video=is_vid, discord_description=att.description)
@@ -1645,7 +1643,7 @@ async def _ingest_attachment(
         mime=att.content_type,
         width=att.width,
         height=att.height,
-        spoiler=att.is_spoiler(),
+        spoiler=att.spoiler,
         is_image=is_img,
         is_video=is_vid,
         alt_text_status=status.value,
@@ -2223,15 +2221,16 @@ async def publish_queued_submission(
     settings: Settings,
     submission: Submission,
     destination: Notifier | None,
-) -> bool:
+) -> bool | None:
     """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
 
     Loads current attachments and links from DB, then delegates to _attempt_publish.
     ``destination`` is the submission thread (or None if the thread can't be resolved -
     publish still proceeds, just without a Discord status notice).
 
-    Returns True if the publish was attempted (success or failure), False if deferred
-    because the parent submission is butterflied but not yet published.
+    Returns True if a real publish attempt was made (success or failure).
+    Returns None if the submission was a duplicate and was cleaned up without posting.
+    Returns False if deferred because the parent is butterflied but not yet published.
     """
     _snap, atts, links = await _snapshot(session, submission)
     if destination is None:
@@ -2246,10 +2245,11 @@ async def _attempt_publish(
     atts: list[Attachment],
     links: list[SubmissionLink],
     destination: Notifier,
-) -> bool:
+) -> bool | None:
     """Publish to Bluesky and record the result.
 
-    Returns True if publish was attempted (success or failure).
+    Returns True if a real publish attempt was made (success or failure).
+    Returns None if the submission was a duplicate and cleaned up without posting.
     Returns False if deferred because the parent is butterflied but not yet published.
     """
     board_cfg = settings.board_for_channel(submission.channel_id)
@@ -2284,6 +2284,8 @@ async def _attempt_publish(
     # Guard against duplicates that slipped into the queue (e.g. from the old warning-only
     # duplicate check that didn't reject queued-but-not-yet-published content).
     for link in links:
+        if link.canonical_url is None:
+            continue  # null canonical_url would match all other nulls; skip the check
         prior_attempt = await session.scalar(
             select(PublishAttempt)
             .join(Submission, PublishAttempt.submission_id == Submission.id)
@@ -2291,6 +2293,7 @@ async def _attempt_publish(
             .where(
                 SubmissionLink.canonical_url == link.canonical_url,
                 PublishAttempt.success.is_(True),
+                PublishAttempt.error.is_(None),  # only real publishes, not cascaded suppression rows
                 Submission.id != submission.id,
             )
             .order_by(PublishAttempt.id.desc())
@@ -2316,7 +2319,7 @@ async def _attempt_publish(
             except Exception as exc:
                 log.warning("submission %s: could not send duplicate notice: %s", submission.id, exc)
             await destination.archive(replies.closing_notice("duplicate"))
-            return True
+            return None  # cleanup, not a real publish - scheduler should continue to next
 
     reply_kwargs: dict = {}
     if parent_ref is not None:
@@ -2513,7 +2516,7 @@ async def _apply_answer(
             await message.reply(replies.media_not_found(), mention_author=False)
             return False
         for att in image_atts:
-            await _ingest_attachment(session, submission, att, settings, http_client)
+            await _ingest_attachment(session, submission, discord_attachment_to_inbound(att), settings, http_client)
 
     elif isinstance(req, SourceRequest):
         urls = extract_urls(message.content)

@@ -7,13 +7,14 @@ block message sends in already-open threads for other submissions.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from sqlalchemy import select
 
 from bot.discord_ingest.service import handle_reaction
-from bot.models import Submission, SubmissionThread
+from bot.models import Submission, SubmissionLink, SubmissionThread
 from bot.state import SubmissionState
 
 from conftest import make_submission
@@ -168,3 +169,70 @@ async def test_new_thread_runs_recompute(session, board):
     msg.channel.create_thread.assert_called_once()
     # recompute sends at least the cancel button
     assert new_thread.send.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Ingestion path: URL in message creates SubmissionLink
+# ---------------------------------------------------------------------------
+
+async def test_handle_reaction_ingests_url(session, board):
+    """A message URL must flow all the way through to a SubmissionLink row.
+
+    This guards the adapter boundary: if Discord's message.content is ever
+    dropped when building InboundMessage, this test catches it.
+    """
+    msg = _message(channel_id=board.discord_channel_id)
+    msg.content = "https://example.com/cool-robot-post"
+    new_thread = _thread(thread_id=700)
+    msg.channel.create_thread.return_value = new_thread
+
+    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock):
+        await handle_reaction(
+            session,
+            settings=_settings(),
+            message=msg,
+            http_client=_http(),
+            skip_auth=True,
+        )
+
+    links = list(await session.scalars(
+        select(SubmissionLink).where(
+            SubmissionLink.raw_url == "https://example.com/cool-robot-post"
+        )
+    ))
+    assert len(links) == 1
+
+
+async def test_handle_reaction_embed_url_ingested_when_no_text(session, board):
+    """When message.content is empty, embed URL falls back to SubmissionLink.
+
+    Guards the embed → InboundEmbed adapter boundary.
+    """
+    embed = MagicMock()
+    embed.url = "https://example.com/from-embed"
+    embed.title = None
+    embed.description = None
+    embed.thumbnail = None
+    embed.image = None
+
+    msg = _message(channel_id=board.discord_channel_id)
+    msg.content = ""
+    msg.embeds = [embed]
+    new_thread = _thread(thread_id=701)
+    msg.channel.create_thread.return_value = new_thread
+
+    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock):
+        await handle_reaction(
+            session,
+            settings=_settings(),
+            message=msg,
+            http_client=_http(),
+            skip_auth=True,
+        )
+
+    links = list(await session.scalars(
+        select(SubmissionLink).where(
+            SubmissionLink.raw_url == "https://example.com/from-embed"
+        )
+    ))
+    assert len(links) == 1
