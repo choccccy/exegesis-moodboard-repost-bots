@@ -1588,6 +1588,11 @@ async def _resolve_links(
         link.resolved_via = meta.via
         if meta.image_url:
             dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+            extra_headers: dict[str, str] = {}
+            if "upload.wikimedia.org" in meta.image_url:
+                from ..resolve.fetch import _UA as _RESOLVE_UA
+                extra_headers["Referer"] = "https://en.wikipedia.org/"
+                extra_headers["User-Agent"] = _RESOLVE_UA
             try:
                 link.resolved_image_path = await download_attachment(
                     url=meta.image_url,
@@ -1596,6 +1601,7 @@ async def _resolve_links(
                     data_dir=settings.data_dir,
                     min_free_mb=settings.storage_min_free_mb,
                     client=http_client,
+                    headers=extra_headers or None,
                 )
             except (StorageFullError, httpx.HTTPError, OSError) as exc:
                 log.info("thumbnail download failed for link %s: %s", link.id, exc)

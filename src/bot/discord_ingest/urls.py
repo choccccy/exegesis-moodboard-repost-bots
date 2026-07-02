@@ -7,8 +7,20 @@ import re
 # Matches http(s) URLs, stopping at whitespace and angle brackets. Discord wraps
 # suppressed-embed links in <...>, which we strip.
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-# Trailing punctuation that is almost never part of the URL itself.
-_TRAILING = ").,;!?\"'>]}"
+# Trailing punctuation that is almost never part of the URL itself (excluding ")").
+_TRAILING = ".,;!?\"'>]}"
+
+
+def _strip_trailing(url: str) -> str:
+    """Strip trailing punctuation, preserving balanced parentheses.
+
+    Plain rstrip(")") breaks Wikipedia URLs like /wiki/Stanley_(vehicle) where
+    the closing paren is part of the path. Only strip trailing ) when unbalanced.
+    """
+    url = url.rstrip(_TRAILING)
+    while url.endswith(")") and url.count("(") < url.count(")"):
+        url = url[:-1]
+    return url
 
 
 def extract_urls(content: str) -> list[str]:
@@ -16,7 +28,7 @@ def extract_urls(content: str) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
     for match in _URL_RE.finditer(content or ""):
-        url = match.group(0).rstrip(_TRAILING)
+        url = _strip_trailing(match.group(0))
         if url not in seen:
             seen.add(url)
             found.append(url)

@@ -331,7 +331,7 @@ async def _wikipedia_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     except ValueError as exc:
         log.info("wikipedia api parse error for %s: %s", url, exc)
         return None
-    image_url = (data.get("originalimage") or data.get("thumbnail") or {}).get("source")
+    image_url = (data.get("thumbnail") or data.get("originalimage") or {}).get("source")
     return ResolvedMetadata(
         title=data.get("title"),
         description=data.get("description"),

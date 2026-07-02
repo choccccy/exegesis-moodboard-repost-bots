@@ -46,6 +46,7 @@ async def download_attachment(
     data_dir: str,
     min_free_mb: int,
     client: httpx.AsyncClient | None = None,
+    headers: dict[str, str] | None = None,
 ) -> str:
     """Download ``url`` into ``dest_dir`` and return the local path.
 
@@ -59,7 +60,7 @@ async def download_attachment(
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=60.0, follow_redirects=True)
     try:
-        async with client.stream("GET", url) as resp:
+        async with client.stream("GET", url, headers=headers or {}) as resp:
             resp.raise_for_status()
             tmp = dest + ".part"
             with open(tmp, "wb") as fh:
