@@ -16,6 +16,18 @@ from .youtube import YouTubeClient
 log = logging.getLogger(__name__)
 
 
+def _on_task_done(task: asyncio.Task, name: str) -> None:
+    """Log an error if a background task exits unexpectedly (not via cancellation)."""
+    if not task.cancelled() and (exc := task.exception()):
+        log.error("background task %r died unexpectedly", name, exc_info=exc)
+
+
+def _watched_task(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(lambda t: _on_task_done(t, name))
+    return task
+
+
 async def amain() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.logs_dir)
@@ -38,10 +50,10 @@ async def amain() -> None:
 
     bot = RepostBot(settings, yt_client=yt_client)
     stop = asyncio.Event()
-    housekeeping = asyncio.create_task(run_housekeeping(settings, stop))
-    queue_dispatcher = asyncio.create_task(run_queue_dispatcher(bot, settings, stop))
-    thread_cleanup = asyncio.create_task(run_thread_cleanup(bot, stop))
-    playlist_retry = asyncio.create_task(run_playlist_retry(yt_client, stop)) if yt_client else None
+    housekeeping = _watched_task(run_housekeeping(settings, stop), "housekeeping")
+    queue_dispatcher = _watched_task(run_queue_dispatcher(bot, settings, stop), "queue_dispatcher")
+    thread_cleanup = _watched_task(run_thread_cleanup(bot, stop), "thread_cleanup")
+    playlist_retry = _watched_task(run_playlist_retry(yt_client, stop), "playlist_retry") if yt_client else None
 
     try:
         await bot.start(settings.discord_bot_token)

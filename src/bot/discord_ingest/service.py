@@ -52,11 +52,12 @@ from ..moderation import (
     GRAPHIC_YES_EMOJI,
     graphic_from_emoji,
 )
-from ..resolve import resolve
+from ..resolve import ResolvedMetadata, resolve
 from ..state import (
     AltTextStatus,
     GraphicStatus,
     Gap,
+    PublishOutcome,
     SubmissionSnapshot,
     SubmissionState,
     evaluate_state,
@@ -1622,6 +1623,89 @@ async def _resolve_links(
                         log.info("thumbnail downloaded via Discord proxy for link %s", link.id)
                     except (StorageFullError, httpx.HTTPError, OSError) as exc2:
                         log.info("Discord proxy thumbnail also failed for link %s: %s", link.id, exc2)
+        if is_primary and meta.video_url:
+            await _ingest_resolved_video(session, submission, link, meta, settings, http_client)
+
+
+# Matches the publish-side Bluesky video limit (95 MB headroom under 100 MB).
+# Oversize resolved videos are dropped here so the submission falls back to the
+# thumbnail card instead of queueing a video that can never upload.
+_MAX_RESOLVED_VIDEO_BYTES = 95 * 1024 * 1024
+
+
+async def _ingest_resolved_video(
+    session: AsyncSession,
+    submission: Submission,
+    link: SubmissionLink,
+    meta: ResolvedMetadata,
+    settings: Settings,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Download a resolver-provided video and attach it to the submission.
+
+    Gives link-only submissions (twitter GIFs/videos, TikToks, reddit GIFs) a
+    real video attachment so publish posts native video instead of a thumbnail
+    card. The Attachment row is only created after a successful download, so
+    any failure here degrades to the existing thumbnail behavior rather than
+    queueing a video post that can never upload.
+
+    Idempotent: skips when the submission already has a video attachment
+    (Discord-uploaded or from a previous resolve pass).
+    """
+    existing = await session.scalar(
+        select(Attachment).where(
+            Attachment.submission_id == submission.id,
+            Attachment.is_video.is_(True),
+        )
+    )
+    if existing is not None:
+        return
+
+    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+    try:
+        path = await download_attachment(
+            url=meta.video_url,
+            dest_dir=dest,
+            filename=f"linkvid_{link.id}.mp4",
+            data_dir=settings.data_dir,
+            min_free_mb=settings.storage_min_free_mb,
+            client=http_client,
+        )
+    except (StorageFullError, httpx.HTTPError, OSError) as exc:
+        log.info("resolved video download failed for link %s: %s - falling back to thumbnail", link.id, exc)
+        return
+
+    path = await _transcode_video(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size > _MAX_RESOLVED_VIDEO_BYTES:
+        log.info(
+            "resolved video for link %s is %d bytes (over %d limit) - falling back to thumbnail",
+            link.id, size, _MAX_RESOLVED_VIDEO_BYTES,
+        )
+        return
+
+    status, body = initial_alt_text(is_image=False, is_video=True, discord_description=None)
+    row = Attachment(
+        submission_id=submission.id,
+        discord_attachment_id=0,  # not from Discord: sourced by the link resolver
+        filename=f"linkvid_{link.id}.mp4",
+        discord_url=meta.video_url,  # original source URL, kept for provenance
+        mime="video/mp4",
+        width=meta.video_width,
+        height=meta.video_height,
+        is_image=False,
+        is_video=True,
+        alt_text_status=status.value,
+        alt_text_body=body,
+        local_path=path,
+        downloaded_at=_now(),
+    )
+    session.add(row)
+    await session.flush()
+    log.info("resolved video attached for submission %s (link %s, %d bytes)", submission.id, link.id, size)
 
 
 async def _ingest_attachment(
@@ -2221,16 +2305,16 @@ async def publish_queued_submission(
     settings: Settings,
     submission: Submission,
     destination: Notifier | None,
-) -> bool | None:
+) -> PublishOutcome:
     """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
 
     Loads current attachments and links from DB, then delegates to _attempt_publish.
     ``destination`` is the submission thread (or None if the thread can't be resolved -
     publish still proceeds, just without a Discord status notice).
 
-    Returns True if a real publish attempt was made (success or failure).
-    Returns None if the submission was a duplicate and was cleaned up without posting.
-    Returns False if deferred because the parent is butterflied but not yet published.
+    Returns a PublishOutcome so the scheduler can decide whether to spend the
+    tick (PUBLISHED), try the next queue item (FAILED / DUPLICATE / DEFERRED),
+    or how to log what happened.
     """
     _snap, atts, links = await _snapshot(session, submission)
     if destination is None:
@@ -2245,13 +2329,8 @@ async def _attempt_publish(
     atts: list[Attachment],
     links: list[SubmissionLink],
     destination: Notifier,
-) -> bool | None:
-    """Publish to Bluesky and record the result.
-
-    Returns True if a real publish attempt was made (success or failure).
-    Returns None if the submission was a duplicate and cleaned up without posting.
-    Returns False if deferred because the parent is butterflied but not yet published.
-    """
+) -> PublishOutcome:
+    """Publish to Bluesky and record the result. Returns a PublishOutcome."""
     board_cfg = settings.board_for_channel(submission.channel_id)
     if not board_cfg or not board_cfg.bluesky_handle:
         err = "board has no Bluesky handle configured"
@@ -2262,7 +2341,7 @@ async def _attempt_publish(
             await destination.send(replies.publish_failed_notice(err))
         except Exception as exc:
             log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
-        return True
+        return PublishOutcome.FAILED
 
     password = settings.bsky_password_for(board_cfg.name)
     if not password:
@@ -2274,12 +2353,12 @@ async def _attempt_publish(
             await destination.send(replies.publish_failed_notice(err))
         except Exception as exc:
             log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
-        return True
+        return PublishOutcome.FAILED
 
     parent_ref = await _resolve_parent_ref(session, submission)
     if parent_ref is _DEFERRED:
         log.info("submission %s deferred: parent not yet published", submission.id)
-        return False
+        return PublishOutcome.DEFERRED
 
     # Guard against duplicates that slipped into the queue (e.g. from the old warning-only
     # duplicate check that didn't reject queued-but-not-yet-published content).
@@ -2319,7 +2398,7 @@ async def _attempt_publish(
             except Exception as exc:
                 log.warning("submission %s: could not send duplicate notice: %s", submission.id, exc)
             await destination.archive(replies.closing_notice("duplicate"))
-            return None  # cleanup, not a real publish - scheduler should continue to next
+            return PublishOutcome.DUPLICATE  # cleanup, not a real publish
 
     reply_kwargs: dict = {}
     if parent_ref is not None:
@@ -2365,14 +2444,15 @@ async def _attempt_publish(
             log.warning("submission %s: published to Bluesky but Discord notice failed: %s", submission.id, exc)
         # Archive unconditionally - even if the notice send failed, close the thread.
         await destination.archive(replies.closing_notice("published to Bluesky"))
-    else:
-        submission.state = SubmissionState.PUBLISH_FAILED.value
-        log.error("submission %s publish failed: %s", submission.id, result.error)
-        try:
-            await destination.send(replies.publish_failed_notice(result.error))
-        except Exception as exc:
-            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
-    return True
+        return PublishOutcome.PUBLISHED
+
+    submission.state = SubmissionState.PUBLISH_FAILED.value
+    log.error("submission %s publish failed: %s", submission.id, result.error)
+    try:
+        await destination.send(replies.publish_failed_notice(result.error))
+    except Exception as exc:
+        log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
+    return PublishOutcome.FAILED
 
 
 async def _build_post_preview(

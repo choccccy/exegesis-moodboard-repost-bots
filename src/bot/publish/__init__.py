@@ -6,7 +6,6 @@ M3: native Bluesky reposts and multi-link reply threads.
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import logging
 import mimetypes
@@ -269,18 +268,28 @@ def _compress_for_bsky(data: bytes) -> bytes:
     return buf.getvalue()
 
 
-async def _upload_blob(client: AsyncClient, path: str) -> object | None:
-    """Read a local file and upload it as a blob. Returns the blob ref or None."""
+def _error_detail(exc: Exception, limit: int = 300) -> str:
+    """Compact one-line description of an exception, for PublishAttempt.error.
+
+    Keeps the leading part of the message (which carries status codes and error
+    names) so the dashboard shows the actual cause, not just a generic label.
+    """
+    detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+    return detail if len(detail) <= limit else detail[:limit] + "..."
+
+
+async def _upload_blob(client: AsyncClient, path: str) -> tuple[object | None, str | None]:
+    """Read a local file and upload it as a blob. Returns (blob_ref, error_detail)."""
     try:
         data = Path(path).read_bytes()
         if len(data) > _BSKY_MAX_BLOB:
             log.warning("image %s is %d bytes, compressing before upload", path, len(data))
             data = _compress_for_bsky(data)
         response = await client.upload_blob(data)
-        return response.blob
+        return response.blob, None
     except Exception as exc:
         log.warning("blob upload failed for %s: %s", path, exc)
-        return None
+        return None, _error_detail(exc)
 
 
 async def _create_post(
@@ -430,7 +439,7 @@ async def _publish_external(
 
     thumb_blob = None
     if primary.resolved_image_path:
-        thumb_blob = await _upload_blob(client, primary.resolved_image_path)
+        thumb_blob, _ = await _upload_blob(client, primary.resolved_image_path)  # thumb is optional
 
     embed = models.AppBskyEmbedExternal.Main(
         external=models.AppBskyEmbedExternal.External(
@@ -455,12 +464,16 @@ async def _publish_images(
     reply=None,
 ) -> PublishResult:
     images = []
+    upload_errors: list[str] = []
     for att in (a for a in attachments if a.is_image):
         if not att.local_path:
             log.warning("image attachment %s has no local_path, skipping", att.id)
+            upload_errors.append(f"attachment {att.id} has no local file")
             continue
-        blob = await _upload_blob(client, att.local_path)
+        blob, err = await _upload_blob(client, att.local_path)
         if blob is None:
+            if err:
+                upload_errors.append(err)
             continue
         images.append(
             models.AppBskyEmbedImages.Image(
@@ -470,7 +483,8 @@ async def _publish_images(
         )
 
     if not images:
-        return PublishResult(success=False, error="no images could be uploaded")
+        detail = f": {upload_errors[-1]}" if upload_errors else ""
+        return PublishResult(success=False, error=f"no images could be uploaded{detail}")
 
     embed = models.AppBskyEmbedImages.Main(images=images)
     primary = links[0] if links else None
@@ -489,44 +503,34 @@ async def _publish_images(
 _BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB - headroom under Bluesky's 100 MB limit
 
 
-async def _upload_video_blob(client: AsyncClient, att: Attachment) -> object | None:
-    """Upload a local video file via Bluesky's job-based API. Returns the blob ref or None."""
+async def _upload_video_blob(client: AsyncClient, att: Attachment) -> tuple[object | None, str | None]:
+    """Upload a local video file as a regular blob. Returns (blob_ref, error_detail).
+
+    Videos go through the same uploadBlob endpoint as images (the path the SDK's
+    own send_video uses); the AppView transcodes them after the record is created.
+    The job-based app.bsky.video.uploadVideo API lives on a separate service
+    (video.bsky.app), not the PDS - calling it via the session client hits the
+    PDS and returns 501 MethodNotImplemented.
+    """
     if not att.local_path:
         log.warning("video attachment %s has no local_path, skipping", att.id)
-        return None
+        return None, f"video attachment {att.id} has no local file"
     try:
         data = Path(att.local_path).read_bytes()
     except OSError as exc:
         log.warning("could not read video file %s: %s", att.local_path, exc)
-        return None
+        return None, _error_detail(exc)
 
     if len(data) > _BSKY_MAX_VIDEO:
         log.warning("video %s is %d bytes (exceeds %d limit), skipping", att.local_path, len(data), _BSKY_MAX_VIDEO)
-        return None
+        return None, f"video is {len(data)} bytes (limit {_BSKY_MAX_VIDEO})"
 
     try:
-        response = await client.app.bsky.video.upload_video(data)
-        job_id = response.job_status.job_id
+        response = await client.upload_blob(data)
+        return response.blob, None
     except Exception as exc:
         log.warning("video upload failed for %s: %s", att.local_path, exc)
-        return None
-
-    for _ in range(150):
-        await asyncio.sleep(2)
-        try:
-            status_resp = await client.app.bsky.video.get_job_status({"job_id": job_id})
-            job = status_resp.job_status
-        except Exception as exc:
-            log.warning("get_job_status failed for %s: %s", job_id, exc)
-            return None
-        if job.state == "JOB_STATE_COMPLETED":
-            return job.blob
-        if job.state == "JOB_STATE_FAILED":
-            log.warning("video processing failed for %s: %s", job_id, job.error)
-            return None
-
-    log.warning("video processing timed out for job %s", job_id)
-    return None
+        return None, _error_detail(exc)
 
 
 async def _publish_video(
@@ -543,9 +547,10 @@ async def _publish_video(
     if first_video is None:
         return PublishResult(success=False, error="no video attachment found")
 
-    blob = await _upload_video_blob(client, first_video)
+    blob, err = await _upload_video_blob(client, first_video)
     if blob is None:
-        return PublishResult(success=False, error="video upload failed")
+        detail = f": {err}" if err else ""
+        return PublishResult(success=False, error=f"video upload failed{detail}")
 
     aspect_ratio = None
     if first_video.width and first_video.height:
@@ -582,9 +587,10 @@ async def _publish_video_reply(
     parent_cid: str,
 ) -> tuple[str, str]:
     """Post a single video attachment as a reply in the thread. Returns (at_uri, cid)."""
-    blob = await _upload_video_blob(client, att)
+    blob, err = await _upload_video_blob(client, att)
     if blob is None:
-        raise RuntimeError(f"video upload failed for attachment {att.id}")
+        detail = f": {err}" if err else ""
+        raise RuntimeError(f"video upload failed for attachment {att.id}{detail}")
 
     aspect_ratio = None
     if att.width and att.height:
@@ -630,12 +636,16 @@ async def _publish_image_reply(
 ) -> tuple[str, str]:
     """Post up to 4 images as a reply in the thread. Returns (at_uri, cid)."""
     images = []
+    upload_errors: list[str] = []
     for att in image_atts[:4]:
         if not att.local_path:
             log.warning("image attachment %s has no local_path, skipping", att.id)
+            upload_errors.append(f"attachment {att.id} has no local file")
             continue
-        blob = await _upload_blob(client, att.local_path)
+        blob, err = await _upload_blob(client, att.local_path)
         if blob is None:
+            if err:
+                upload_errors.append(err)
             continue
         images.append(
             models.AppBskyEmbedImages.Image(
@@ -644,7 +654,8 @@ async def _publish_image_reply(
             )
         )
     if not images:
-        raise RuntimeError("no images could be uploaded for image reply")
+        detail = f": {upload_errors[-1]}" if upload_errors else ""
+        raise RuntimeError(f"no images could be uploaded for image reply{detail}")
 
     embed = models.AppBskyEmbedImages.Main(images=images)
     primary = links[0] if links else None

@@ -23,6 +23,12 @@ class ResolvedMetadata:
     description: str | None = None
     image_url: str | None = None
     via: str = "none"  # oembed | opengraph | html | discord | none | skipped
+    # Direct video file URL (mp4) when the source is a video/GIF post and the
+    # resolver API exposes one (fxtwitter, vxtwitter, tikwm, reddit GIFs).
+    # image_url still carries the thumbnail still for fallback/preview use.
+    video_url: str | None = None
+    video_width: int | None = None
+    video_height: int | None = None
 
 
 class _MetaParser(HTMLParser):
@@ -197,20 +203,21 @@ async def _tumblr_oembed(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     )
 
 
-def _fxtwitter_image(tweet: dict) -> str | None:
-    """Return the best available static image URL from an fxtwitter tweet dict.
+def _fxtwitter_media(tweet: dict) -> tuple[str | None, dict | None]:
+    """Return (still_image_url, video_dict) from an fxtwitter tweet dict.
 
-    Photos: use the direct URL. Videos and GIFs: use thumbnail_url, which is a
-    JPEG still that Bluesky can embed (the actual video can't be uploaded anyway).
+    Photos: direct URL, no video. Videos and GIFs: the thumbnail still plus the
+    media dict itself - fxtwitter serves both types as direct video/mp4 URLs
+    (with width/height), which Bluesky can host natively.
     """
     media = tweet.get("media") or {}
     photos = media.get("photos") or []
     if photos:
-        return photos[0].get("url")
+        return photos[0].get("url"), None
     videos = media.get("videos") or []
     if videos:
-        return videos[0].get("thumbnail_url")
-    return None
+        return videos[0].get("thumbnail_url"), videos[0]
+    return None, None
 
 
 async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
@@ -235,13 +242,16 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
         if resp.status_code == 200:
             tweet = resp.json().get("tweet", {})
             if tweet:
-                image_url = _fxtwitter_image(tweet)
-                if not image_url:
-                    image_url = _fxtwitter_image(tweet.get("quote") or {})
+                image_url, video = _fxtwitter_media(tweet)
+                if not image_url and not video:
+                    image_url, video = _fxtwitter_media(tweet.get("quote") or {})
                 return ResolvedMetadata(
                     title=tweet.get("text"),
                     description=tweet.get("author", {}).get("name"),
                     image_url=image_url,
+                    video_url=(video or {}).get("url"),
+                    video_width=(video or {}).get("width"),
+                    video_height=(video or {}).get("height"),
                     via="fxtwitter_api",
                 )
         else:
@@ -263,11 +273,28 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
     except ValueError:
         log.info("vxtwitter api returned non-JSON for %s", url)
         return None
-    media_urls = data.get("mediaURLs") or []
+    # media_extended distinguishes images from videos/GIFs; the flat mediaURLs
+    # list would hand an .mp4 URL to the thumbnail downloader for video tweets.
+    image_url = None
+    video: dict | None = None
+    for m in data.get("media_extended") or []:
+        if m.get("type") in ("video", "gif") and video is None:
+            video = m
+        elif m.get("type") == "image" and image_url is None:
+            image_url = m.get("url")
+    if image_url is None and video is not None:
+        image_url = video.get("thumbnail_url")
+    if image_url is None and video is None:
+        media_urls = data.get("mediaURLs") or []
+        image_url = media_urls[0] if media_urls else None
+    video_size = (video or {}).get("size") or {}
     return ResolvedMetadata(
         title=data.get("text"),
         description=data.get("user_name"),
-        image_url=media_urls[0] if media_urls else None,
+        image_url=image_url,
+        video_url=(video or {}).get("url"),
+        video_width=video_size.get("width"),
+        video_height=video_size.get("height"),
         via="vxtwitter_api",
     )
 
@@ -299,6 +326,7 @@ async def _tiktok_tikwm(url: str, client: httpx.AsyncClient) -> ResolvedMetadata
         title=None,
         description=author,
         image_url=cover or None,
+        video_url=data.get("play") or None,  # watermark-free direct mp4
         via="tikwm",
     )
 
@@ -338,6 +366,19 @@ async def _wikipedia_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
         image_url=image_url,
         via="wikipedia_api",
     )
+
+
+def _reddit_gif_video(post: dict) -> dict | None:
+    """Return the reddit_video dict when the post is a GIF-style video.
+
+    Only is_gif videos are usable: reddit's fallback_url is the video stream
+    without the audio track, so posting a regular video from it would be silent.
+    GIFs have no audio to lose.
+    """
+    rv = ((post.get("secure_media") or post.get("media") or {}) or {}).get("reddit_video") or {}
+    if rv.get("is_gif") and rv.get("fallback_url"):
+        return rv
+    return None
 
 
 def _reddit_image_url(post: dict) -> str | None:
@@ -392,16 +433,23 @@ async def _reddit_json_api(url: str, client: httpx.AsyncClient) -> ResolvedMetad
 
     # Try to get an image from the post itself first.
     image_url = _reddit_image_url(post)
+    gif_video = _reddit_gif_video(post)
 
-    # For crossposts, fall through to the original post's images.
-    if not image_url and post.get("crosspost_parent_list"):
+    # For crossposts, fall through to the original post's media.
+    if post.get("crosspost_parent_list"):
         parent = post["crosspost_parent_list"][0]
-        image_url = _reddit_image_url(parent)
+        if not image_url:
+            image_url = _reddit_image_url(parent)
+        if not gif_video:
+            gif_video = _reddit_gif_video(parent)
 
     return ResolvedMetadata(
         title=title,
         description=subreddit,
         image_url=image_url,
+        video_url=(gif_video or {}).get("fallback_url"),
+        video_width=(gif_video or {}).get("width"),
+        video_height=(gif_video or {}).get("height"),
         via="reddit_api",
     )
 
@@ -515,7 +563,7 @@ async def resolve(
             log.info("opengraph fetch failed for %s: %s", url, exc)
 
     meta = meta or ResolvedMetadata(via="none")
-    fetched_anything = bool(meta.title or meta.image_url)
+    fetched_anything = bool(meta.title or meta.image_url or meta.video_url)
 
     title = meta.title or fallback_title
     description = meta.description or fallback_description
@@ -528,5 +576,8 @@ async def resolve(
     else:
         via = "none"
     return ResolvedMetadata(
-        title=title, description=description, image_url=image_url, via=via
+        title=title, description=description, image_url=image_url, via=via,
+        video_url=meta.video_url,
+        video_width=meta.video_width,
+        video_height=meta.video_height,
     )

@@ -19,7 +19,7 @@ from bot.discord_ingest.service import publish_queued_submission
 from bot.models import PublishAttempt, SubmissionLink, SubmissionThread
 from bot.publish import PublishResult
 from bot.scheduler import _fire_board, run_queue_dispatcher
-from bot.state import SubmissionState
+from bot.state import PublishOutcome, SubmissionState
 
 from conftest import MockDest, make_submission
 
@@ -285,7 +285,7 @@ async def test_duplicate_publish_queued_submission_returns_none(session, board):
     await _add_link(session, sub_b.id, "https://example.com/dup")
 
     result = await publish_queued_submission(session, settings, sub_b, MockDest())
-    assert result is None, "duplicate cleanup must return None so the scheduler continues to next"
+    assert result is PublishOutcome.DUPLICATE, "duplicate cleanup lets the scheduler continue to next"
 
 
 async def test_null_canonical_url_not_treated_as_duplicate(session, board):
@@ -315,7 +315,7 @@ async def test_null_canonical_url_not_treated_as_duplicate(session, board):
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=ok) as mock_pub:
         result = await publish_queued_submission(session, settings, sub_b, MockDest())
 
-    assert result is True, "submission with null canonical_url must not be falsely suppressed"
+    assert result is PublishOutcome.PUBLISHED, "submission with null canonical_url must not be falsely suppressed"
     mock_pub.assert_awaited_once()
 
 
@@ -350,7 +350,78 @@ async def test_suppression_row_does_not_cascade_to_block_next_submission(session
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=ok) as mock_pub:
         result = await publish_queued_submission(session, settings, sub_b, MockDest())
 
-    assert result is True, "suppression row must not cascade to suppress a later submission"
+    assert result is PublishOutcome.PUBLISHED, "suppression row must not cascade to suppress a later submission"
+    mock_pub.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Failure fall-through
+# ---------------------------------------------------------------------------
+#
+# Bug: a real failed publish attempt ended the tick, and because the queue
+# retries PUBLISH_FAILED items oldest-first, a permanently-failing submission
+# (e.g. #978's broken video upload) sat at the head of the queue and consumed
+# every tick - the board stopped posting entirely. A failure must fall through
+# to the next queue item, bounded so a systemic outage (bad credentials,
+# network down) can't burn the whole queue in one tick.
+
+
+async def test_fire_board_failure_falls_through_to_next_item(session, board):
+    sub_a = make_submission(board, state=QUEUED, source_discord_message_id=101,
+                            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sub_b = make_submission(board, state=QUEUED, source_discord_message_id=102,
+                            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    session.add_all([sub_a, sub_b])
+    await session.flush()
+
+    outcomes = [PublishOutcome.FAILED, PublishOutcome.PUBLISHED]
+    with patch(
+        "bot.scheduler.ingest_service.publish_queued_submission",
+        new_callable=AsyncMock, side_effect=outcomes,
+    ) as mock_pub:
+        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+
+    assert mock_pub.await_count == 2, "a failed attempt must fall through to the next queue item"
+    first_sub = mock_pub.await_args_list[0].args[2]
+    second_sub = mock_pub.await_args_list[1].args[2]
+    assert first_sub.id == sub_a.id
+    assert second_sub.id == sub_b.id
+
+
+async def test_fire_board_gives_up_after_failure_budget(session, board):
+    for i in range(5):
+        session.add(make_submission(
+            board, state=QUEUED, source_discord_message_id=200 + i,
+            created_at=datetime(2026, 1, 1 + i, tzinfo=timezone.utc),
+        ))
+    await session.flush()
+
+    with patch(
+        "bot.scheduler.ingest_service.publish_queued_submission",
+        new_callable=AsyncMock, return_value=PublishOutcome.FAILED,
+    ) as mock_pub:
+        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+
+    assert mock_pub.await_count == 3, (
+        "a systemic failure must stop after the per-tick failure budget, "
+        "not burn through the whole queue"
+    )
+
+
+async def test_fire_board_publish_success_ends_tick(session, board):
+    sub_a = make_submission(board, state=QUEUED, source_discord_message_id=301,
+                            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sub_b = make_submission(board, state=QUEUED, source_discord_message_id=302,
+                            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    session.add_all([sub_a, sub_b])
+    await session.flush()
+
+    with patch(
+        "bot.scheduler.ingest_service.publish_queued_submission",
+        new_callable=AsyncMock, return_value=PublishOutcome.PUBLISHED,
+    ) as mock_pub:
+        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+
     mock_pub.assert_awaited_once()
 
 
@@ -390,3 +461,24 @@ async def test_run_queue_dispatcher_startup_uses_only_real_settings_attributes()
 
     # Must not raise AttributeError (or any other exception)
     await run_queue_dispatcher(bot=None, settings=settings, stop=stop)
+
+
+async def test_record_discord_thread_count_uses_real_guild_api():
+    """Regression: thread cleanup called guild.fetch_active_threads(), which does
+    not exist on discord.Guild (the real method is active_threads()). The spec'd
+    mock raises AttributeError if the code invents a method name again.
+    """
+    import discord
+
+    from bot.scheduler import _record_discord_thread_count
+
+    guild = MagicMock(spec=discord.Guild)
+    guild.active_threads = AsyncMock(return_value=[MagicMock(), MagicMock(), MagicMock()])
+    bot = MagicMock()
+    bot.guilds = [guild]
+
+    with patch("bot.bot_status.record_thread_count") as mock_record:
+        await _record_discord_thread_count(bot)
+
+    guild.active_threads.assert_awaited_once()
+    mock_record.assert_called_once_with(3)

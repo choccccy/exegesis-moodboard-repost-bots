@@ -26,7 +26,7 @@ from bot.config import BoardConfig
 from bot.discord_ingest.service import handle_reaction, publish_queued_submission
 from bot.models import Attachment, PublishAttempt, Submission, SubmissionLink
 from bot.publish import PublishResult
-from bot.state import SubmissionState
+from bot.state import PublishOutcome, SubmissionState
 
 from conftest import MockDest, make_submission
 
@@ -193,7 +193,7 @@ async def test_e2e_external_link_published(session, board):
         published = await publish_queued_submission(session, settings, submission, dest)
 
     # --- assertions ---
-    assert published is True
+    assert published is PublishOutcome.PUBLISHED
 
     # Bluesky was called once with the right board and password
     mock_pub.assert_awaited_once()
@@ -270,7 +270,7 @@ async def test_e2e_image_attachment_published(session, board):
         dest = MockDest()
         published = await publish_queued_submission(session, settings, submission, dest)
 
-    assert published is True
+    assert published is PublishOutcome.PUBLISHED
     mock_pub.assert_awaited_once()
     call_kwargs = mock_pub.call_args.kwargs
 
@@ -308,7 +308,7 @@ async def test_e2e_publish_failure_recorded(session, board):
         dest = MockDest()
         published = await publish_queued_submission(session, settings, submission, dest)
 
-    assert published is True  # attempted (even though it failed)
+    assert published is PublishOutcome.FAILED  # real attempt was made and failed
 
     attempt = await session.scalar(
         select(PublishAttempt).where(PublishAttempt.submission_id == submission.id)
@@ -414,7 +414,7 @@ async def test_e2e_duplicate_url_aborts_publish(session, board):
         result = await publish_queued_submission(session, settings, sub2, dest)
 
     # Bluesky should NOT have been called - duplicate detected before publish
-    assert result is None, "duplicate cleanup should return None so scheduler continues to next"
+    assert result is PublishOutcome.DUPLICATE, "duplicate cleanup lets the scheduler continue to next"
     mock_pub.assert_not_awaited()
 
     attempt = await session.scalar(

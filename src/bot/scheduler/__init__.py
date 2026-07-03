@@ -17,7 +17,7 @@ from ..discord_ingest import service as ingest_service
 from ..discord_ingest.discord_notifier import DiscordNotifier
 from .. import errors as errors_module
 from ..models import Board, Submission, SubmissionThread, YoutubePlaylistAdd
-from ..state import SubmissionState
+from ..state import PublishOutcome, SubmissionState
 from .. import queue as queue_module
 
 log = logging.getLogger(__name__)
@@ -90,8 +90,8 @@ async def _record_discord_thread_count(bot) -> None:
     total = 0
     for guild in bot.guilds:
         try:
-            result = await guild.fetch_active_threads()
-            total += len(result.threads)
+            threads = await guild.active_threads()
+            total += len(threads)
         except Exception as exc:
             log.warning("thread cleanup: could not fetch active threads for guild %s: %s", guild.id, exc)
     record_thread_count(total)
@@ -275,7 +275,9 @@ async def _fire_board(
         return
 
     _MAX_SKIP_TRIES = 25
+    _MAX_FAILED_ATTEMPTS_PER_TICK = 3
     skip_ids: set[int] = set()
+    failed_attempts = 0
     for _ in range(_MAX_SKIP_TRIES):
         submission = await queue_module.pick_next_for_board(
             session, board.id, fresh_cutoff, skip_ids=frozenset(skip_ids)
@@ -306,16 +308,33 @@ async def _fire_board(
                     submission.id, exc,
                 )
 
-        attempted = await ingest_service.publish_queued_submission(session, settings, submission, destination)
-        if attempted is True:
-            return  # real publish attempt (success or failure) - done for this tick
+        outcome = await ingest_service.publish_queued_submission(session, settings, submission, destination)
+        if outcome is PublishOutcome.PUBLISHED:
+            return  # posted - the tick is spent
+
         skip_ids.add(submission.id)
-        if attempted is None:
+        if outcome is PublishOutcome.FAILED:
+            # Fall through to the next item so one permanently-failing submission
+            # can't starve the board, but bound the damage: a systemic failure
+            # (bad credentials, network down) shouldn't burn through the queue
+            # marking everything PUBLISH_FAILED in a single tick.
+            failed_attempts += 1
+            if failed_attempts >= _MAX_FAILED_ATTEMPTS_PER_TICK:
+                log.warning(
+                    "queue: board %s giving up this tick after %d failed publish attempts",
+                    board_cfg.name, failed_attempts,
+                )
+                return
+            log.info(
+                "queue: board %s submission %s failed to publish, trying next in queue (%d/%d failures this tick)",
+                board_cfg.name, submission.id, failed_attempts, _MAX_FAILED_ATTEMPTS_PER_TICK,
+            )
+        elif outcome is PublishOutcome.DUPLICATE:
             log.info(
                 "queue: board %s submission %s was a duplicate, trying next in queue",
                 board_cfg.name, submission.id,
             )
-        else:
+        else:  # DEFERRED
             log.info(
                 "queue: board %s submission %s deferred (parent not published), trying next",
                 board_cfg.name, submission.id,

@@ -25,6 +25,21 @@ class SubmissionState(str, enum.Enum):
     PUBLISH_FAILED = "publish_failed"
 
 
+class PublishOutcome(str, enum.Enum):
+    """Result of a scheduler-driven publish attempt, as seen by _fire_board.
+
+    PUBLISHED  - post created on Bluesky; the tick is spent.
+    FAILED     - real attempt made and failed; submission is PUBLISH_FAILED.
+    DUPLICATE  - content already published elsewhere; cleaned up without posting.
+    DEFERRED   - reply-chain parent not yet published; try again later.
+    """
+
+    PUBLISHED = "published"
+    FAILED = "failed"
+    DUPLICATE = "duplicate"
+    DEFERRED = "deferred"
+
+
 class AltTextStatus(str, enum.Enum):
     NEEDED = "needed"
     PROVIDED = "provided"

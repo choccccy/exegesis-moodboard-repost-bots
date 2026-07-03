@@ -508,3 +508,177 @@ async def test_resolve_tiktok_tikwm_failure_falls_to_direct_fetch():
         "https://www.tiktok.com/@someone/video/123", "tiktok", client=client
     )
     assert client.get.call_count == 2  # noqa: PLR2004
+
+
+# --- video URL extraction (twitter GIFs/videos, tiktok, reddit GIFs) ---
+#
+# Regression/feature: video and GIF posts previously resolved to only a
+# thumbnail still, so the bot published a static image instead of the actual
+# video. The resolvers now surface a direct mp4 URL for ingestion to download.
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_video_returns_video_url():
+    client = AsyncMock()
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "launch day",
+            "author": {"name": "SpaceX"},
+            "media": {
+                "videos": [{
+                    "url": "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1920x1080/clip.mp4",
+                    "thumbnail_url": "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/still.jpg",
+                    "width": 1920,
+                    "height": 1080,
+                    "type": "video",
+                }]
+            },
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/SpaceX/status/1", "twitter", client=client)
+    assert result.video_url == "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/1920x1080/clip.mp4"
+    assert result.video_width == 1920  # noqa: PLR2004
+    assert result.video_height == 1080  # noqa: PLR2004
+    assert result.image_url == "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/still.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_gif_returns_video_url():
+    client = AsyncMock()
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "lol",
+            "author": {"name": "Poster"},
+            "media": {
+                "videos": [{
+                    "url": "https://video.twimg.com/tweet_video/G7lhWQHXAAEfxeK.mp4",
+                    "thumbnail_url": "https://pbs.twimg.com/tweet_video_thumb/G7lhWQHXAAEfxeK.jpg",
+                    "width": 480,
+                    "height": 480,
+                    "type": "gif",
+                }]
+            },
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/user/status/2", "twitter", client=client)
+    assert result.video_url == "https://video.twimg.com/tweet_video/G7lhWQHXAAEfxeK.mp4"
+    assert result.image_url == "https://pbs.twimg.com/tweet_video_thumb/G7lhWQHXAAEfxeK.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_photo_has_no_video_url():
+    client = AsyncMock()
+    api_resp = MagicMock()
+    api_resp.status_code = 200
+    api_resp.json.return_value = {
+        "tweet": {
+            "text": "pic",
+            "author": {"name": "Poster"},
+            "media": {"photos": [{"url": "https://pbs.twimg.com/media/abc.jpg"}]},
+        }
+    }
+    client.get.return_value = api_resp
+    result = await resolve("https://twitter.com/user/status/3", "twitter", client=client)
+    assert result.video_url is None
+    assert result.image_url == "https://pbs.twimg.com/media/abc.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_vxtwitter_video_uses_thumbnail_not_mp4_as_image():
+    # Regression: the vxtwitter fallback used mediaURLs[0] as image_url, which
+    # for video tweets is the .mp4 itself - the thumbnail downloader then saved
+    # a video file as the "image". media_extended distinguishes the two.
+    client = AsyncMock()
+    vx_resp = MagicMock()
+    vx_resp.status_code = 200
+    vx_resp.json.return_value = {
+        "text": "vroom",
+        "user_name": "Cars",
+        "mediaURLs": ["https://video.twimg.com/ext_tw_video/9/pu/vid/avc1/1280x720/v.mp4"],
+        "media_extended": [{
+            "type": "video",
+            "url": "https://video.twimg.com/ext_tw_video/9/pu/vid/avc1/1280x720/v.mp4",
+            "thumbnail_url": "https://pbs.twimg.com/ext_tw_video_thumb/9/pu/img/still.jpg",
+            "size": {"width": 1280, "height": 720},
+        }],
+    }
+    client.get.side_effect = [_error_response(404), vx_resp]  # fxtwitter 404 -> vxtwitter
+    result = await resolve("https://twitter.com/cars/status/9", "twitter", client=client)
+    assert result.via == "vxtwitter_api"
+    assert result.video_url == "https://video.twimg.com/ext_tw_video/9/pu/vid/avc1/1280x720/v.mp4"
+    assert result.image_url == "https://pbs.twimg.com/ext_tw_video_thumb/9/pu/img/still.jpg"
+    assert result.video_width == 1280  # noqa: PLR2004
+    assert result.video_height == 720  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_resolve_tiktok_tikwm_returns_play_url():
+    client = AsyncMock()
+    tikwm_resp = MagicMock()
+    tikwm_resp.status_code = 200
+    tikwm_resp.json = MagicMock(return_value={
+        "code": 0,
+        "data": {
+            "cover": "https://cdn.tiktok.com/cover.jpg",
+            "play": "https://v16m.tiktokcdn-us.com/abc/video.mp4",
+            "author": {"nickname": "Someone"},
+        },
+    })
+    client.get.return_value = tikwm_resp
+    result = await resolve("https://www.tiktok.com/@someone/video/1", "tiktok", client=client)
+    assert result.video_url == "https://v16m.tiktokcdn-us.com/abc/video.mp4"
+    assert result.image_url == "https://cdn.tiktok.com/cover.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_gif_returns_video_url():
+    client = AsyncMock()
+    reddit_resp = MagicMock()
+    reddit_resp.status_code = 200
+    reddit_resp.json.return_value = [
+        {"data": {"children": [{"data": {
+            "title": "cool gif",
+            "subreddit_name_prefixed": "r/robots",
+            "url": "https://v.redd.it/xyz",
+            "secure_media": {"reddit_video": {
+                "fallback_url": "https://v.redd.it/xyz/DASH_480.mp4?source=fallback",
+                "width": 480, "height": 480, "is_gif": True,
+            }},
+            "preview": {"images": [{"source": {"url": "https://preview.redd.it/still.jpg"}}]},
+        }}]}}
+    ]
+    client.get.return_value = reddit_resp
+    result = await resolve("https://www.reddit.com/r/robots/comments/abc/cool_gif/", "reddit", client=client)
+    assert result.video_url == "https://v.redd.it/xyz/DASH_480.mp4?source=fallback"
+    assert result.video_width == 480  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_regular_video_has_no_video_url():
+    # fallback_url streams video WITHOUT the audio track; posting a regular
+    # video from it would be silent, so only is_gif videos are taken.
+    client = AsyncMock()
+    reddit_resp = MagicMock()
+    reddit_resp.status_code = 200
+    reddit_resp.json.return_value = [
+        {"data": {"children": [{"data": {
+            "title": "video with sound",
+            "subreddit_name_prefixed": "r/robots",
+            "url": "https://v.redd.it/abc",
+            "secure_media": {"reddit_video": {
+                "fallback_url": "https://v.redd.it/abc/DASH_1080.mp4?source=fallback",
+                "width": 1920, "height": 1080, "is_gif": False,
+            }},
+            "preview": {"images": [{"source": {"url": "https://preview.redd.it/still.jpg"}}]},
+        }}]}}
+    ]
+    client.get.return_value = reddit_resp
+    result = await resolve("https://www.reddit.com/r/robots/comments/def/video/", "reddit", client=client)
+    assert result.video_url is None
+    assert result.image_url == "https://preview.redd.it/still.jpg"
