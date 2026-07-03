@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import pytest_asyncio
 
-from bot.dashboard.queries import QueuedItem, board_queue
+from bot.dashboard.queries import QueuedItem, board_queue, board_stats, recent_publishes
 from bot.models import PublishAttempt, Submission, SubmissionLink
 from bot.state import SubmissionState
 
@@ -150,3 +150,103 @@ async def test_fresh_ordered_before_stale(session, board):
 
     assert items[0].submission_id == fresh.id
     assert items[1].submission_id == stale.id
+
+
+# ---------------------------------------------------------------------------
+# board_stats and recent_publishes - duplicate cleanup rows must be excluded
+# ---------------------------------------------------------------------------
+#
+# Duplicate cleanup rows have success=True but error="duplicate: ...".
+# They must NOT appear as real posts in the dashboard because:
+# 1. They didn't actually publish new content.
+# 2. Their attempted_at may have a timezone suffix that sorts above naive
+#    timestamps in SQLite string comparison, hiding real recent posts.
+
+
+class _BoardStatSettings:
+    queue_timezone = "America/Denver"
+    queue_fresh_window_hours = 72
+    queue_target_days = 90
+    queue_min_daily = 1
+    queue_max_daily = 6
+    boards = []
+
+    def bluesky_handle_for(self, name):
+        return f"{name}.exegesis.space"
+
+
+async def test_board_stats_excludes_duplicate_cleanup_from_last_published(session, board):
+    """board_stats last_published_at must reflect the most recent REAL post, not a cleanup row.
+
+    Regression: before the fix, the last_attempt query used success.is_(True) without
+    filtering error IS NULL, so duplicate cleanup rows appeared as the 'last post'.
+    """
+    real_sub = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=1)
+    dup_sub = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=2)
+    session.add_all([real_sub, dup_sub])
+    await session.flush()
+
+    # Real post - happened earlier
+    real_attempt = PublishAttempt(
+        submission_id=real_sub.id,
+        success=True, error=None,
+        bsky_url="https://bsky.app/profile/robots.exegesis.space/post/abc",
+        at_uri="at://did:plc:test/app.bsky.feed.post/abc",
+        attempted_at=datetime(2026, 7, 2, 12, 0, 0),
+    )
+    # Duplicate cleanup - happened later but must not be shown as a post
+    dup_attempt = PublishAttempt(
+        submission_id=dup_sub.id,
+        success=True,
+        error="duplicate: content already published by another submission",
+        bsky_url="https://bsky.app/profile/robots.exegesis.space/post/abc",
+        at_uri="at://did:plc:test/app.bsky.feed.post/abc",
+        attempted_at=datetime(2026, 7, 2, 14, 0, 0),
+    )
+    session.add_all([real_attempt, dup_attempt])
+    await session.flush()
+
+    settings = _BoardStatSettings()
+    settings.boards = []
+    stats = await board_stats(session, settings)
+    board_stat = next(s for s in stats if s.name == board.name)
+
+    # last_published_at must be the REAL post, not the later duplicate cleanup
+    assert board_stat.last_bsky_url == "https://bsky.app/profile/robots.exegesis.space/post/abc"
+    assert board_stat.last_published_at == datetime(2026, 7, 2, 12, 0, 0)
+
+
+async def test_recent_publishes_excludes_duplicate_cleanup_rows(session, board):
+    """recent_publishes must not include rows where error IS NOT NULL.
+
+    Regression: before the fix, duplicate cleanup rows appeared in the feed,
+    making curators think content had been newly published when it had only
+    been de-duplicated at publish time.
+    """
+    real_sub = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=10)
+    dup_sub = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=11)
+    session.add_all([real_sub, dup_sub])
+    await session.flush()
+
+    session.add(PublishAttempt(
+        submission_id=real_sub.id,
+        success=True, error=None,
+        bsky_url="https://bsky.app/profile/robots.exegesis.space/post/real",
+        at_uri="at://did:plc:test/app.bsky.feed.post/real",
+        attempted_at=datetime(2026, 7, 2, 10, 0, 0),
+    ))
+    session.add(PublishAttempt(
+        submission_id=dup_sub.id,
+        success=True,
+        error="duplicate: content already published by another submission",
+        bsky_url="https://bsky.app/profile/robots.exegesis.space/post/real",
+        at_uri="at://did:plc:test/app.bsky.feed.post/real",
+        attempted_at=datetime(2026, 7, 2, 12, 0, 0),
+    ))
+    await session.flush()
+
+    settings = _BoardStatSettings()
+    publishes = await recent_publishes(session, settings, limit=10)
+
+    assert len(publishes) == 1, "duplicate cleanup row must be excluded from recent_publishes"
+    assert publishes[0].resolved_bsky_url == "https://bsky.app/profile/robots.exegesis.space/post/real"

@@ -216,11 +216,12 @@ async def run_queue_dispatcher(bot, settings: Settings, stop: asyncio.Event) -> 
     """Fire the queue tick once per hour from queue_start_hour onward in the configured timezone."""
     tz = ZoneInfo(settings.queue_timezone)
     log.info(
-        "queue dispatcher starting (tz=%s start_hour=%d fresh_cap=%d backlog_cap=%d)",
+        "queue dispatcher starting (tz=%s start_hour=%d min=%d max=%d target_days=%d)",
         settings.queue_timezone,
         settings.queue_start_hour,
-        settings.queue_fresh_daily_cap,
-        settings.queue_backlog_daily_cap,
+        settings.queue_min_daily,
+        settings.queue_max_daily,
+        settings.queue_target_days,
     )
     while not stop.is_set():
         now_mt = datetime.now(tz)

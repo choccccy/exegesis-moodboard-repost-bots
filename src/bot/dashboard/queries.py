@@ -125,6 +125,7 @@ async def board_stats(session: AsyncSession, settings: DashboardSettings) -> lis
             .where(
                 Submission.board_id == board.id,
                 PublishAttempt.success.is_(True),
+                PublishAttempt.error.is_(None),
             )
             .order_by(PublishAttempt.attempted_at.desc())
             .limit(1)
@@ -205,7 +206,7 @@ async def recent_publishes(
                 SubmissionLink.order_index == 0,
             ),
         )
-        .where(PublishAttempt.success.is_(True))
+        .where(PublishAttempt.success.is_(True), PublishAttempt.error.is_(None))
         .order_by(PublishAttempt.attempted_at.desc())
         .limit(limit)
     )
