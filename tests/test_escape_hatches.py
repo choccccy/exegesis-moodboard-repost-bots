@@ -261,26 +261,7 @@ async def test_alt_skip_tombstone_edit_error_swallowed(session, board):
     assert att.alt_text_status == AltTextStatus.SKIPPED.value
 
 
-class _FailChecklistSendDest:
-    """Fails the status-checklist send specifically, succeeds for everything else -
-    forces the standalone confirmation-message fallback when the checklist can't post."""
-
-    def __init__(self):
-        self.sent: list[str] = []
-
-    async def send(self, content=None, **kw):
-        if content and content.startswith("**post status**"):
-            raise discord.HTTPException(MagicMock(), "checklist send failed")
-        self.sent.append(content or "")
-        m = MagicMock()
-        m.id = next(_ids)
-        return m
-
-    async def archive(self, notice):
-        pass
-
-
-async def test_ready_falls_back_to_standalone_confirm_when_checklist_send_fails(session, board):
+async def test_ready_status_message_is_confirmation_not_checklist(session, board):
     from bot.models import ConfirmationRequest
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
@@ -292,16 +273,18 @@ async def test_ready_falls_back_to_standalone_confirm_when_checklist_send_fails(
     ))
     await session.flush()
 
-    dest = _FailChecklistSendDest()
+    dest = MockDest()
     await recompute_and_request(session, sub, settings=_settings(), destination=dest)
 
-    # Checklist send failed (status_message_id stays None) so a standalone confirm was posted.
-    assert sub.status_message_id is None
+    # Ready: the status message is the concise confirmation prompt, not the checklist wall.
+    assert any("queue this for posting" in m for m in dest.sent)
+    assert not any("post status" in m for m in dest.sent)
+    # The Queue button's ConfirmationRequest is tied to that status message.
     conf = await session.scalar(
         select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
     )
     assert conf is not None
-    assert any("queue this for posting" in m for m in dest.sent)
+    assert conf.bot_message_id == sub.status_message_id
 
 
 # --- recompute offers the waiver button only with media ---------------------
@@ -400,13 +383,9 @@ class _SendOnlyDest:
 
 async def test_upsert_falls_back_to_send_when_edit_unsupported(session, board):
     # status_message_id is set but the destination can't edit -> a fresh checklist is sent.
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, status_message_id=42)
+    # A blocked (no-source) submission renders the checklist, not the confirmation prompt.
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, status_message_id=42)
     session.add(sub)
-    await session.flush()
-    session.add(SubmissionLink(
-        submission_id=sub.id, order_index=0, raw_url="https://x/y",
-        canonical_url="https://x/y", domain_family="other",
-    ))
     await session.flush()
 
     dest = _SendOnlyDest()
