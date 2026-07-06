@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 _CATCHUP_INTER_MESSAGE_DELAY = 2.0       # seconds; existing submission, thread reused
 _CATCHUP_NEW_THREAD_DELAY = 6.0          # seconds; new thread created, respect rate limit
 _CATCHUP_CHANNEL_TIMEOUT = 3600.0       # seconds; per-channel scan wall-clock limit (safety only)
+_CATCHUP_INTER_THREAD_DELAY = 1.5        # seconds; pace the per-pending-thread recompute on startup
 
 _TRIAGE_STATE_LABELS = {
     "ready_to_queue":                  "Needs confirmation",
@@ -59,16 +60,19 @@ def _format_triage(
     *,
     channel_name: str,
     filter_label: str | None,
+    user_label: str | None = None,
 ) -> str:
+    by_user = f" · by {user_label}" if user_label else ""
     if not items:
         qualifier = f" matching '{filter_label}'" if filter_label else ""
-        return f"All clear — nothing open{qualifier} for **#{channel_name}**."
+        user_qualifier = f" from {user_label}" if user_label else ""
+        return f"All clear — nothing open{qualifier}{user_qualifier} for **#{channel_name}**."
 
     truncated = len(items) > _TRIAGE_MAX_ITEMS
     shown = items[:_TRIAGE_MAX_ITEMS]
 
     if filter_label:
-        header = f"**🦋 #{channel_name}** — {len(items)} open · {filter_label}"
+        header = f"**🦋 #{channel_name}** — {len(items)} open · {filter_label}{by_user}"
         lines = [header, ""]
         for item in shown:
             link = f"[{item.title}](<{item.thread_url}>)" if item.thread_url else item.title
@@ -83,7 +87,7 @@ def _format_triage(
         state_order = list(_TRIAGE_STATE_LABELS.keys())
         sorted_states = sorted(grouped, key=lambda s: state_order.index(s) if s in state_order else 99)
 
-        header = f"**🦋 #{channel_name}** — {len(items)} open"
+        header = f"**🦋 #{channel_name}** — {len(items)} open{by_user}"
         lines = [header]
         for state in sorted_states:
             group = grouped[state]
@@ -150,13 +154,21 @@ class RepostBot(discord.Client):
             await bot_ref._handle_scan_slash(interaction, days)
 
         @self.tree.command(name="triage", description="List open submission threads for this board")
-        @app_commands.describe(filter="Filter by state (omit to show all)")
+        @app_commands.describe(
+            filter="Filter by state (omit to show all)",
+            user="Filter to one submitter (omit to show all)",
+        )
         @app_commands.choices(filter=_TRIAGE_CHOICES)
         async def _triage(
             interaction: discord.Interaction,
             filter: app_commands.Choice[str] | None = None,
+            user: discord.User | None = None,
         ) -> None:
-            await bot_ref._handle_triage_slash(interaction, filter)
+            await bot_ref._handle_triage_slash(interaction, filter, user)
+
+        @self.tree.command(name="status", description="Show what this submission is waiting on (run in its thread)")
+        async def _status(interaction: discord.Interaction) -> None:
+            await bot_ref._handle_status_slash(interaction)
 
         guild_ids = {b.discord_guild_id for b in self.settings.boards}
         log.info("syncing slash commands to %d guild(s): %s", len(guild_ids), guild_ids)
@@ -243,6 +255,16 @@ class RepostBot(discord.Client):
             elif custom_id.startswith("pl_skip:"):
                 await service.handle_playlist_skip_button(
                     session, interaction, int(custom_id.removeprefix("pl_skip:")),
+                    self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("alt_skip:"):
+                await service.handle_alt_skip_button(
+                    session, interaction, int(custom_id.removeprefix("alt_skip:")),
+                    self.settings, self._yt_client,
+                )
+            elif custom_id.startswith("no_source:"):
+                await service.handle_no_source_button(
+                    session, interaction, int(custom_id.removeprefix("no_source:")),
                     self.settings, self._yt_client,
                 )
 
@@ -439,6 +461,7 @@ class RepostBot(discord.Client):
         self,
         interaction: discord.Interaction,
         filter: app_commands.Choice[str] | None,
+        user: discord.User | None = None,
     ) -> None:
         """Handle /triage - list open submission threads for this board."""
         channel = interaction.channel
@@ -467,14 +490,48 @@ class RepostBot(discord.Client):
                 board_id=board.id,
                 guild_id=board_cfg.discord_guild_id,
                 state_filter=filter.value if filter else None,
+                user_id_filter=user.id if user else None,
             )
 
         content = _format_triage(
             items,
             channel_name=getattr(channel, "name", str(channel.id)),
             filter_label=filter.name if filter else None,
+            user_label=user.display_name if user else None,
         )
         await interaction.followup.send(content, ephemeral=True)
+
+    async def _handle_status_slash(self, interaction: discord.Interaction) -> None:
+        """Handle /status - show what the submission for this thread is waiting on."""
+        channel = interaction.channel
+        async with session_scope() as session:
+            submission = None
+            if channel is not None:
+                submission = await session.scalar(
+                    select(Submission)
+                    .join(
+                        SubmissionThread,
+                        (SubmissionThread.board_id == Submission.board_id)
+                        & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
+                    )
+                    .where(SubmissionThread.thread_id == channel.id)
+                )
+            if submission is None:
+                await interaction.response.send_message(
+                    "Run `/status` inside a submission's thread.", ephemeral=True
+                )
+                return
+
+            board_cfg = self.settings.board_for_channel(submission.channel_id)
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+                await interaction.response.send_message(
+                    "You're not authorised to view this submission.", ephemeral=True
+                )
+                return
+
+            content = await service.render_submission_status(session, submission)
+        await interaction.response.send_message(content, ephemeral=True)
 
     async def _run_channel_scan(
         self,
@@ -736,7 +793,9 @@ class RepostBot(discord.Client):
                 log.warning("thread catch-up failed for thread %s: %s", thread_id, exc)
                 continue
 
-            # Ensure all missing request messages (including the cancel button) are present.
+            # Ensure all missing request messages (including the cancel button and the
+            # live status checklist) are present. This is what backfills the checklist
+            # onto idle open submissions from before the feature existed.
             try:
                 async with session_scope() as session:
                     submission = await session.get(Submission, submission_id)
@@ -747,6 +806,10 @@ class RepostBot(discord.Client):
                         )
             except Exception:
                 log.exception("recompute_and_request failed for submission %s in thread %s", submission_id, thread_id)
+
+            # Pace the pass so a large pending backlog trickles out instead of
+            # bursting past Discord's global rate limit (each recompute may send).
+            await asyncio.sleep(_CATCHUP_INTER_THREAD_DELAY)
 
         log.info("thread catch-up scan complete: replayed %d event(s)", replayed)
         service._fire_and_forget(self._archive_queued_threads())

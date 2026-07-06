@@ -27,6 +27,7 @@ from bot.discord_ingest.service import recompute_and_request
 from bot.models import (
     Attachment,
     Board,
+    ConfirmationRequest,
     MetadataRequest,
     Submission,
     SubmissionLink,
@@ -85,14 +86,18 @@ async def test_fresh_transition_posts_confirmation_prompt(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    # State stops at READY_TO_QUEUE - waiting for ✅ reaction.
+    # State stops at READY_TO_QUEUE - waiting for the Queue button (now on the checklist).
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
-    assert replies.confirmation_request() in dest.sent
-    assert not any("queued" in m.lower() for m in dest.sent)
+    assert any("Ready to queue" in m for m in dest.sent)
+    conf = await session.scalar(
+        select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
+    )
+    assert conf is not None
+    assert not any("queued -" in m.lower() for m in dest.sent)
 
 
 # ---------------------------------------------------------------------------
-# Stuck READY_TO_QUEUE - confirmation prompt posted if not already there
+# Stuck READY_TO_QUEUE - confirmation registered if not already there
 # ---------------------------------------------------------------------------
 
 async def test_stuck_ready_to_queue_posts_confirmation_once(session, board):
@@ -103,10 +108,14 @@ async def test_stuck_ready_to_queue_posts_confirmation_once(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    # State stays READY_TO_QUEUE; confirmation prompt posted.
+    # State stays READY_TO_QUEUE; checklist shows ready and a confirmation is registered.
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
-    assert replies.confirmation_request() in dest.sent
-    assert not any("queued" in m.lower() for m in dest.sent)
+    assert any("Ready to queue" in m for m in dest.sent)
+    conf = await session.scalar(
+        select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
+    )
+    assert conf is not None
+    assert not any("queued -" in m.lower() for m in dest.sent)
 
     # Second recompute must not duplicate the prompt.
     dest2 = await _recompute(session, sub, board)
@@ -348,7 +357,7 @@ async def test_alt_text_request_posted_per_image(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    alt_text_msgs = [m for m in dest.sent if "alt text" in m.lower()]
+    alt_text_msgs = [m for m in dest.sent if "with the alt text for" in m]
     assert len(alt_text_msgs) == 2
 
 
@@ -373,7 +382,7 @@ async def test_alt_text_request_not_duplicated(session, board):
     dest1 = await _recompute(session, sub, board)
     dest2 = await _recompute(session, sub, board)
 
-    alt_text_msgs1 = [m for m in dest1.sent if "alt text" in m.lower()]
-    alt_text_msgs2 = [m for m in dest2.sent if "alt text" in m.lower()]
+    alt_text_msgs1 = [m for m in dest1.sent if "with the alt text for" in m]
+    alt_text_msgs2 = [m for m in dest2.sent if "with the alt text for" in m]
     assert len(alt_text_msgs1) == 1
     assert len(alt_text_msgs2) == 0  # already open, not re-posted

@@ -185,3 +185,128 @@ def test_format_post_preview_overflow_spans_multiple_pages():
     assert len(result) >= 2
     assert all(len(page) <= replies._DISCORD_MSG_LIMIT for page in result)
     assert any("cont." in page for page in result[1:])
+
+
+# ---------------------------------------------------------------------------
+# duplicate notices, _paginate boundaries, format_post_preview branches
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_queued_with_thread_url():
+    out = replies.duplicate_queued("https://discord.com/channels/1/2/3")
+    assert "already queued" in out
+    assert "https://discord.com/channels/1/2/3" in out
+
+
+def test_duplicate_queued_without_thread_url():
+    out = replies.duplicate_queued(None)
+    assert "already queued" in out
+    assert "https://" not in out
+
+
+def test_duplicate_pending_with_thread_url():
+    out = replies.duplicate_pending("https://discord.com/channels/1/2/3")
+    assert "already being processed" in out
+    assert "https://discord.com/channels/1/2/3" in out
+
+
+def test_duplicate_pending_without_thread_url():
+    out = replies.duplicate_pending(None)
+    assert "already being processed" in out
+    assert "https://" not in out
+
+
+def test_paginate_single_short_page():
+    pages = replies._paginate(["one", "two"])
+    assert pages == ["one\ntwo"]
+
+
+def test_paginate_empty_lines_returns_single_empty_page():
+    assert replies._paginate([]) == [""]
+
+
+def test_paginate_splits_at_limit_with_continuation_header():
+    long_line = "x" * (replies._DISCORD_MSG_LIMIT - 10)
+    pages = replies._paginate([long_line, "next-page-line"], header="-# (cont.)")
+    assert len(pages) == 2
+    assert pages[1].startswith("-# (cont.)")
+    assert "next-page-line" in pages[1]
+
+
+def test_paginate_hard_splits_overlong_single_line():
+    monster = "y" * (replies._DISCORD_MSG_LIMIT * 2 + 50)
+    pages = replies._paginate([monster], header="-# (cont.)")
+    assert len(pages) >= 3
+    assert all(len(page) <= replies._DISCORD_MSG_LIMIT for page in pages)
+    joined = "".join(page.replace("-# (cont.)", "").replace("\n", "") for page in pages)
+    assert joined.count("y") == len(monster)
+
+
+def _preview(**kw):
+    defaults = dict(
+        kind="external",
+        title="A title",
+        links=[("https://example.com/a", "other", "A title")],
+        images=[],
+        embed_title="Embed Title",
+        embed_description="Embed description",
+        embed_has_thumb=True,
+        board_name="robots",
+    )
+    defaults.update(kw)
+    return replies.PostPreview(**defaults)
+
+
+def test_preview_reply_to_url_shown():
+    pages = replies.format_post_preview(_preview(reply_to_bsky_url="https://bsky.app/parent"))
+    assert "reply-to: https://bsky.app/parent" in pages[0]
+
+
+def test_preview_reply_to_pending_shown():
+    pages = replies.format_post_preview(_preview(reply_to_pending=True))
+    assert "parent queued" in pages[0]
+
+
+def test_preview_record_kind():
+    pages = replies.format_post_preview(_preview(
+        kind="record",
+        links=[("https://bsky.app/profile/x/post/y", "bluesky", None)],
+    ))
+    assert "embed.record:" in pages[0]
+    assert "native repost" in pages[0]
+
+
+def test_preview_video_kind_counts_thread_posts():
+    pages = replies.format_post_preview(_preview(
+        kind="video",
+        videos=[("a.mp4", "first vid"), ("b.mp4", None)],
+        images=[("pic.jpg", "a pic")],
+    ))
+    text = pages[0]
+    # root video + 1 extra video reply + 1 image reply = 3 posts
+    assert "**thread 1/3:**" in text
+    assert "video reply" in text
+    assert "image reply" in text
+    assert '"first vid"' in text
+    assert "(no alt text)" in text  # b.mp4 has no alt
+
+
+def test_preview_extra_link_replies():
+    pages = replies.format_post_preview(_preview(
+        links=[
+            ("https://example.com/a", "other", "First"),
+            ("https://example.com/b", "other", "Second"),
+        ],
+    ))
+    text = "\n".join(pages)
+    assert "**thread 2/2:**" in text
+    assert "link reply" in text
+    assert "https://example.com/b" in text
+
+
+def test_preview_labels_and_graphic_line():
+    pages = replies.format_post_preview(_preview(labels=["sexual"], nsfw=True, graphic_status="graphic"))
+    text = pages[0]
+    assert "labels: sexual" in text
+    assert "NSFW" in text
+    assert "graphic: graphic" in text

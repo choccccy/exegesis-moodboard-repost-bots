@@ -44,6 +44,7 @@ class AltTextStatus(str, enum.Enum):
     NEEDED = "needed"
     PROVIDED = "provided"
     NOT_REQUIRED = "not_required"  # e.g. non-image attachment
+    SKIPPED = "skipped"  # OP/curator explicitly waived alt text for this attachment
 
 
 class GraphicStatus(str, enum.Enum):
@@ -85,6 +86,9 @@ class SubmissionSnapshot:
     resolved_via: str | None = None
     # True when the curator reacted 🔗 to confirm this is the best available link.
     metadata_confirmed: bool = False
+    # True when an OP/curator marked the post as having no findable source. The
+    # SOURCE gap is then satisfied and the post publishes with a "source unknown" note.
+    source_waived: bool = False
 
 
 def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
@@ -94,7 +98,7 @@ def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
     METADATA before IMAGE so that a better link has a chance to provide an image.
     """
     gaps: list[Gap] = []
-    if not snap.has_canonical_link:
+    if not snap.has_canonical_link and not snap.source_waived:
         gaps.append(Gap.SOURCE)
     if (
         snap.needs_metadata

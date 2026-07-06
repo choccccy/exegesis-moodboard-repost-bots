@@ -11,6 +11,8 @@ Custom ID scheme (must stay stable — old buttons carry these forever):
   pl_skip:{submission_id}   — skip YouTube playlist addition
   edit:{submission_id}      — open edit-post-text modal
   edit_post:{submission_id} — modal custom_id for post text editing
+  alt_skip:{attachment_id}  — waive alt text for one attachment
+  no_source:{submission_id} — waive the source requirement (no findable source)
 """
 
 from __future__ import annotations
@@ -102,6 +104,28 @@ def make_playlist_skip_view(submission_id: int) -> discord.ui.View:
         label="Skip playlist",
         emoji="⏹️",
         custom_id=f"pl_skip:{submission_id}",
+    ))
+    return view
+
+
+def make_alt_skip_view(attachment_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.secondary,
+        label="Skip alt text",
+        emoji="⏭️",
+        custom_id=f"alt_skip:{attachment_id}",
+    ))
+    return view
+
+
+def make_no_source_view(submission_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.secondary,
+        label="No known source",
+        emoji="🚫",
+        custom_id=f"no_source:{submission_id}",
     ))
     return view
 

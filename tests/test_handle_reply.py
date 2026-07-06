@@ -24,10 +24,12 @@ from bot.models import (
     Attachment,
     AttachmentAltTextRequest,
     Board,
+    MetadataRequest,
     SourceRequest,
     Submission,
     SubmissionLink,
     SupplementalImageRequest,
+    SupplementalLinkRequest,
 )
 from bot.state import AltTextStatus, SubmissionState
 
@@ -419,3 +421,206 @@ async def test_handle_reply_unknown_bot_message_returns_false(session, board):
 
     result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Metadata request: URL reply replaces the primary link and re-resolves
+# ---------------------------------------------------------------------------
+
+async def _add_metadata_request(session, submission: Submission) -> MetadataRequest:
+    req = MetadataRequest(
+        submission_id=submission.id,
+        bot_message_id=next(_NEXT_ID),
+    )
+    session.add(req)
+    await session.flush()
+    return req
+
+
+async def _add_supplemental_link_request(session, submission: Submission) -> SupplementalLinkRequest:
+    req = SupplementalLinkRequest(
+        submission_id=submission.id,
+        bot_message_id=next(_NEXT_ID),
+    )
+    session.add(req)
+    await session.flush()
+    return req
+
+
+def _add_primary_link(session, submission: Submission) -> SubmissionLink:
+    link = SubmissionLink(
+        submission_id=submission.id,
+        order_index=0,
+        raw_url="https://old.example.com/post",
+        canonical_url="https://old.example.com/post",
+        domain_family="other",
+        resolved_title="Old Title",
+        resolved_description="Old description",
+        resolved_image_url="https://old.example.com/img.jpg",
+        resolved_image_path="/vol/old.jpg",
+        resolved_via="opengraph",
+    )
+    session.add(link)
+    return link
+
+
+async def test_handle_reply_metadata_url_replaces_primary_link(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_BETTER_LINK.value)
+    session.add(sub)
+    await session.flush()
+    link = _add_primary_link(session, sub)
+    await session.flush()
+    req = await _add_metadata_request(session, sub)
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="https://www.artstation.com/artwork/better-link",
+    )
+    settings = _mock_settings()
+
+    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()) as mock_resolve, \
+         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+        result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is True
+    # primary link swapped in place, stale resolution cleared for the re-resolve
+    assert "artstation.com" in link.canonical_url
+    assert link.resolved_title is None
+    assert link.resolved_description is None
+    assert link.resolved_image_url is None
+    assert link.resolved_image_path is None
+    assert link.resolved_via is None
+    mock_resolve.assert_called_once()
+    msg.reply.assert_called_once()  # "link updated" ack
+    fresh_req = await session.get(MetadataRequest, req.id)
+    assert fresh_req.answered_at is not None
+
+
+async def test_handle_reply_metadata_no_url_nudges(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_BETTER_LINK.value)
+    session.add(sub)
+    await session.flush()
+    link = _add_primary_link(session, sub)
+    await session.flush()
+    req = await _add_metadata_request(session, sub)
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="just use the one I posted",  # no URL
+    )
+    settings = _mock_settings()
+
+    result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is True  # handled (nudge sent), request stays open
+    msg.reply.assert_called_once()
+    assert link.canonical_url == "https://old.example.com/post"  # untouched
+    fresh_req = await session.get(MetadataRequest, req.id)
+    assert fresh_req.answered_at is None
+
+
+# ---------------------------------------------------------------------------
+# Supplemental link request: URL appends a new link after the primary
+# ---------------------------------------------------------------------------
+
+async def test_handle_reply_supplemental_link_appends_link(session, board):
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    _add_primary_link(session, sub)
+    await session.flush()
+    req = await _add_supplemental_link_request(session, sub)
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="https://example.org/making-of",
+    )
+    settings = _mock_settings()
+
+    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()) as mock_resolve, \
+         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+        result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is True
+    links = list(await session.scalars(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == sub.id)
+        .order_by(SubmissionLink.order_index)
+    ))
+    assert len(links) == 2
+    assert links[1].order_index == 1
+    assert "example.org" in links[1].canonical_url
+    mock_resolve.assert_called_once()
+    fresh_req = await session.get(SupplementalLinkRequest, req.id)
+    assert fresh_req.answered_at is not None
+
+
+async def test_handle_reply_supplemental_link_no_url_nudges(session, board):
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    req = await _add_supplemental_link_request(session, sub)
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="no link, sorry",
+    )
+    settings = _mock_settings()
+
+    result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is True  # handled (nudge sent), request stays open
+    msg.reply.assert_called_once()
+    fresh_req = await session.get(SupplementalLinkRequest, req.id)
+    assert fresh_req.answered_at is None
+
+
+async def test_handle_reply_supplemental_link_without_existing_links_starts_at_one(session, board):
+    """With no existing links, supplemental links start at order_index 1,
+    leaving slot 0 free for a future primary/source link.
+    """
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    req = await _add_supplemental_link_request(session, sub)
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="https://example.org/extra",
+    )
+    settings = _mock_settings()
+
+    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()), \
+         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+        result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is True
+    links = list(await session.scalars(
+        select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
+    ))
+    assert len(links) == 1
+    assert links[0].order_index == 1
+
+
+# ---------------------------------------------------------------------------
+# Request whose submission row is gone
+# ---------------------------------------------------------------------------
+
+async def test_handle_reply_missing_submission_returns_false(session, board):
+    req = SourceRequest(submission_id=99999, bot_message_id=next(_NEXT_ID))
+    session.add(req)
+    await session.flush()
+
+    msg = _make_message(reply_to_id=req.bot_message_id, author_id=999, content="https://example.com/x")
+    settings = _mock_settings()
+
+    result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
+
+    assert result is False
+    fresh_req = await session.get(SourceRequest, req.id)
+    assert fresh_req.answered_at is None

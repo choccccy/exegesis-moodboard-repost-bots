@@ -236,3 +236,123 @@ async def test_handle_reaction_embed_url_ingested_when_no_text(session, board):
         )
     ))
     assert len(links) == 1
+
+
+# ---------------------------------------------------------------------------
+# Duplicate detection: same canonical URL as an existing active submission
+# ---------------------------------------------------------------------------
+
+DUP_URL = "https://example.com/cool-robot-post"
+
+
+async def _run_duplicate_reaction(session, board, *, existing_state, existing_thread_id):
+    """Seed an existing submission holding DUP_URL, then react to a new message
+    containing the same URL. Returns (result, new_thread, new_msg_id).
+    """
+    from bot.canonicalize import canonicalize
+
+    canon = canonicalize(DUP_URL)
+    existing = make_submission(
+        board,
+        source_discord_message_id=777,
+        state=existing_state,
+    )
+    existing.thread_id = existing_thread_id
+    session.add(existing)
+    await session.flush()
+    session.add(SubmissionLink(
+        submission_id=existing.id,
+        order_index=0,
+        raw_url=DUP_URL,
+        canonical_url=canon.canonical_url,
+        domain_family=canon.domain_family,
+    ))
+    await session.flush()
+
+    msg = _message(channel_id=board.discord_channel_id, msg_id=4242)
+    msg.content = DUP_URL
+    new_thread = _thread(thread_id=800)
+    msg.channel.create_thread.return_value = new_thread
+
+    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+         patch("bot.discord_ingest.service.remove_submission_dir"), \
+         patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock), \
+         patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:
+        result = await handle_reaction(
+            session,
+            settings=_settings(),
+            message=msg,
+            http_client=_http(),
+            skip_auth=True,
+        )
+    return result, new_thread, msg.id, mock_archive
+
+
+def _sent_texts(thread) -> list[str]:
+    return [
+        (call.args[0] if call.args else call.kwargs.get("content") or "")
+        for call in thread.send.call_args_list
+    ]
+
+
+async def test_duplicate_of_queued_posts_notice_with_thread_url(session, board):
+    """Second submission of a QUEUED URL gets the duplicate_queued notice
+    (with a link to the original thread), and the new submission is deleted.
+    """
+    result, new_thread, msg_id, mock_archive = await _run_duplicate_reaction(
+        session, board,
+        existing_state=SubmissionState.QUEUED.value,
+        existing_thread_id=888,
+    )
+
+    assert result is False
+    notices = [t for t in _sent_texts(new_thread) if "already queued" in t]
+    assert len(notices) == 1
+    assert "https://discord.com/channels/1/888" in notices[0]
+    # the new submission row is cleaned up; the notice thread is archived
+    remaining = await session.scalar(
+        select(Submission).where(Submission.source_discord_message_id == msg_id)
+    )
+    assert remaining is None
+    mock_archive.assert_called_once()
+
+
+async def test_duplicate_of_pending_posts_notice_with_thread_url(session, board):
+    """A non-queued active (pending) duplicate gets the duplicate_pending notice."""
+    result, new_thread, msg_id, _ = await _run_duplicate_reaction(
+        session, board,
+        existing_state=SubmissionState.AWAITING_SOURCE.value,
+        existing_thread_id=888,
+    )
+
+    assert result is False
+    notices = [t for t in _sent_texts(new_thread) if "already being processed" in t]
+    assert len(notices) == 1
+    assert "https://discord.com/channels/1/888" in notices[0]
+
+
+async def test_duplicate_of_queued_without_thread_omits_url(session, board):
+    """When the original submission has no thread, the notice has no link."""
+    result, new_thread, _, _ = await _run_duplicate_reaction(
+        session, board,
+        existing_state=SubmissionState.QUEUED.value,
+        existing_thread_id=None,
+    )
+
+    assert result is False
+    notices = [t for t in _sent_texts(new_thread) if "already queued" in t]
+    assert len(notices) == 1
+    assert "discord.com/channels" not in notices[0]
+
+
+async def test_duplicate_of_pending_without_thread_omits_url(session, board):
+    result, new_thread, _, _ = await _run_duplicate_reaction(
+        session, board,
+        existing_state=SubmissionState.INTENT_SUBMITTED.value,
+        existing_thread_id=None,
+    )
+
+    assert result is False
+    notices = [t for t in _sent_texts(new_thread) if "already being processed" in t]
+    assert len(notices) == 1
+    assert "discord.com/channels" not in notices[0]

@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 _MAX_GRAPHEMES = 300
 
+# Post text for a media post whose source was explicitly waived (no findable source).
+_SOURCE_UNKNOWN_TEXT = "source unknown"
+
 # Matches Bluesky hashtags: # followed by at least one letter (not a bare digit-only tag),
 # then any word characters. Negative lookbehind avoids matching inside URLs (#anchor).
 _TAG_RE = re.compile(r"(?<!\w)#([a-zA-Z][a-zA-Z0-9_]*)(?!\w)")
@@ -101,10 +104,7 @@ async def publish_submission(
             # For native reposts, show the original post's URL, not the repost record.
             result.bsky_url = links[0].canonical_url
         else:
-            try:
-                await client.like(result.at_uri, result.at_cid)
-            except Exception as exc:
-                log.warning("failed to like own post for submission %s: %s", submission.id, exc)
+            await _like_quietly(client, result.at_uri, result.at_cid)
             result.bsky_url = at_uri_to_url(result.at_uri, board_cfg.bluesky_handle)
             reply_uri, reply_cid = result.at_uri, result.at_cid
             if kind == "video":
@@ -292,6 +292,32 @@ async def _upload_blob(client: AsyncClient, path: str) -> tuple[object | None, s
         return None, _error_detail(exc)
 
 
+async def _like_quietly(client: AsyncClient, uri: str, cid: str) -> None:
+    """Like our own post, best-effort. A failure is logged, never raised, so it
+    can't break the publish or the reply chain. The URI identifies the post."""
+    try:
+        await client.like(uri, cid)
+    except Exception as exc:
+        log.warning("failed to like own post %s: %s", uri, exc)
+
+
+async def _external_embed(client: AsyncClient, link: SubmissionLink):
+    """Build an external-link embed card for a link, uploading its resolved
+    thumbnail if one was downloaded. Shared by the root external post and the
+    link-reply posts so replies get the same card as the root."""
+    thumb_blob = None
+    if link.resolved_image_path:
+        thumb_blob, _ = await _upload_blob(client, link.resolved_image_path)  # thumb is optional
+    return models.AppBskyEmbedExternal.Main(
+        external=models.AppBskyEmbedExternal.External(
+            uri=link.canonical_url,
+            title=link.resolved_title or link.canonical_url,
+            description=link.resolved_description or "",
+            thumb=thumb_blob,
+        )
+    )
+
+
 async def _create_post(
     client: AsyncClient,
     *,
@@ -407,6 +433,7 @@ async def _publish_reply_post(
     text, facets = _post_text_and_facets(title, url)
     text, facets = _append_tags(text, facets, tags)
 
+    embed = await _external_embed(client, link)
     reply_ref = models.AppBskyFeedPost.ReplyRef(
         root=models.ComAtprotoRepoStrongRef.Main(uri=root_uri, cid=root_cid),
         parent=models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
@@ -415,12 +442,13 @@ async def _publish_reply_post(
         client,
         text=text,
         facets=facets,
-        embed=None,
+        embed=embed,
         labels=labels,
         reply=reply_ref,
     )
     if not result.at_uri or not result.at_cid:
         raise RuntimeError("reply post creation returned no URI/CID")
+    await _like_quietly(client, result.at_uri, result.at_cid)
     return result.at_uri, result.at_cid
 
 
@@ -435,20 +463,8 @@ async def _publish_external(
     primary = links[0]
     url = primary.canonical_url
     title = primary.resolved_title
-    description = primary.resolved_description or ""
 
-    thumb_blob = None
-    if primary.resolved_image_path:
-        thumb_blob, _ = await _upload_blob(client, primary.resolved_image_path)  # thumb is optional
-
-    embed = models.AppBskyEmbedExternal.Main(
-        external=models.AppBskyEmbedExternal.External(
-            uri=url,
-            title=title or url,
-            description=description,
-            thumb=thumb_blob,
-        )
-    )
+    embed = await _external_embed(client, primary)
     text, facets = _post_text_and_facets(title, url)
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
@@ -494,7 +510,8 @@ async def _publish_images(
     if url:
         text, facets = _post_text_and_facets(title, url)
     else:
-        text, facets = "", []
+        # No link: the source was waived. Say so rather than posting bare media.
+        text, facets = _SOURCE_UNKNOWN_TEXT, []
 
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
@@ -570,7 +587,8 @@ async def _publish_video(
     if url:
         text, facets = _post_text_and_facets(title, url)
     else:
-        text, facets = "", []
+        # No link: the source was waived. Say so rather than posting bare media.
+        text, facets = _SOURCE_UNKNOWN_TEXT, []
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 
@@ -620,6 +638,7 @@ async def _publish_video_reply(
     result = await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply_ref)
     if not result.at_uri or not result.at_cid:
         raise RuntimeError("video reply post returned no URI/CID")
+    await _like_quietly(client, result.at_uri, result.at_cid)
     return result.at_uri, result.at_cid
 
 
@@ -674,6 +693,7 @@ async def _publish_image_reply(
     result = await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply_ref)
     if not result.at_uri or not result.at_cid:
         raise RuntimeError("image reply post returned no URI/CID")
+    await _like_quietly(client, result.at_uri, result.at_cid)
     return result.at_uri, result.at_cid
 
 

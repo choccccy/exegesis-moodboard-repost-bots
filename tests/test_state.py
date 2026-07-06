@@ -129,3 +129,31 @@ def test_metadata_gap_not_without_link():
 def test_source_precedes_metadata():
     s = snap(has_canonical_link=False, needs_metadata=True, resolved_via="none")
     assert missing_gaps(s)[0] == Gap.SOURCE
+
+
+# --- source_waived + skipped alt text (escape hatches) ---------------------
+
+
+def test_source_waived_suppresses_source_gap():
+    s = snap(has_canonical_link=False, source_waived=True)
+    assert Gap.SOURCE not in missing_gaps(s)
+    assert evaluate_state(s) == SubmissionState.READY_TO_QUEUE
+
+
+def test_source_waived_still_blocks_on_alt_text():
+    # Waiving source doesn't waive other gaps.
+    s = snap(has_canonical_link=False, source_waived=True,
+             image_alt_statuses=[AltTextStatus.NEEDED])
+    assert Gap.SOURCE not in missing_gaps(s)
+    assert evaluate_state(s) == SubmissionState.AWAITING_ALT_TEXT
+
+
+def test_skipped_alt_text_is_not_a_gap():
+    s = snap(image_alt_statuses=[AltTextStatus.SKIPPED, AltTextStatus.PROVIDED])
+    assert Gap.ALT_TEXT not in missing_gaps(s)
+    assert evaluate_state(s) == SubmissionState.READY_TO_QUEUE
+
+
+def test_mixed_skipped_and_needed_still_blocks():
+    s = snap(image_alt_statuses=[AltTextStatus.SKIPPED, AltTextStatus.NEEDED])
+    assert Gap.ALT_TEXT in missing_gaps(s)

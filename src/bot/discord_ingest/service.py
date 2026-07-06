@@ -143,14 +143,17 @@ async def fetch_triage_items(
     board_id: int,
     guild_id: int,
     state_filter: str | None = None,
+    user_id_filter: int | None = None,
 ) -> list[TriageItem]:
-    """Fetch open submissions for a board, optionally filtered by state."""
+    """Fetch open submissions for a board, optionally filtered by state and/or submitter."""
     filters = [
         Submission.board_id == board_id,
         ~Submission.state.in_(_TRIAGE_TERMINAL_STATES),
     ]
     if state_filter is not None:
         filters.append(Submission.state == state_filter)
+    if user_id_filter is not None:
+        filters.append(Submission.author_id == user_id_filter)
 
     rows = list(await session.execute(
         select(
@@ -1104,7 +1107,10 @@ async def handle_playlist_opt_out(
         if resolved_thread is not None and not resolved_thread.archived:
             queued_at = submission.updated_at
             if queued_at is not None and queued_at.tzinfo is None:
-                queued_at = queued_at.replace(tzinfo=timezone.utc)
+                # Unreachable here in practice: playlist_skipped=True above dirties
+                # the row, so autoflush fires onupdate=_utcnow (tz-aware) before this
+                # read. Kept as defense in depth against future reorderings.
+                queued_at = queued_at.replace(tzinfo=timezone.utc)  # pragma: no cover
             elapsed = (
                 (datetime.now(timezone.utc) - queued_at).total_seconds()
                 if queued_at else _THREAD_CLOSE_DELAY
@@ -1226,8 +1232,16 @@ async def handle_confirm_button(
     if not submission.playlist_skipped:
         videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg, yt_client)
 
+    # The Queue button lives on the live status checklist; re-render it as queued
+    # and disable the button (interaction.message is that checklist message).
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Queued ✅"))
+        await interaction.message.edit(
+            content=replies.status_checklist(
+                _snap, ready=True, terminal="queued",
+                source_domain=links[0].domain_family if links else None,
+            ),
+            view=views.make_disabled_view("Queued ✅"),
+        )
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone confirm button for submission %s: %s", submission_id, exc)
 
@@ -1339,6 +1353,108 @@ async def handle_graphic_button(
     channel = interaction.channel
     if channel is None:
         return
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_alt_skip_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    attachment_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Skip alt text button clicked: waive alt text for one attachment (OP or curator)."""
+    att = await session.get(Attachment, attachment_id)
+    if att is None:
+        await interaction.followup.send("Attachment not found.", ephemeral=True)
+        return
+    submission = await session.get(Submission, att.submission_id)
+    if submission is None:
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to skip alt text here.", ephemeral=True)
+        return
+    if att.alt_text_status != AltTextStatus.NEEDED.value:
+        await interaction.followup.send("Alt text already handled for this image.", ephemeral=True)
+        return
+
+    att.alt_text_status = AltTextStatus.SKIPPED.value
+    att.alt_text_author = user.id
+    req = await session.scalar(
+        select(AttachmentAltTextRequest).where(
+            AttachmentAltTextRequest.submission_id == submission.id,
+            AttachmentAltTextRequest.attachment_id == attachment_id,
+            AttachmentAltTextRequest.answered_at.is_(None),
+        )
+    )
+    if req is not None:
+        req.answer = "skipped"
+        req.answered_by = user.id
+        req.answered_at = _now()
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Alt text skipped ⏭️"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone alt-skip button for attachment %s: %s", attachment_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    await channel.send(replies.alt_text_skipped(att.filename))
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_no_source_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """No known source button: waive the source requirement (OP or curator).
+
+    Only offered when the post has uploaded media; the post then publishes with a
+    "source unknown" note instead of a link.
+    """
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        return
+
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
+        return
+    if submission.source_waived:
+        await interaction.followup.send("Already marked as no known source.", ephemeral=True)
+        return
+
+    submission.source_waived = True
+    req = await session.scalar(
+        select(SourceRequest).where(
+            SourceRequest.submission_id == submission.id,
+            SourceRequest.answered_at.is_(None),
+        )
+    )
+    if req is not None:
+        req.answer = "no_source"
+        req.answered_by = user.id
+        req.answered_at = _now()
+
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("No known source 🚫"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone no-source button for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    await channel.send(replies.no_source_marked())
     await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
@@ -1865,8 +1981,71 @@ async def _snapshot(
         needs_metadata=kind == "external",
         resolved_via=resolved_via,
         metadata_confirmed=confirmed_meta is not None,
+        source_waived=bool(submission.source_waived),
     )
     return snap, atts, links
+
+
+_STATUS_TERMINAL_FOOTER = {
+    SubmissionState.QUEUED.value: "queued",
+    SubmissionState.PUBLISHED.value: "published to Bluesky",
+    SubmissionState.PUBLISH_FAILED.value: "publish failed - will retry",
+}
+
+
+async def render_submission_status(session: AsyncSession, submission: Submission) -> str:
+    """Render the status checklist for a submission on demand (used by /status)."""
+    snap, _atts, links = await _snapshot(session, submission)
+    ready = evaluate_state(snap) == SubmissionState.READY_TO_QUEUE
+    source_domain = links[0].domain_family if links else None
+    terminal = _STATUS_TERMINAL_FOOTER.get(submission.state)
+    return replies.status_checklist(
+        snap, ready=ready, source_domain=source_domain, terminal=terminal
+    )
+
+
+async def _upsert_status_checklist(
+    submission: Submission,
+    destination: Notifier,
+    snap: SubmissionSnapshot,
+    *,
+    ready: bool,
+    source_domain: str | None,
+) -> None:
+    """Post the live 'post status' checklist once, then edit it in place thereafter.
+
+    Carries the Queue/Edit buttons when ``ready``. Best-effort: a failure to post or
+    edit the status message must never break the ingest flow.
+    """
+    content = replies.status_checklist(snap, ready=ready, source_domain=source_domain)
+    view = views.make_confirm_view(submission.id) if ready else None
+    try:
+        if submission.status_message_id is not None and await _edit_status_message(
+            destination, submission.status_message_id, content, view
+        ):
+            return
+        msg = await destination.send(content, view=view)
+        submission.status_message_id = msg.id
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("could not upsert status checklist for submission %s: %s", submission.id, exc)
+
+
+async def _edit_status_message(destination, message_id: int, content: str, view) -> bool:
+    """Edit the checklist message in place via the channel's partial-message API.
+
+    Returns True if the message was handled (edited, or a transient edit error that
+    shouldn't respawn it), False if the destination can't edit (caller sends fresh).
+    """
+    getter = getattr(destination, "get_partial_message", None)
+    if getter is None:
+        return False
+    try:
+        await getter(message_id).edit(content=content, view=view)
+    except discord.NotFound:
+        return False  # message was deleted - let the caller repost it
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("could not edit status message %s: %s", message_id, exc)
+    return True
 
 
 async def _has_open_request(session: AsyncSession, model, submission_id: int, **extra) -> bool:
@@ -2184,8 +2363,16 @@ async def recompute_and_request(
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
+        # Offer the "no known source" waiver only when there is media to post without a link.
+        has_media = any(a.is_image or a.is_video for a in atts)
         try:
-            msg = await destination.send(replies.source_request())
+            if has_media:
+                msg = await destination.send(
+                    replies.source_request_with_waiver(),
+                    view=views.make_no_source_view(submission.id),
+                )
+            else:
+                msg = await destination.send(replies.source_request())
             session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post source request for submission %s: %s", submission.id, exc)
@@ -2222,19 +2409,20 @@ async def recompute_and_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
+            skip_view = views.make_alt_skip_view(att.id)
             try:
                 if att.local_path and att.is_image:
                     try:
                         file = _discord_file_for_attachment(att.local_path, att.filename)
-                        msg = await destination.send(replies.alt_text_request(att.filename), file=file)
+                        msg = await destination.send(replies.alt_text_request(att.filename), file=file, view=skip_view)
                     except Exception as exc:
                         log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
                         msg = await destination.send(
-                            replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
+                            replies.alt_text_request(att.filename) + f"\n{att.discord_url}", view=skip_view
                         )
                 else:
                     msg = await destination.send(
-                        replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
+                        replies.alt_text_request(att.filename) + f"\n{att.discord_url}", view=skip_view
                     )
                 session.add(
                     AttachmentAltTextRequest(
@@ -2261,6 +2449,16 @@ async def recompute_and_request(
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post graphic request for submission %s: %s", submission.id, exc)
 
+    # Live status checklist: created once, edited in place each recompute. It is the
+    # glanceable source of truth for what's blocking, and carries the Queue/Edit
+    # buttons once ready. Skipped once the submission is terminal (queued/published).
+    ready = new_state == SubmissionState.READY_TO_QUEUE
+    source_domain = links[0].domain_family if links else None
+    if old_state not in _QUEUE_TERMINAL:
+        await _upsert_status_checklist(
+            submission, destination, snap, ready=ready, source_domain=source_domain
+        )
+
     action = _queue_action(old_state, new_state)
     if action in ("fresh", "silent"):
         has_conf = await session.scalar(
@@ -2273,20 +2471,31 @@ async def recompute_and_request(
                 preview = await _build_post_preview(session, submission, atts, links)
                 for page in replies.format_post_preview(preview):
                     await destination.send(page)
-                board_cfg_conf = settings.board_for_channel(submission.channel_id)
-                msg = await destination.send(
-                    replies.confirmation_request(
-                        bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
-                        youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
-                    ),
-                    view=views.make_confirm_view(submission.id),
-                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post preview for submission %s: %s", submission.id, exc)
+            # The queue button lives on the checklist; tie the ConfirmationRequest to it.
+            # If the checklist couldn't be posted, fall back to a standalone confirm message.
+            if submission.status_message_id is not None:
                 session.add(ConfirmationRequest(
                     submission_id=submission.id,
-                    bot_message_id=msg.id,
+                    bot_message_id=submission.status_message_id,
                 ))
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not post confirmation request for submission %s: %s", submission.id, exc)
+            else:
+                try:
+                    board_cfg_conf = settings.board_for_channel(submission.channel_id)
+                    msg = await destination.send(
+                        replies.confirmation_request(
+                            bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                            youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+                        ),
+                        view=views.make_confirm_view(submission.id),
+                    )
+                    session.add(ConfirmationRequest(
+                        submission_id=submission.id,
+                        bot_message_id=msg.id,
+                    ))
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("could not post confirmation request for submission %s: %s", submission.id, exc)
 
     # When a reply updates an already-queued submission and all pending alt-text gaps
     # are now resolved, confirm the update and re-schedule thread archiving.

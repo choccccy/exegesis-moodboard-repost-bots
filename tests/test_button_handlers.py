@@ -17,6 +17,7 @@ from bot.discord_ingest.service import (
     handle_edit_button,
     handle_graphic_button,
     handle_label_reaction,
+    handle_metadata_confirm_button,
     handle_metadata_reaction,
     handle_playlist_skip_button,
 )
@@ -28,6 +29,7 @@ from bot.models import (
     PublishAttempt,
     Submission,
     SubmissionLink,
+    YoutubePlaylistAdd,
 )
 from bot.state import GraphicStatus, SubmissionState
 
@@ -702,3 +704,229 @@ async def test_apply_post_edits_no_link_no_crash(session, board):
 
     # Should not raise
     await apply_post_edits(session, submission_id=sub.id, new_title="Anything")
+
+
+# ---------------------------------------------------------------------------
+# handle_metadata_confirm_button
+# ---------------------------------------------------------------------------
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_metadata_confirm_button_happy_path(mock_recompute, session, board):
+    """Curator clicks 'use link as-is': request marked confirmed, recompute runs."""
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = MetadataRequest(submission_id=sub.id, bot_message_id=6000)
+    session.add(req)
+    await session.flush()
+
+    channel = _channel_mock()
+    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
+    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+
+    assert req.answer == "confirmed"
+    assert req.answered_by == CURATOR_ID
+    assert req.answered_at is not None
+    interaction.message.edit.assert_called_once()  # button tombstoned
+    channel.send.assert_called_once()  # metadata_confirmed notice
+    mock_recompute.assert_called_once()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_metadata_confirm_button_unauthorized_rejected(mock_recompute, session, board):
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = MetadataRequest(submission_id=sub.id, bot_message_id=6001)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=777)  # not OP, not curator
+    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+
+    assert req.answer is None
+    assert req.answered_at is None
+    interaction.followup.send.assert_called_once()
+    mock_recompute.assert_not_called()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_metadata_confirm_button_already_answered(mock_recompute, session, board):
+    """No open MetadataRequest: replies 'Already confirmed.' and stops."""
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = MetadataRequest(submission_id=sub.id, bot_message_id=6002)
+    req.answer = "confirmed"
+    req.answered_at = datetime.now(timezone.utc)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+
+    interaction.followup.send.assert_called_once()
+    mock_recompute.assert_not_called()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_metadata_confirm_button_missing_submission(mock_recompute, session, board):
+    """Open request whose submission row is gone: silent no-op."""
+    req = MetadataRequest(submission_id=99999, bot_message_id=6003)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    await handle_metadata_confirm_button(session, interaction, 99999, _settings())
+
+    assert req.answer is None
+    interaction.followup.send.assert_not_called()
+    mock_recompute.assert_not_called()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_metadata_confirm_button_no_channel_skips_recompute(mock_recompute, session, board):
+    """interaction.channel is None: request still answered, no notice/recompute."""
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = MetadataRequest(submission_id=sub.id, bot_message_id=6004)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    interaction.channel = None
+    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+
+    assert req.answer == "confirmed"
+    mock_recompute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# handle_graphic_button - uncovered branches
+# ---------------------------------------------------------------------------
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_graphic_button_missing_submission(mock_recompute, session, board):
+    """Open request whose submission row is gone: silent no-op."""
+    req = ContentLabelRequest(submission_id=99999, bot_message_id=5002)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    await handle_graphic_button(session, interaction, 99999, _settings())
+
+    assert req.answered_at is None
+    mock_recompute.assert_not_called()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_graphic_button_tombstone_failure_tolerated(mock_recompute, session, board):
+    """A failing message.edit (tombstone) must not block the classification."""
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = ContentLabelRequest(submission_id=sub.id, bot_message_id=5003)
+    session.add(req)
+    await session.flush()
+
+    channel = _channel_mock()
+    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
+    interaction.message.edit.side_effect = discord.HTTPException(MagicMock(), "no")
+    await handle_graphic_button(session, interaction, sub.id, _settings())
+
+    assert sub.graphic_status == GraphicStatus.GRAPHIC.value
+    assert req.answered_at is not None
+    mock_recompute.assert_called_once()
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_graphic_button_no_channel_skips_recompute(mock_recompute, session, board):
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    session.add(sub)
+    await session.flush()
+
+    req = ContentLabelRequest(submission_id=sub.id, bot_message_id=5004)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    interaction.channel = None
+    await handle_graphic_button(session, interaction, sub.id, _settings())
+
+    assert sub.graphic_status == GraphicStatus.GRAPHIC.value
+    mock_recompute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# handle_playlist_skip_button - uncovered branches
+# ---------------------------------------------------------------------------
+
+
+async def test_playlist_skip_submission_not_found(session, board):
+    interaction = _interaction(user_id=CURATOR_ID)
+    await handle_playlist_skip_button(session, interaction, 99999, _settings())
+
+    interaction.followup.send.assert_called_once()
+
+
+@patch("bot.discord_ingest.service._do_playlist_remove", new_callable=AsyncMock)
+async def test_playlist_skip_removes_existing_playlist_adds(mock_remove, session, board):
+    """Opting out after a successful playlist add removes the video."""
+    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
+    sub.playlist_skipped = False
+    session.add(sub)
+    await session.flush()
+
+    row = YoutubePlaylistAdd(
+        board_id=board.id,
+        source_discord_message_id=sub.source_discord_message_id,
+        video_id="dQw4w9WgXcQ",
+        playlist_id="PL123",
+        discord_requester_id=AUTHOR_ID,
+        success=True,
+    )
+    session.add(row)
+    await session.flush()
+
+    channel = _channel_mock()
+    interaction = _interaction(user_id=AUTHOR_ID, channel=channel)
+    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+
+    assert sub.playlist_skipped is True
+    mock_remove.assert_called_once()
+    assert mock_remove.call_args[0][0] is row
+
+
+@patch("bot.discord_ingest.service._archive_thread_after_delay_seconds")
+@patch("bot.discord_ingest.service._fire_and_forget")
+@patch("bot.discord_ingest.service._resolve_thread_by_id", new_callable=AsyncMock)
+async def test_playlist_skip_on_queued_schedules_archive(
+    mock_resolve_thread, mock_fire, mock_delay, session, board
+):
+    """Skipping the playlist on an already-queued submission re-schedules the
+    thread archive with the remaining close delay.
+    """
+    mock_resolve_thread.return_value = _thread_mock(thread_id=500)
+    mock_delay.return_value = MagicMock()  # avoid creating a real coroutine
+
+    sub = make_submission(board, state=SubmissionState.QUEUED.value, channel_id=100, author_id=AUTHOR_ID)
+    sub.playlist_skipped = False
+    sub.thread_id = 500
+    session.add(sub)
+    await session.flush()
+
+    channel = _channel_mock()
+    interaction = _interaction(user_id=AUTHOR_ID, channel=channel)
+    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+
+    assert sub.playlist_skipped is True
+    mock_resolve_thread.assert_called_once()
+    mock_fire.assert_called_once()

@@ -71,6 +71,13 @@ class Submission(Base):
     # Message ID of the ⏹️ opt-out prompt posted in the submission thread.
     playlist_opt_out_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
+    # Set True when an OP/curator marks the post as having no findable source; the
+    # SOURCE requirement is then waived and the post publishes with a "source unknown" note.
+    source_waived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Message ID of the live "post status" checklist message in the submission thread,
+    # edited in place as gaps are filled. Null until the checklist is first posted.
+    status_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     # Captured from the Discord-generated link embed at ingest. Feeds the
     # external-embed preview and the at-least-one-image check (thumb).
     embed_title: Mapped[str | None] = mapped_column(Text, nullable=True)

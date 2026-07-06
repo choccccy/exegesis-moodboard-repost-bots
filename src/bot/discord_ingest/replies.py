@@ -5,6 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..moderation import GRAPHIC_YES_EMOJI
+from ..state import AltTextStatus, Gap, GraphicStatus, missing_gaps
+
+_GAP_LABEL = {
+    Gap.SOURCE: "source",
+    Gap.METADATA: "embed metadata",
+    Gap.IMAGE: "image",
+    Gap.ALT_TEXT: "alt text",
+}
 
 METADATA_CONFIRM_EMOJI = "🔗"
 CANCEL_EMOJI = "❌"
@@ -14,6 +22,86 @@ CONFIRMATION_EMOJI = "✅"
 
 def source_request() -> str:
     return "**reply to this message** with the source URL"
+
+
+def source_request_with_waiver() -> str:
+    """Source prompt shown when a 'No known source' button is offered (media present)."""
+    return (
+        "**reply to this message** with the source URL.\n"
+        "-# genuinely no findable source? use **No known source** below - but *only* if you "
+        "truly can't find it. try a Google or reverse image search (images.google.com, TinEye, "
+        "SauceNAO) first."
+    )
+
+
+def no_source_marked() -> str:
+    return 'marked as no known source - this post will publish with a "source unknown" note'
+
+
+def alt_text_skipped(filename: str) -> str:
+    return f"alt text skipped for **{filename}**"
+
+
+def status_checklist(
+    snap,
+    *,
+    ready: bool,
+    source_domain: str | None = None,
+    terminal: str | None = None,
+) -> str:
+    """Render the live 'post status' checklist for a submission thread.
+
+    One glanceable message, edited in place as gaps are filled, that makes the
+    limiting factor obvious. ``snap`` is a state.SubmissionSnapshot. ``terminal``
+    (e.g. "queued") renders a final footer instead of the blocked/ready one.
+    """
+    lines: list[str] = ["**post status**"]
+
+    if snap.has_canonical_link:
+        lines.append(f"✅ source: {source_domain}" if source_domain else "✅ source")
+    elif snap.source_waived:
+        lines.append("🚫 source: unknown (waived)")
+    else:
+        lines.append("⛔ source - reply with the source URL")
+
+    if snap.needs_metadata:
+        meta_ok = snap.metadata_confirmed or snap.resolved_via not in (None, "none")
+        lines.append(
+            "✅ embed metadata" if meta_ok
+            else "⛔ embed - reply with a better link or attach an image"
+        )
+
+    if snap.needs_image:
+        lines.append("✅ image" if snap.has_image else "⛔ image - attach at least one")
+
+    statuses = snap.image_alt_statuses
+    if statuses:
+        needed = sum(1 for s in statuses if s == AltTextStatus.NEEDED)
+        skipped = sum(1 for s in statuses if s == AltTextStatus.SKIPPED)
+        if needed:
+            lines.append(f"⛔ alt text - needed for {needed} of {len(statuses)} image(s)")
+        else:
+            lines.append(f"✅ alt text ({skipped} skipped)" if skipped else "✅ alt text")
+
+    if snap.graphic_classification_required:
+        if snap.graphic_status != GraphicStatus.UNKNOWN:
+            lines.append(f"✅ graphic label: {snap.graphic_status.value}")
+        else:
+            lines.append("◽ graphic label (optional) - not set")
+
+    lines.append("")
+    if terminal == "queued":
+        lines.append("✅ **Queued** - will post at the next available slot.")
+    elif terminal:
+        lines.append(f"-# {terminal}")
+    elif ready:
+        lines.append("✅ **Ready to queue** - use the button below.")
+    else:
+        blockers = [_GAP_LABEL[g] for g in missing_gaps(snap)]
+        joined = ", ".join(blockers) if blockers else "nothing"
+        lines.append(f"⛔ **Not queued yet** - blocked on: {joined}")
+
+    return "\n".join(lines)
 
 
 def image_request() -> str:
@@ -258,47 +346,35 @@ _DISCORD_MSG_LIMIT = 1900
 def _paginate(lines: list[str], *, header: str = "") -> list[str]:
     """Split lines into Discord-safe pages (≤ _DISCORD_MSG_LIMIT chars each).
 
-    Continuation pages start with `header` so the reader has context.
-    Lines that individually exceed the limit are hard-split as a last resort.
+    Continuation pages start with `header` so the reader has context. The
+    header counts against the page budget, so no page ever exceeds the limit -
+    lines too long for the remaining space are hard-split as a last resort.
     """
     pages: list[str] = []
     current: list[str] = []
-    current_len = 0
+    current_len = 0  # length of "\n".join(current), counted conservatively
 
-    def _flush() -> None:
+    def _start_continuation() -> None:
+        nonlocal current, current_len
         if current:
             pages.append("\n".join(current))
-        current.clear()
-        nonlocal current_len
-        current_len = 0
-
-    def _continuation_prefix() -> list[str]:
-        return [header, ""] if header else []
+        current = [header, ""] if header else []
+        current_len = sum(len(l) + 1 for l in current)
 
     for line in lines:
-        # Hard-split a single line that's too long to fit in any page.
-        while len(line) > _DISCORD_MSG_LIMIT:
-            chunk = line[:_DISCORD_MSG_LIMIT]
-            line = line[_DISCORD_MSG_LIMIT:]
-            if current:
-                _flush()
-                current.extend(_continuation_prefix())
-                current_len = sum(len(l) + 1 for l in current)
-            current.append(chunk)
-            _flush()
-            current.extend(_continuation_prefix())
-            current_len = sum(len(l) + 1 for l in current)
-
-        needed = len(line) + (1 if current else 0)
-        if current and current_len + needed > _DISCORD_MSG_LIMIT:
-            _flush()
-            current.extend(_continuation_prefix())
-            current_len = sum(len(l) + 1 for l in current)
-
+        while True:
+            room = _DISCORD_MSG_LIMIT - current_len - (1 if current else 0)
+            if len(line) <= room:
+                break
+            if room > 20:  # worth filling the rest of this page before splitting
+                current.append(line[:room])
+                line = line[room:]
+            _start_continuation()
         current.append(line)
-        current_len += needed
+        current_len += len(line) + 1
 
-    _flush()
+    if current:
+        pages.append("\n".join(current))
     return pages or [""]
 
 
@@ -339,7 +415,12 @@ def format_post_preview(p: PostPreview) -> list[str]:
     lines.append("text:")
     if p.title:
         lines.append(f"  {p.title}")
-    lines.append(f"  {primary_url}" if primary_url else "  (none)")
+    if primary_url:
+        lines.append(f"  {primary_url}")
+    elif p.images or p.videos:
+        lines.append("  source unknown")  # sourceless media post (source waived)
+    else:
+        lines.append("  (none)")
 
     if p.kind == "video":
         first_vid = p.videos[0] if p.videos else None

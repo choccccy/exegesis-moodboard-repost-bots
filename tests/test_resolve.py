@@ -682,3 +682,592 @@ async def test_resolve_reddit_regular_video_has_no_video_url():
     result = await resolve("https://www.reddit.com/r/robots/comments/def/video/", "reddit", client=client)
     assert result.video_url is None
     assert result.image_url == "https://preview.redd.it/still.jpg"
+
+
+# --- service._resolve_links thumbnail download (wikimedia headers + discord proxy fallback) ---
+#
+# These live here for topic proximity (they exercise how resolved metadata is
+# turned into a downloaded thumbnail) but the code under test is
+# bot.discord_ingest.service._resolve_links. resolve() and download_attachment
+# are patched at the service module level.
+
+import httpx
+
+from bot.discord_ingest.service import _resolve_links
+from bot.models import SubmissionLink
+from bot.resolve.fetch import ResolvedMetadata, _UA
+
+from conftest import make_submission
+
+
+def _link_settings(tmp_path) -> MagicMock:
+    s = MagicMock()
+    s.attachments_dir = str(tmp_path / "attachments")
+    s.data_dir = str(tmp_path)
+    s.storage_min_free_mb = 0
+    s.youtube_api_key = None
+    return s
+
+
+async def _seed_link(session, board, url: str, family: str = "other"):
+    """Create a submission holding a single unresolved link; returns (submission, link)."""
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    link = SubmissionLink(
+        submission_id=sub.id,
+        order_index=0,
+        raw_url=url,
+        canonical_url=url,
+        domain_family=family,
+    )
+    session.add(link)
+    await session.flush()
+    return sub, link
+
+
+@pytest.mark.asyncio
+async def test_resolve_links_wikimedia_image_gets_referer_and_ua(session, board, tmp_path):
+    """upload.wikimedia.org thumbnails are fetched with a Referer + resolver UA
+    (their CDN 403s bare requests).
+    """
+    submission, link = await _seed_link(session, board, "https://en.wikipedia.org/wiki/Oshkosh_NGDV", "wikipedia")
+    meta = ResolvedMetadata(
+        title="Oshkosh NGDV",
+        image_url="https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg",
+        via="wikipedia_api",
+    )
+
+    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
+         patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_1")) as dl:
+        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+
+    dl.assert_called_once()
+    headers = dl.call_args.kwargs["headers"]
+    assert headers["Referer"] == "https://en.wikipedia.org/"
+    assert headers["User-Agent"] == _UA
+    assert link.resolved_image_path == "/vol/thumb_1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_links_non_wikimedia_image_gets_no_extra_headers(session, board, tmp_path):
+    submission, link = await _seed_link(session, board, "https://example.com/post")
+    meta = ResolvedMetadata(title="Post", image_url="https://cdn.example.com/img.jpg", via="opengraph")
+
+    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
+         patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_2")) as dl:
+        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+
+    dl.assert_called_once()
+    assert dl.call_args.kwargs["headers"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_links_falls_back_to_discord_proxy(session, board, tmp_path):
+    """Primary thumbnail download fails: the Discord CDN proxy copy is tried
+    and its path recorded.
+    """
+    submission, link = await _seed_link(session, board, "https://www.furaffinity.net/view/123/")
+    meta = ResolvedMetadata(title="Art", image_url="https://d.furaffinity.net/art/x.png", via="opengraph")
+    proxy = "https://media.discordapp.net/external/proxy.png"
+
+    dl = AsyncMock(side_effect=[httpx.HTTPError("403 blocked"), "/vol/thumb_proxy"])
+    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
+         patch("bot.discord_ingest.service.download_attachment", new=dl):
+        await _resolve_links(
+            session, submission, _link_settings(tmp_path), MagicMock(),
+            embed_thumb_proxy_url=proxy,
+        )
+
+    assert dl.call_count == 2
+    assert dl.call_args_list[0].kwargs["url"] == meta.image_url
+    assert dl.call_args_list[1].kwargs["url"] == proxy
+    assert link.resolved_image_path == "/vol/thumb_proxy"
+
+
+@pytest.mark.asyncio
+async def test_resolve_links_proxy_failure_swallowed(session, board, tmp_path):
+    """Both the source CDN and the Discord proxy failing is non-fatal:
+    metadata is kept, resolved_image_path just stays unset.
+    """
+    submission, link = await _seed_link(session, board, "https://www.furaffinity.net/view/456/")
+    meta = ResolvedMetadata(title="Art", image_url="https://d.furaffinity.net/art/y.png", via="opengraph")
+
+    dl = AsyncMock(side_effect=[httpx.HTTPError("403"), httpx.HTTPError("404")])
+    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
+         patch("bot.discord_ingest.service.download_attachment", new=dl):
+        await _resolve_links(
+            session, submission, _link_settings(tmp_path), MagicMock(),
+            embed_thumb_proxy_url="https://media.discordapp.net/external/other.png",
+        )
+
+    assert dl.call_count == 2
+    assert link.resolved_image_path is None
+    assert link.resolved_title == "Art"
+
+
+@pytest.mark.asyncio
+async def test_resolve_links_no_proxy_url_single_attempt(session, board, tmp_path):
+    """Download failure with no Discord proxy available: exactly one attempt."""
+    submission, link = await _seed_link(session, board, "https://example.com/no-proxy")
+    meta = ResolvedMetadata(title="Post", image_url="https://cdn.example.com/z.jpg", via="opengraph")
+
+    dl = AsyncMock(side_effect=httpx.HTTPError("boom"))
+    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
+         patch("bot.discord_ingest.service.download_attachment", new=dl):
+        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+
+    assert dl.call_count == 1
+    assert link.resolved_image_path is None
+
+
+# ---------------------------------------------------------------------------
+# youtube api, wikipedia, reddit branches, mirrors, and resolve() fallbacks
+# ---------------------------------------------------------------------------
+
+from bot.resolve.fetch import (
+    _youtube_video_id,
+    _youtube_watch_url,
+    _deviantart_mirror_url,
+    _reddit_image_url,
+)
+
+
+def _json_response(payload, status=200):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json = MagicMock(return_value=payload)
+    return resp
+
+
+def test_youtube_video_id_variants():
+    assert _youtube_video_id("https://youtu.be/abc123") == "abc123"
+    assert _youtube_video_id("https://www.youtube.com/watch?v=xyz") == "xyz"
+    assert _youtube_video_id("https://youtu.be/") is None
+    assert _youtube_video_id("https://example.com/watch?v=xyz") is None
+
+
+def test_youtube_watch_url_conversion():
+    assert _youtube_watch_url("https://youtu.be/abc") == "https://www.youtube.com/watch?v=abc"
+    assert _youtube_watch_url("https://youtu.be/") == "https://youtu.be/"
+    assert _youtube_watch_url("https://www.youtube.com/watch?v=abc") == "https://www.youtube.com/watch?v=abc"
+
+
+def test_deviantart_mirror_url():
+    assert "fixdeviantart.com" in _deviantart_mirror_url("https://www.deviantart.com/a/art/B-1")
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_used_when_key_present():
+    client = AsyncMock()
+    client.get.return_value = _json_response({
+        "items": [{"snippet": {
+            "title": "Video Title",
+            "channelTitle": "Channel",
+            "thumbnails": {"maxres": {"url": "https://i.ytimg.com/vi/x/maxresdefault.jpg"}},
+        }}]
+    })
+    result = await resolve(
+        "https://www.youtube.com/watch?v=x", "youtube",
+        client=client, youtube_api_key="KEY",
+    )
+    assert result.title == "Video Title"
+    assert result.via == "youtube_api"
+    assert "googleapis.com" in client.get.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_non_200_falls_to_oembed():
+    client = AsyncMock()
+    client.get.side_effect = [
+        _json_response({}, status=403),               # data api quota
+        _oembed_response("Fallback Title"),           # oembed
+    ]
+    result = await resolve(
+        "https://www.youtube.com/watch?v=x", "youtube",
+        client=client, youtube_api_key="KEY",
+    )
+    assert result.title == "Fallback Title"
+    assert result.via == "oembed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_empty_items_falls_through():
+    client = AsyncMock()
+    client.get.side_effect = [
+        _json_response({"items": []}),
+        _oembed_response("OEmbed Title"),
+    ]
+    result = await resolve(
+        "https://www.youtube.com/watch?v=x", "youtube",
+        client=client, youtube_api_key="KEY",
+    )
+    assert result.via == "oembed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_thumbnail_priority():
+    client = AsyncMock()
+    client.get.return_value = _json_response({
+        "items": [{"snippet": {
+            "title": "T", "channelTitle": "C",
+            "thumbnails": {"default": {"url": "https://i.ytimg.com/vi/x/default.jpg"},
+                           "high": {"url": "https://i.ytimg.com/vi/x/hq.jpg"}},
+        }}]
+    })
+    result = await resolve("https://youtu.be/x", "youtube", client=client, youtube_api_key="KEY")
+    assert result.image_url == "https://i.ytimg.com/vi/x/hq.jpg"  # high beats default
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_api():
+    client = AsyncMock()
+    client.get.return_value = _json_response({
+        "title": "Robot",
+        "description": "mechanical being",
+        "thumbnail": {"source": "https://upload.wikimedia.org/robot.jpg"},
+    })
+    result = await resolve("https://en.wikipedia.org/wiki/Robot", "wikipedia", client=client)
+    assert result.title == "Robot"
+    assert result.via == "wikipedia_api"
+    assert "api/rest_v1/page/summary/Robot" in client.get.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_bad_path_falls_to_opengraph():
+    client = AsyncMock()
+    client.get.return_value = _html_response("Wiki OG")
+    result = await resolve("https://en.wikipedia.org/notwiki", "wikipedia", client=client)
+    assert result.title == "Wiki OG"
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_non_200_and_parse_error():
+    client = AsyncMock()
+    bad_json = MagicMock()
+    bad_json.status_code = 200
+    bad_json.json = MagicMock(side_effect=ValueError("nope"))
+    bad_json.headers = {"content-type": "text/html"}
+    bad_json.text = "<html><head><title>fallback</title></head></html>"
+    bad_json.url = "https://en.wikipedia.org/wiki/X"
+    bad_json.raise_for_status = MagicMock()
+    client.get.side_effect = [_json_response({}, status=503), bad_json]
+    result = await resolve("https://en.wikipedia.org/wiki/X", "wikipedia", client=client)
+    # api 503 -> opengraph fallback fetch of the canonical page
+    assert result.via in ("html", "none", "opengraph")
+
+
+def test_reddit_image_url_direct_and_extension():
+    assert _reddit_image_url({"url": "https://i.redd.it/abc.jpg"}) == "https://i.redd.it/abc.jpg"
+    assert _reddit_image_url({"url": "https://cdn.example.com/pic.PNG"}) == "https://cdn.example.com/pic.PNG"
+    assert _reddit_image_url({"url": "https://example.com/page", "preview": {
+        "images": [{"source": {"url": "https://preview.redd.it/x?a=1&amp;b=2"}}]
+    }}) == "https://preview.redd.it/x?a=1&b=2"
+    assert _reddit_image_url({"url": "https://example.com/page"}) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_unexpected_shape_falls_to_mirror():
+    client = AsyncMock()
+    client.get.side_effect = [
+        _json_response({"unexpected": True}),   # json api wrong shape
+        _html_response("vxreddit OG"),          # vxreddit mirror
+    ]
+    result = await resolve("https://www.reddit.com/r/x/comments/1/t/", "reddit", client=client)
+    assert result.title == "vxreddit OG"
+    assert "vxreddit.com" in client.get.call_args_list[1][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_crosspost_parent_image():
+    client = AsyncMock()
+    client.get.return_value = _json_response([
+        {"data": {"children": [{"data": {
+            "title": "xpost", "subreddit_name_prefixed": "r/x",
+            "url": "https://example.com/page",
+            "crosspost_parent_list": [{"url": "https://i.redd.it/orig.jpg"}],
+        }}]}}
+    ])
+    result = await resolve("https://www.reddit.com/r/x/comments/1/t/", "reddit", client=client)
+    assert result.image_url == "https://i.redd.it/orig.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_opengraph_non_html_content_type():
+    client = AsyncMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "application/pdf"}
+    resp.raise_for_status = MagicMock()
+    client.get.return_value = resp
+    result = await resolve("https://example.com/doc.pdf", "other", client=client)
+    assert result.via == "none"
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_to_discord_embed_values():
+    client = AsyncMock()
+    client.get.side_effect = httpx.ConnectError("down")
+    result = await resolve(
+        "https://example.com/x", "other", client=client,
+        fallback_title="Discord Title", fallback_image_url="https://cdn.discord.com/t.jpg",
+    )
+    assert result.title == "Discord Title"
+    assert result.via == "discord"
+
+
+@pytest.mark.asyncio
+async def test_resolve_nothing_anywhere_is_none():
+    client = AsyncMock()
+    client.get.side_effect = httpx.ConnectError("down")
+    result = await resolve("https://example.com/x", "other", client=client)
+    assert result.via == "none"
+    assert result.title is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_tiktok_http_error_and_bad_json():
+    client = AsyncMock()
+    client.get.side_effect = [httpx.ConnectError("down"), _html_response("TikTok Page")]
+    result = await resolve("https://www.tiktok.com/@u/video/1", "tiktok", client=client)
+    assert result.title == "TikTok Page"
+
+    client2 = AsyncMock()
+    bad = MagicMock()
+    bad.status_code = 200
+    bad.json = MagicMock(side_effect=ValueError)
+    client2.get.side_effect = [bad, _html_response("TikTok Page 2")]
+    result2 = await resolve("https://www.tiktok.com/@u/video/2", "tiktok", client=client2)
+    assert result2.title == "TikTok Page 2"
+
+
+@pytest.mark.asyncio
+async def test_resolve_tikwm_no_cover_no_author_falls_through():
+    client = AsyncMock()
+    client.get.side_effect = [_json_response({"data": {}}), _html_response("TT OG")]
+    result = await resolve("https://www.tiktok.com/@u/video/3", "tiktok", client=client)
+    assert result.title == "TT OG"
+
+
+@pytest.mark.asyncio
+async def test_resolve_deviantart_thumbnail_fallback_to_url():
+    client = AsyncMock()
+    client.get.return_value = _json_response({
+        "title": "Art", "author_name": "Artist", "url": "https://cdn.da.com/full.png",
+    })
+    result = await resolve("https://www.deviantart.com/a/art/B-1", "deviantart", client=client)
+    assert result.image_url == "https://cdn.da.com/full.png"
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_no_video_id_falls_to_oembed():
+    client = AsyncMock()
+    client.get.return_value = _oembed_response("Playlist Page")
+    # A playlist URL has no v= parameter, so the data API step is skipped entirely.
+    result = await resolve(
+        "https://www.youtube.com/playlist?list=PLx", "youtube",
+        client=client, youtube_api_key="KEY",
+    )
+    assert result.via == "oembed"
+    assert "oembed" in client.get.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_oembed_non_200_falls_to_watch_page():
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(401), _html_response("Watch Page")]
+    result = await resolve("https://www.youtube.com/watch?v=x", "youtube", client=client)
+    assert result.title == "Watch Page"
+
+
+@pytest.mark.asyncio
+async def test_resolve_instagram_oembed_bad_json_falls_through():
+    client = AsyncMock()
+    bad = MagicMock()
+    bad.status_code = 200
+    bad.json = MagicMock(side_effect=ValueError)
+    client.get.side_effect = [bad, _html_response("IG Mirror")]
+    result = await resolve("https://www.instagram.com/p/abc/", "instagram", client=client)
+    assert result.title == "IG Mirror"
+    assert "kkinstagram.com" in client.get.call_args_list[1][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_non_status_url_skips_apis():
+    client = AsyncMock()
+    client.get.return_value = _html_response("Profile Page")
+    result = await resolve("https://twitter.com/someuser", "twitter", client=client)
+    # No /status/ segment: both APIs skip, goes straight to fxtwitter mirror OG.
+    assert result.title == "Profile Page"
+    assert "fxtwitter.com" in client.get.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_vxtwitter_image_only_tweet():
+    client = AsyncMock()
+    vx = _json_response({
+        "text": "pic tweet", "user_name": "U",
+        "mediaURLs": ["https://pbs.twimg.com/media/a.jpg"],
+        "media_extended": [{"type": "image", "url": "https://pbs.twimg.com/media/a.jpg"}],
+    })
+    client.get.side_effect = [_error_response(404), vx]
+    result = await resolve("https://twitter.com/u/status/5", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/media/a.jpg"
+    assert result.video_url is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_tikwm_non_200_falls_to_direct():
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(429), _html_response("TT Direct")]
+    result = await resolve("https://www.tiktok.com/@u/video/9", "tiktok", client=client)
+    assert result.title == "TT Direct"
+
+
+def test_reddit_image_url_preview_without_url_key():
+    # source dict present but url empty -> falls through to None
+    assert _reddit_image_url({"url": "", "preview": {"images": [{"source": {}}]}}) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_crosspost_parent_gif_video():
+    client = AsyncMock()
+    client.get.return_value = _json_response([
+        {"data": {"children": [{"data": {
+            "title": "xpost gif", "subreddit_name_prefixed": "r/x",
+            "url": "https://example.com/page",
+            "crosspost_parent_list": [{
+                "url": "https://i.redd.it/orig.jpg",
+                "secure_media": {"reddit_video": {
+                    "fallback_url": "https://v.redd.it/g/DASH_480.mp4",
+                    "width": 480, "height": 320, "is_gif": True,
+                }},
+            }],
+        }}]}}
+    ])
+    result = await resolve("https://www.reddit.com/r/x/comments/2/t/", "reddit", client=client)
+    assert result.video_url == "https://v.redd.it/g/DASH_480.mp4"
+
+
+@pytest.mark.asyncio
+async def test_resolve_mirror_opengraph_error_falls_to_canonical():
+    client = AsyncMock()
+    client.get.side_effect = [
+        _error_response(404),        # reddit json api
+        httpx.ConnectError("down"),  # vxreddit mirror raises
+        _html_response("Canonical"), # canonical fetch works
+    ]
+    result = await resolve("https://www.reddit.com/r/x/comments/3/t/", "reddit", client=client)
+    assert result.title == "Canonical"
+
+
+def test_meta_parser_ignores_meta_without_content():
+    from bot.resolve.fetch import parse_html_metadata
+    html = '<html><head><meta property="og:title"><title>T</title></head></html>'
+    meta = parse_html_metadata(html, "https://example.com")
+    assert meta.title == "T"
+    assert meta.via == "html"
+
+
+@pytest.mark.asyncio
+async def test_resolve_vxtwitter_media_urls_fallback_when_no_media_extended():
+    client = AsyncMock()
+    vx = _json_response({
+        "text": "old-format tweet", "user_name": "U",
+        "mediaURLs": ["https://pbs.twimg.com/media/only.jpg"],
+        "media_extended": [],
+    })
+    client.get.side_effect = [_error_response(404), vx]
+    result = await resolve("https://twitter.com/u/status/6", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/media/only.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_request_error_falls_through():
+    client = AsyncMock()
+    client.get.side_effect = [httpx.ConnectError("down"), _html_response("Wiki Direct")]
+    result = await resolve("https://en.wikipedia.org/wiki/Robot", "wikipedia", client=client)
+    assert result.title == "Wiki Direct"
+
+
+@pytest.mark.asyncio
+async def test_resolve_wikipedia_json_error_falls_through():
+    client = AsyncMock()
+    bad = MagicMock()
+    bad.status_code = 200
+    bad.json = MagicMock(side_effect=ValueError)
+    client.get.side_effect = [bad, _html_response("Wiki Direct 2")]
+    result = await resolve("https://en.wikipedia.org/wiki/Robot", "wikipedia", client=client)
+    assert result.title == "Wiki Direct 2"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_request_error_falls_to_mirror():
+    client = AsyncMock()
+    client.get.side_effect = [httpx.ConnectError("down"), _html_response("vxreddit")]
+    result = await resolve("https://www.reddit.com/r/x/comments/4/t/", "reddit", client=client)
+    assert result.title == "vxreddit"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_crosspost_parent_not_needed_when_post_has_both():
+    client = AsyncMock()
+    client.get.return_value = _json_response([
+        {"data": {"children": [{"data": {
+            "title": "self-sufficient", "subreddit_name_prefixed": "r/x",
+            "url": "https://i.redd.it/own.jpg",
+            "secure_media": {"reddit_video": {
+                "fallback_url": "https://v.redd.it/own/DASH_480.mp4",
+                "width": 1, "height": 1, "is_gif": True,
+            }},
+            "crosspost_parent_list": [{"url": "https://i.redd.it/parent.jpg"}],
+        }}]}}
+    ])
+    result = await resolve("https://www.reddit.com/r/x/comments/5/t/", "reddit", client=client)
+    assert result.image_url == "https://i.redd.it/own.jpg"
+    assert result.video_url == "https://v.redd.it/own/DASH_480.mp4"
+
+
+@pytest.mark.asyncio
+async def test_resolve_youtube_api_raising_is_caught_by_resolve():
+    client = AsyncMock()
+    client.get.side_effect = [httpx.ConnectError("api down"), _oembed_response("After API Error")]
+    result = await resolve(
+        "https://www.youtube.com/watch?v=x", "youtube",
+        client=client, youtube_api_key="KEY",
+    )
+    assert result.title == "After API Error"
+
+
+@pytest.mark.asyncio
+async def test_resolve_oembed_handler_raising_is_caught_by_resolve():
+    client = AsyncMock()
+    # youtube oembed handler does not catch network errors itself
+    client.get.side_effect = [httpx.ConnectError("oembed down"), _html_response("OG After")]
+    result = await resolve("https://www.youtube.com/watch?v=x", "youtube", client=client)
+    assert result.title == "OG After"
+
+
+@pytest.mark.asyncio
+async def test_resolve_fxtwitter_200_with_empty_tweet_falls_to_vxtwitter():
+    client = AsyncMock()
+    client.get.side_effect = [
+        _json_response({"tweet": {}}),  # 200 but empty payload
+        _json_response({"text": "vx", "user_name": "U", "mediaURLs": [], "media_extended": []}),
+    ]
+    result = await resolve("https://twitter.com/u/status/7", "twitter", client=client)
+    assert result.via == "vxtwitter_api"
+
+
+@pytest.mark.asyncio
+async def test_resolve_vxtwitter_unknown_media_type_ignored():
+    client = AsyncMock()
+    vx = _json_response({
+        "text": "poll tweet", "user_name": "U",
+        "mediaURLs": [],
+        "media_extended": [{"type": "poll", "url": "https://x/poll"},
+                           {"type": "image", "url": "https://pbs.twimg.com/media/i.jpg"}],
+    })
+    client.get.side_effect = [_error_response(404), vx]
+    result = await resolve("https://twitter.com/u/status/8", "twitter", client=client)
+    assert result.image_url == "https://pbs.twimg.com/media/i.jpg"
