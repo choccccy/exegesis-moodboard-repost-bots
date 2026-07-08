@@ -216,6 +216,22 @@ class RepostBot(discord.Client):
                 )
             return
 
+        # The alt picker opens a message-with-select then a modal - neither may defer first.
+        if custom_id.startswith("alt_edit:"):
+            async with session_scope() as session:
+                await service.handle_alt_edit_button(
+                    session, interaction, int(custom_id.removeprefix("alt_edit:")),
+                    self.settings, self._yt_client,
+                )
+            return
+        if custom_id.startswith("alt_pick:"):
+            async with session_scope() as session:
+                await service.handle_alt_pick(
+                    session, interaction, int(custom_id.removeprefix("alt_pick:")),
+                    self.settings, self._yt_client,
+                )
+            return
+
         try:
             await interaction.response.defer()
         except discord.NotFound:

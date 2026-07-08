@@ -42,6 +42,13 @@ def alt_text_skipped(filename: str) -> str:
     return f"alt text skipped for **{filename}**"
 
 
+def alt_text_overwritten(filename: str, previous: str | None) -> str:
+    if previous:
+        shown = previous if len(previous) <= 100 else previous[:97] + "..."
+        return f'🔁 alt text for **{filename}** updated (was: "{shown}")'
+    return f"🔁 alt text for **{filename}** updated"
+
+
 def status_checklist(
     snap,
     *,

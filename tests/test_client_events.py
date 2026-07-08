@@ -66,6 +66,28 @@ async def test_on_interaction_edit_prefix_routes_without_defer(repost_bot, sessi
     interaction.response.defer.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("custom_id", "handler_name", "expected_id"),
+    [
+        ("alt_edit:8", "handle_alt_edit_button", 8),
+        ("alt_pick:9", "handle_alt_pick", 9),
+    ],
+)
+async def test_on_interaction_alt_prefixes_route_without_defer(
+    repost_bot, session, custom_id, handler_name, expected_id
+):
+    # Both produce an initial response (a select message, then a modal), so neither defers.
+    interaction = make_interaction(custom_id=custom_id)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch(f"bot.discord_ingest.client.service.{handler_name}", new_callable=AsyncMock) as handler,
+    ):
+        await repost_bot.on_interaction(interaction)
+    handler.assert_awaited_once()
+    assert handler.await_args.args[2] == expected_id
+    interaction.response.defer.assert_not_awaited()
+
+
 async def test_on_interaction_expired_defer_falls_back_to_channel_message(repost_bot):
     interaction = make_interaction(custom_id="confirm:3")
     interaction.response.defer = AsyncMock(side_effect=_not_found())

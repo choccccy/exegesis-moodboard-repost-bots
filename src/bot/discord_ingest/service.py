@@ -1538,11 +1538,99 @@ async def handle_edit_button(
         select(SubmissionLink)
         .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
     )
+    media = await _media_attachments(session, submission_id)
     modal = views.PostEditModal(
         submission_id=submission_id,
         current_title=primary.resolved_title if primary else None,
+        media=[(a.id, a.filename, a.alt_text_body) for a in media[:4]],
     )
     await interaction.response.send_modal(modal)
+
+
+async def handle_alt_edit_button(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Edit-alt-text button: send an image picker (for posts with more media than the modal fits)."""
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        await interaction.response.send_message("Submission not found.", ephemeral=True)
+        return
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.response.send_message(
+            "You're not authorised to edit this submission.", ephemeral=True
+        )
+        return
+    media = await _media_attachments(session, submission_id)
+    if not media:
+        await interaction.response.send_message("This post has no images to edit.", ephemeral=True)
+        return
+    if len(media) > 25:
+        log.warning("submission %s has %d media; alt picker shows the first 25", submission_id, len(media))
+    await interaction.response.send_message(
+        "Pick an image to edit its alt text:",
+        view=views.make_alt_picker_view(submission_id, [(a.id, a.filename) for a in media]),
+        ephemeral=True,
+    )
+
+
+async def handle_alt_pick(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Image picked from the alt picker: open that attachment's alt-text modal."""
+    values = (interaction.data or {}).get("values") or []
+    if not values:
+        return
+    attachment_id = int(values[0])
+    submission = await session.get(Submission, submission_id)
+    att = await session.get(Attachment, attachment_id)
+    board_cfg = settings.board_for_channel(submission.channel_id) if submission else None
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if submission is None or not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.response.send_message(
+            "You're not authorised to edit this submission.", ephemeral=True
+        )
+        return
+    if att is None or att.submission_id != submission_id:
+        await interaction.response.send_message("Image not found.", ephemeral=True)
+        return
+    await interaction.response.send_modal(
+        views.AltEditModal(attachment_id, att.filename, att.alt_text_body)
+    )
+
+
+async def _media_attachments(session: AsyncSession, submission_id: int) -> list[Attachment]:
+    """A submission's image/video attachments, ordered by id (stable insertion order)."""
+    rows = list(await session.scalars(
+        select(Attachment)
+        .where(Attachment.submission_id == submission_id)
+        .order_by(Attachment.id)
+    ))
+    return [a for a in rows if a.is_image or a.is_video]
+
+
+def _set_attachment_alt(att: Attachment, value: str | None, editor_id: int) -> None:
+    """Write alt text onto an attachment. Non-empty -> PROVIDED; empty -> SKIPPED (an
+    explicit clear that keeps the post queueable). Stamps the editor as the author."""
+    text = (value or "").strip()
+    if text:
+        att.alt_text_body = text
+        att.alt_text_status = AltTextStatus.PROVIDED.value
+    else:
+        att.alt_text_body = None
+        att.alt_text_status = AltTextStatus.SKIPPED.value
+    att.alt_text_author = editor_id
 
 
 async def apply_post_edits(
@@ -1550,15 +1638,36 @@ async def apply_post_edits(
     *,
     submission_id: int,
     new_title: str,
+    alt_updates: dict[int, str] | None = None,
+    edited_by: int = 0,
 ) -> None:
-    """Apply curator edits to the post text (resolved_title on primary link)."""
+    """Apply curator edits: the post text (resolved_title on primary link) and, optionally,
+    per-image alt text keyed by attachment id."""
     primary = await session.scalar(
         select(SubmissionLink)
         .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
     )
     if primary is not None:
         primary.resolved_title = new_title.strip() or None
-    log.info("applied post text edit for submission %s", submission_id)
+    for att_id, value in (alt_updates or {}).items():
+        att = await session.get(Attachment, att_id)
+        if att is not None and att.submission_id == submission_id:
+            _set_attachment_alt(att, value, edited_by)
+    log.info("applied post edit for submission %s (%d alt field(s))", submission_id, len(alt_updates or {}))
+
+
+async def apply_single_alt(
+    session: AsyncSession,
+    *,
+    attachment_id: int,
+    value: str,
+    edited_by: int,
+) -> None:
+    """Apply alt text to one attachment (from the per-image picker modal)."""
+    att = await session.get(Attachment, attachment_id)
+    if att is not None:
+        _set_attachment_alt(att, value, edited_by)
+        log.info("applied alt-text edit for attachment %s", attachment_id)
 
 
 async def _resolve_thread_by_id(
@@ -2471,12 +2580,13 @@ async def recompute_and_request(
             # bottom of the thread, after the preview.
             try:
                 board_cfg_conf = settings.board_for_channel(submission.channel_id)
+                media_count = sum(1 for a in atts if a.is_image or a.is_video)
                 msg = await destination.send(
                     replies.confirmation_request(
                         bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
                         youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
                     ),
-                    view=views.make_confirm_view(submission.id),
+                    view=views.make_confirm_view(submission.id, media_count=media_count),
                 )
                 session.add(ConfirmationRequest(
                     submission_id=submission.id,
@@ -2762,7 +2872,9 @@ async def handle_reply(
     if not _is_authorized(message.author, submission, board_cfg):
         return False  # silently ignore non-curators
 
-    if req.answered_at is not None:
+    # Alt-text replies may overwrite a previous answer (fix a typo, rewrite); other
+    # request types still ignore duplicate replies once answered.
+    if req.answered_at is not None and not isinstance(req, AttachmentAltTextRequest):
         return True  # already satisfied; ignore duplicate
 
     handled = await _apply_answer(session, req, submission, message, settings, http_client)
@@ -2851,9 +2963,17 @@ async def _apply_answer(
             return False
         att = await session.get(Attachment, req.attachment_id)
         if att is not None:
+            # Overwriting a real previous value? Make that visible rather than silent.
+            overwrote = att.alt_text_status == AltTextStatus.PROVIDED.value
+            previous = att.alt_text_body
             att.alt_text_body = body
             att.alt_text_status = AltTextStatus.PROVIDED.value
             att.alt_text_author = message.author.id
+            if overwrote:
+                try:
+                    await message.channel.send(replies.alt_text_overwritten(att.filename, previous))
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("could not post alt-overwrite notice for att %s: %s", att.id, exc)
 
     elif isinstance(req, MetadataRequest):
         urls = extract_urls(message.content)

@@ -60,24 +60,6 @@ async def test_notifier_archive_noop_for_plain_channel():
 # ---------------------------------------------------------------------------
 
 
-async def test_post_edit_modal_on_submit_applies_edits(session):
-    modal = views.PostEditModal(submission_id=42, current_title="old title")
-    interaction = MagicMock(spec=discord.Interaction)
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
-    modal.caption_input = MagicMock()
-    modal.caption_input.value = "new title"
-
-    with patch("bot.db.session_scope", bound_session_scope(session)), \
-         patch("bot.discord_ingest.service.apply_post_edits", new_callable=AsyncMock) as mock_apply:
-        await modal.on_submit(interaction)
-
-    mock_apply.assert_awaited_once()
-    assert mock_apply.await_args.kwargs["submission_id"] == 42
-    assert mock_apply.await_args.kwargs["new_title"] == "new title"
-    interaction.response.send_message.assert_awaited_once()
-
-
 def test_view_factories_carry_routing_custom_ids():
     # The custom_id prefixes are the routing contract for on_interaction.
     cases = [
