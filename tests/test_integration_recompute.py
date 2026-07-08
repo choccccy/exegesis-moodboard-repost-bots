@@ -86,11 +86,11 @@ async def test_fresh_transition_posts_confirmation_prompt(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    # State stops at READY_TO_QUEUE; the status message morphs into the confirmation
-    # prompt (no checklist noise) and carries the Queue button.
+    # State stops at READY_TO_QUEUE; the checklist stays (all checked) and the queue
+    # confirmation is posted as its own message.
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
     assert replies.confirmation_request() in dest.sent
-    assert not any("post status" in m for m in dest.sent)  # checklist suppressed when ready
+    assert any("post status" in m for m in dest.sent)  # checklist kept for posterity
     conf = await session.scalar(
         select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
     )
@@ -110,10 +110,11 @@ async def test_stuck_ready_to_queue_posts_confirmation_once(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    # State stays READY_TO_QUEUE; the confirmation prompt is posted and registered.
+    # State stays READY_TO_QUEUE; the confirmation prompt is posted and registered,
+    # and the checklist is kept.
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
     assert replies.confirmation_request() in dest.sent
-    assert not any("post status" in m for m in dest.sent)  # checklist suppressed when ready
+    assert any("post status" in m for m in dest.sent)  # checklist kept for posterity
     conf = await session.scalar(
         select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
     )

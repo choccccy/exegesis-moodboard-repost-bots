@@ -2001,38 +2001,27 @@ async def _upsert_status_checklist(
     submission: Submission,
     destination: Notifier,
     snap: SubmissionSnapshot,
-    settings: Settings,
     *,
     ready: bool,
     source_domain: str | None,
 ) -> None:
-    """Post the submission's status/action message once, then edit it in place.
+    """Post the 'post status' checklist once, then edit it in place as gaps fill.
 
-    While the submission is blocked, this is the 'post status' checklist showing
-    exactly what's missing. Once ready, the checklist would just be a wall of green
-    checkmarks (noise), so the same message morphs into the concise queue-confirmation
-    prompt carrying the Queue/Edit buttons. Best-effort: a failure to post or edit the
-    status message must never break the ingest flow.
+    Kept for the whole life of the submission - even fully checked off it stays as a
+    record of what was required. It never carries buttons; the queue confirmation and
+    its Queue/Edit buttons are a separate message at the bottom of the thread.
+    Best-effort: a failure to post or edit must never break the ingest flow.
     """
-    if ready:
-        board_cfg = settings.board_for_channel(submission.channel_id)
-        content = replies.confirmation_request(
-            bluesky_handle=board_cfg.bluesky_handle if board_cfg else None,
-            youtube_playlist_id=board_cfg.youtube_playlist_id if board_cfg else None,
-        )
-        view = views.make_confirm_view(submission.id)
-    else:
-        content = replies.status_checklist(snap, ready=False, source_domain=source_domain)
-        view = None
+    content = replies.status_checklist(snap, ready=ready, source_domain=source_domain)
     try:
         if submission.status_message_id is not None and await _edit_status_message(
-            destination, submission.status_message_id, content, view
+            destination, submission.status_message_id, content, None
         ):
             return
-        msg = await destination.send(content, view=view)
+        msg = await destination.send(content)
         submission.status_message_id = msg.id
     except (discord.Forbidden, discord.HTTPException) as exc:
-        log.warning("could not upsert status message for submission %s: %s", submission.id, exc)
+        log.warning("could not upsert status checklist for submission %s: %s", submission.id, exc)
 
 
 async def _edit_status_message(destination, message_id: int, content: str, view) -> bool:
@@ -2461,7 +2450,7 @@ async def recompute_and_request(
     source_domain = links[0].domain_family if links else None
     if old_state not in _QUEUE_TERMINAL:
         await _upsert_status_checklist(
-            submission, destination, snap, settings, ready=ready, source_domain=source_domain
+            submission, destination, snap, ready=ready, source_domain=source_domain
         )
 
     action = _queue_action(old_state, new_state)
@@ -2478,14 +2467,23 @@ async def recompute_and_request(
                     await destination.send(page)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("could not post preview for submission %s: %s", submission.id, exc)
-            # The Queue button lives on the status message (now morphed into the
-            # confirmation prompt); tie the ConfirmationRequest to it. If that message
-            # couldn't be posted this tick, a later recompute will register it.
-            if submission.status_message_id is not None:
+            # Post the queue confirmation (with the buttons) last, so it sits at the very
+            # bottom of the thread, after the preview.
+            try:
+                board_cfg_conf = settings.board_for_channel(submission.channel_id)
+                msg = await destination.send(
+                    replies.confirmation_request(
+                        bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                        youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+                    ),
+                    view=views.make_confirm_view(submission.id),
+                )
                 session.add(ConfirmationRequest(
                     submission_id=submission.id,
-                    bot_message_id=submission.status_message_id,
+                    bot_message_id=msg.id,
                 ))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post confirmation request for submission %s: %s", submission.id, exc)
 
     # When a reply updates an already-queued submission and all pending alt-text gaps
     # are now resolved, confirm the update and re-schedule thread archiving.

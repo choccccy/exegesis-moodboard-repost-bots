@@ -261,7 +261,7 @@ async def test_alt_skip_tombstone_edit_error_swallowed(session, board):
     assert att.alt_text_status == AltTextStatus.SKIPPED.value
 
 
-async def test_ready_status_message_is_confirmation_not_checklist(session, board):
+async def test_ready_keeps_checklist_and_puts_confirmation_last(session, board):
     from bot.models import ConfirmationRequest
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
@@ -276,15 +276,19 @@ async def test_ready_status_message_is_confirmation_not_checklist(session, board
     dest = MockDest()
     await recompute_and_request(session, sub, settings=_settings(), destination=dest)
 
-    # Ready: the status message is the concise confirmation prompt, not the checklist wall.
-    assert any("queue this for posting" in m for m in dest.sent)
-    assert not any("post status" in m for m in dest.sent)
-    # The Queue button's ConfirmationRequest is tied to that status message.
+    # Ready: the checklist is kept (all checked, "Ready to queue"), and the queue
+    # confirmation is the LAST message so the buttons sit at the bottom, after the preview.
+    assert any("post status" in m and "Ready to queue" in m for m in dest.sent)
+    assert "queue this for posting" in dest.sent[-1]
+    preview_idx = next(i for i, m in enumerate(dest.sent) if "prospective Bluesky post" in m)
+    conf_idx = next(i for i, m in enumerate(dest.sent) if "queue this for posting" in m)
+    assert preview_idx < conf_idx  # preview before the queue confirmation
+    # The confirmation is a standalone message; the checklist persists for posterity.
     conf = await session.scalar(
         select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
     )
     assert conf is not None
-    assert conf.bot_message_id == sub.status_message_id
+    assert sub.status_message_id is not None
 
 
 # --- recompute offers the waiver button only with media ---------------------
