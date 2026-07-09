@@ -490,6 +490,31 @@ async def test_thread_catchup_includes_ready_to_queue_submissions(repost_bot, se
     assert recompute.await_args.args[1].id == sub.id
 
 
+async def test_thread_catchup_processes_newest_submissions_first(repost_bot, session, board):
+    """The scan must walk newest submissions first so a recent post gets its buttons
+    back promptly instead of waiting behind the whole historical backlog."""
+    old = await _add_pending_thread(session, board, source_msg_id=10, thread_id=1010)
+    new = await _add_pending_thread(session, board, source_msg_id=20, thread_id=2020)
+    assert new.id > old.id  # sanity: 'new' was inserted later
+
+    thread = MagicMock()
+    install_history(thread, [])
+    repost_bot._resolve_channel = AsyncMock(return_value=thread)
+    order: list[int] = []
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
+        patch(
+            "bot.discord_ingest.client.service.recompute_and_request",
+            new_callable=AsyncMock,
+            side_effect=lambda s, sub, **kw: order.append(sub.id),
+        ),
+        patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
+    ):
+        await repost_bot._run_thread_catchup()
+    assert order == [new.id, old.id]  # newest processed before oldest
+
+
 async def test_thread_catchup_unarchives_thread_before_recompute(repost_bot, session, board):
     """An archived thread must be unarchived before recompute so that sends succeed.
     Without this, the confirmation button repost silently fails."""

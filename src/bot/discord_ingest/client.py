@@ -734,6 +734,10 @@ class RepostBot(discord.Client):
                     Submission.state.in_(_PENDING_STATES),
                     Submission.thread_id.is_not(None),
                 )
+                # Newest first: a just-submitted post gets its buttons back promptly
+                # instead of waiting behind the entire historical backlog (each thread
+                # costs a full history walk + pacing delay).
+                .order_by(Submission.id.desc())
             )
             pending = [(r.thread_id, r.submission_id) for r in rows]
 
