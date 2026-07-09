@@ -655,20 +655,48 @@ async def test_resolve_reddit_gif_returns_video_url():
     ]
     client.get.return_value = reddit_resp
     result = await resolve("https://www.reddit.com/r/robots/comments/abc/cool_gif/", "reddit", client=client)
+    # GIFs have no audio: the video-only fallback_url is downloaded directly.
     assert result.video_url == "https://v.redd.it/xyz/DASH_480.mp4?source=fallback"
+    assert result.video_is_stream is False
     assert result.video_width == 480  # noqa: PLR2004
 
 
 @pytest.mark.asyncio
-async def test_resolve_reddit_regular_video_has_no_video_url():
-    # fallback_url streams video WITHOUT the audio track; posting a regular
-    # video from it would be silent, so only is_gif videos are taken.
+async def test_resolve_reddit_regular_video_uses_stream_manifest():
+    # Regular videos have separate audio, so we hand the HLS manifest to ffmpeg to mux.
     client = AsyncMock()
     reddit_resp = MagicMock()
     reddit_resp.status_code = 200
     reddit_resp.json.return_value = [
         {"data": {"children": [{"data": {
             "title": "video with sound",
+            "subreddit_name_prefixed": "r/robots",
+            "url": "https://v.redd.it/abc",
+            "secure_media": {"reddit_video": {
+                "fallback_url": "https://v.redd.it/abc/DASH_1080.mp4?source=fallback",
+                "hls_url": "https://v.redd.it/abc/HLSPlaylist.m3u8?token=xyz",
+                "dash_url": "https://v.redd.it/abc/DASHPlaylist.mpd?token=xyz",
+                "width": 1920, "height": 1080, "is_gif": False,
+            }},
+            "preview": {"images": [{"source": {"url": "https://preview.redd.it/still.jpg"}}]},
+        }}]}}
+    ]
+    client.get.return_value = reddit_resp
+    result = await resolve("https://www.reddit.com/r/robots/comments/def/video/", "reddit", client=client)
+    assert result.video_url == "https://v.redd.it/abc/HLSPlaylist.m3u8?token=xyz"  # HLS preferred
+    assert result.video_is_stream is True
+    assert result.image_url == "https://preview.redd.it/still.jpg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_regular_video_without_manifest_is_skipped():
+    # No HLS/DASH manifest -> a bare fallback_url would be silent, so skip the video.
+    client = AsyncMock()
+    reddit_resp = MagicMock()
+    reddit_resp.status_code = 200
+    reddit_resp.json.return_value = [
+        {"data": {"children": [{"data": {
+            "title": "video no manifest",
             "subreddit_name_prefixed": "r/robots",
             "url": "https://v.redd.it/abc",
             "secure_media": {"reddit_video": {
@@ -1271,3 +1299,86 @@ async def test_resolve_vxtwitter_unknown_media_type_ignored():
     client.get.side_effect = [_error_response(404), vx]
     result = await resolve("https://twitter.com/u/status/8", "twitter", client=client)
     assert result.image_url == "https://pbs.twimg.com/media/i.jpg"
+
+
+# --- reddit mirror (vxreddit) og:video muxed-mp4 path ------------------------
+
+from bot.resolve.fetch import _extract_og_video, _reddit_mirror
+
+
+def test_extract_og_video():
+    assert _extract_og_video(
+        '<meta property="og:video:secure_url" content="https://x/v.mp4?a=1&amp;b=2">'
+    ) == "https://x/v.mp4?a=1&b=2"
+    assert _extract_og_video('<meta property="og:video" content="https://x/w.mp4">') == "https://x/w.mp4"
+    assert _extract_og_video("<html><head><title>no video</title></head></html>") is None
+
+
+def _reddit_mirror_resp(video_url, title="Reddit Vid", image="https://preview.redd.it/s.jpg"):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "text/html; charset=utf-8"}
+    resp.text = (
+        "<html><head>"
+        f'<meta property="og:title" content="{title}">'
+        f'<meta property="og:image" content="{image}">'
+        f'<meta property="og:video:secure_url" content="{video_url}">'
+        "</head></html>"
+    )
+    resp.url = "https://vxreddit.com/r/mallninjashit/comments/1sz144x/"
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_json_403_uses_mirror_muxed_video():
+    # reddit.com JSON blocks the host (403); the vxreddit mirror serves a muxed mp4.
+    client = AsyncMock()
+    vid = "https://vxreddit.com/redditvideo.mp4?video_url=https%3A%2F%2Fv.redd.it%2Fabc%2FCMAF_720.m3u8&amp;audio_url=y"
+    client.get.side_effect = [_error_response(403), _reddit_mirror_resp(vid)]
+    result = await resolve("https://www.reddit.com/r/mallninjashit/comments/1sz144x/", "reddit", client=client)
+    assert result.via == "reddit_mirror"
+    assert result.video_url == (
+        "https://vxreddit.com/redditvideo.mp4?video_url=https%3A%2F%2Fv.redd.it%2Fabc%2FCMAF_720.m3u8&audio_url=y"
+    )
+    assert result.video_is_stream is False  # a directly downloadable muxed mp4
+    assert result.image_url == "https://preview.redd.it/s.jpg"
+    assert "vxreddit.com" in client.get.call_args_list[1][0][0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_reddit_json_success_skips_mirror():
+    # When reddit.com JSON works, it is trusted whole - the mirror is not consulted.
+    client = AsyncMock()
+    client.get.return_value = _json_response([
+        {"data": {"children": [{"data": {
+            "title": "img post", "subreddit_name_prefixed": "r/x",
+            "url": "https://i.redd.it/pic.jpg",
+        }}]}}
+    ])
+    result = await resolve("https://www.reddit.com/r/x/comments/1/t/", "reddit", client=client)
+    assert result.image_url == "https://i.redd.it/pic.jpg"
+    assert client.get.call_count == 1  # no mirror fetch
+
+
+@pytest.mark.asyncio
+async def test_reddit_mirror_non_200_returns_none():
+    client = AsyncMock()
+    client.get.return_value = _error_response(502)
+    assert await _reddit_mirror("https://www.reddit.com/r/x/comments/1/t/", client) is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_mirror_http_error_returns_none():
+    client = AsyncMock()
+    client.get.side_effect = httpx.ConnectError("down")
+    assert await _reddit_mirror("https://www.reddit.com/r/x/comments/1/t/", client) is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_mirror_unrewritable_url_returns_none():
+    # A URL that _reddit_mirror_url can't rewrite (no www.reddit.com prefix) -> no mirror.
+    client = AsyncMock()
+    result = await _reddit_mirror("https://old.reddit.com/r/x/comments/1/t/", client)
+    assert result is None
+    client.get.assert_not_awaited()

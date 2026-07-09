@@ -311,6 +311,42 @@ async def test_handle_reply_alt_text_overwrite_posts_notice(session, board):
     assert any("robot.jpg" in n and "updated" in n and "old alt" in n for n in notices)
 
 
+async def test_handle_reply_alt_text_same_value_no_notice(session, board):
+    """Replaying the identical alt text (e.g. thread catch-up on bot restart) must
+    update the DB but NOT post an overwrite notice, since nothing actually changed."""
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    att = Attachment(
+        submission_id=sub.id,
+        discord_attachment_id=next(_NEXT_ID),
+        filename="robot.jpg",
+        discord_url="https://cdn.discord.com/robot.jpg",
+        is_image=True,
+        alt_text_status=AltTextStatus.PROVIDED.value,
+        alt_text_body="existing alt text",
+        alt_text_author=sub.author_id,
+    )
+    session.add(att)
+    await session.flush()
+    from datetime import datetime, timezone
+    req = await _add_alt_text_request(session, sub, att.id)
+    req.answered_at = datetime.now(timezone.utc)
+    await session.flush()
+
+    msg = _make_message(
+        reply_to_id=req.bot_message_id,
+        author_id=sub.author_id,
+        content="existing alt text",  # same value as already stored
+    )
+    with patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+        result = await handle_reply(session, settings=_mock_settings(), message=msg, http_client=MagicMock())
+
+    assert result is True
+    # No overwrite notice posted since the value didn't change.
+    msg.channel.send.assert_not_awaited()
+
+
 async def test_handle_reply_alt_overwrite_notice_failure_swallowed(session, board):
     import discord
     from datetime import datetime, timezone

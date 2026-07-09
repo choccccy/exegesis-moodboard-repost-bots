@@ -469,6 +469,46 @@ async def test_thread_catchup_does_not_duplicate_existing_checklist(repost_bot, 
     assert not any(c.startswith("**post status**") for c in thread.sent)
 
 
+async def test_thread_catchup_includes_ready_to_queue_submissions(repost_bot, session, board):
+    """READY_TO_QUEUE submissions must be included in the catch-up scan so that a
+    missing confirmation button (e.g. message deleted after restart) gets reposted."""
+    sub = await _add_pending_thread(
+        session, board, state=SubmissionState.READY_TO_QUEUE.value, thread_id=888,
+    )
+    thread = MagicMock()
+    install_history(thread, [])
+    repost_bot._resolve_channel = AsyncMock(return_value=thread)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
+        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
+    ):
+        await repost_bot._run_thread_catchup()
+    recompute.assert_awaited_once()
+    assert recompute.await_args.args[1].id == sub.id
+
+
+async def test_thread_catchup_unarchives_thread_before_recompute(repost_bot, session, board):
+    """An archived thread must be unarchived before recompute so that sends succeed.
+    Without this, the confirmation button repost silently fails."""
+    await _add_pending_thread(session, board, thread_id=889)
+    thread = MagicMock(spec=discord.Thread)
+    thread.archived = True
+    install_history(thread, [])
+    repost_bot._resolve_channel = AsyncMock(return_value=thread)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
+        patch("bot.discord_ingest.client.service._unarchive_thread", new_callable=AsyncMock) as unarchive,
+        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
+    ):
+        await repost_bot._run_thread_catchup()
+    unarchive.assert_awaited_once_with(thread)
+    recompute.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # _archive_queued_threads
 # ---------------------------------------------------------------------------

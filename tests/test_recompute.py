@@ -273,3 +273,63 @@ async def test_recompute_from_reply_on_queued_confirms_and_archives(session, boa
     assert any(s.startswith("[archive]") for s in dest.sent)
     # no confirmation re-posted for a terminal-state submission
     assert await _count(session, ConfirmationRequest, sub.id) == 0
+
+
+async def test_recompute_keeps_confirmation_when_fetch_errors(session, board):
+    """If fetch_message raises a non-404 error (Forbidden/HTTPException), treat the
+    confirmation as present and do not resend it."""
+    import discord
+    from unittest.mock import MagicMock
+
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    session.add(sub)
+    await session.flush()
+    _add_link(session, sub, resolved_via="opengraph", resolved_image_path="/t.jpg")
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=88888))
+    await session.flush()
+
+    class _ForbiddenFetchDest(MockDest):
+        async def fetch_message(self, message_id: int):
+            raise discord.HTTPException(MagicMock(), "server error")
+
+    dest = _ForbiddenFetchDest()
+    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    # Row must survive; no new confirmation sent.
+    rows = list(await session.scalars(
+        select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
+    ))
+    assert len(rows) == 1
+    assert rows[0].bot_message_id == 88888
+    assert not any("queue this for posting" in s.lower() for s in dest.sent)
+
+
+async def test_recompute_reposts_confirmation_when_discord_message_deleted(session, board):
+    """If the confirmation message was deleted from Discord, recompute on the 'silent'
+    path (READY_TO_QUEUE -> READY_TO_QUEUE) must detect the NotFound and repost a
+    fresh confirmation button with a new DB row."""
+    import discord
+    from unittest.mock import MagicMock
+
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    session.add(sub)
+    await session.flush()
+    _add_link(session, sub, resolved_via="opengraph", resolved_image_path="/t.jpg")
+    # Simulate a stale DB row pointing to a Discord message that no longer exists.
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=99999))
+    await session.flush()
+
+    class _DeletedConfDest(MockDest):
+        async def fetch_message(self, message_id: int):
+            raise discord.NotFound(MagicMock(), "Unknown Message")
+
+    dest = _DeletedConfDest()
+    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    # Stale row must be replaced by a fresh one pointing to a new Discord message.
+    rows = list(await session.scalars(
+        select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
+    ))
+    assert len(rows) == 1
+    assert rows[0].bot_message_id != 99999  # new message, not the deleted one
+    assert any("queue this for posting" in s.lower() for s in dest.sent)

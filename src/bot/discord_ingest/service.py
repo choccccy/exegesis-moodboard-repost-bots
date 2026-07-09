@@ -24,6 +24,7 @@ from ..accessibility import initial_alt_text, is_image_attachment, is_video_atta
 from ..asset_store import (
     StorageFullError,
     download_attachment,
+    has_free_space,
     remove_submission_dir,
     submission_dir,
 )
@@ -1880,20 +1881,27 @@ async def _ingest_resolved_video(
         return
 
     dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
-    try:
-        path = await download_attachment(
-            url=meta.video_url,
-            dest_dir=dest,
-            filename=f"linkvid_{link.id}.mp4",
-            data_dir=settings.data_dir,
-            min_free_mb=settings.storage_min_free_mb,
-            client=http_client,
-        )
-    except (StorageFullError, httpx.HTTPError, OSError) as exc:
-        log.info("resolved video download failed for link %s: %s - falling back to thumbnail", link.id, exc)
-        return
-
-    path = await _transcode_video(path)
+    filename = f"linkvid_{link.id}.mp4"
+    if meta.video_is_stream:
+        # Stream manifest (e.g. reddit): ffmpeg fetches and muxes video + separate audio.
+        path = await _fetch_stream_video(meta.video_url, dest, filename, settings)
+        if path is None:
+            log.info("resolved stream video failed for link %s - falling back to thumbnail", link.id)
+            return
+    else:
+        try:
+            path = await download_attachment(
+                url=meta.video_url,
+                dest_dir=dest,
+                filename=filename,
+                data_dir=settings.data_dir,
+                min_free_mb=settings.storage_min_free_mb,
+                client=http_client,
+            )
+        except (StorageFullError, httpx.HTTPError, OSError) as exc:
+            log.info("resolved video download failed for link %s: %s - falling back to thumbnail", link.id, exc)
+            return
+        path = await _transcode_video(path)
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -1975,6 +1983,46 @@ async def _ingest_attachment(
     except (httpx.HTTPError, OSError) as exc:
         log.warning("failed to download attachment %s: %s", att.id, exc)
     return row
+
+
+_STREAM_MUX_TIMEOUT = 180  # seconds; ffmpeg fetch+mux of a remote HLS/DASH stream
+
+
+async def _fetch_stream_video(
+    manifest_url: str, dest_dir: str, filename: str, settings: Settings
+) -> str | None:
+    """Fetch a remote HLS/DASH stream and mux video + audio into an H.264/AAC MP4.
+
+    Used for sources (reddit) that serve video and audio as separate streams: ffmpeg
+    reads the manifest, picks the best video+audio, and writes one file. Returns the
+    output path, or None on any failure (no space, timeout, ffmpeg error) so ingest
+    degrades to the thumbnail card.
+    """
+    if not has_free_space(settings.data_dir, settings.storage_min_free_mb):
+        log.info("no free space for stream video %s", manifest_url)
+        return None
+    out_path = os.path.join(dest_dir, filename)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", manifest_url,
+            "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
+            "-y", out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        log.warning("could not start ffmpeg for stream %s: %s", manifest_url, exc)
+        return None
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_STREAM_MUX_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        log.warning("ffmpeg stream mux timed out for %s", manifest_url)
+        return None
+    if proc.returncode != 0:
+        log.warning("ffmpeg stream mux failed for %s: %s", manifest_url, stderr.decode()[-500:])
+        return None
+    return out_path
 
 
 async def _transcode_video(input_path: str) -> str:
@@ -2564,11 +2612,33 @@ async def recompute_and_request(
 
     action = _queue_action(old_state, new_state)
     if action in ("fresh", "silent"):
-        has_conf = await session.scalar(
-            select(ConfirmationRequest.id).where(
-                ConfirmationRequest.submission_id == submission.id
+        existing_conf = await session.scalar(
+            select(ConfirmationRequest).where(
+                ConfirmationRequest.submission_id == submission.id,
+                ConfirmationRequest.confirmed_at.is_(None),
             )
-        ) is not None
+        )
+        has_conf = existing_conf is not None
+
+        # On the "silent" path (already READY_TO_QUEUE, typically a bot restart),
+        # verify the Discord message is still there. If it was deleted, clean up
+        # the stale row so the confirmation button gets reposted below.
+        if has_conf and action == "silent" and existing_conf is not None:
+            fetch_message = getattr(destination, "fetch_message", None)
+            if fetch_message is not None:
+                try:
+                    await fetch_message(existing_conf.bot_message_id)
+                except discord.NotFound:
+                    log.warning(
+                        "confirmation message %s for submission %s was deleted; reposting",
+                        existing_conf.bot_message_id, submission.id,
+                    )
+                    await session.delete(existing_conf)
+                    await session.flush()
+                    has_conf = False
+                except (discord.Forbidden, discord.HTTPException):
+                    pass  # cannot verify; assume it exists
+
         if not has_conf:
             try:
                 preview = await _build_post_preview(session, submission, atts, links)
@@ -2964,7 +3034,9 @@ async def _apply_answer(
         att = await session.get(Attachment, req.attachment_id)
         if att is not None:
             # Overwriting a real previous value? Make that visible rather than silent.
-            overwrote = att.alt_text_status == AltTextStatus.PROVIDED.value
+            # Only flag an overwrite if the body actually changed - same value replayed
+            # on boot (thread catch-up) must not re-post the notice.
+            overwrote = att.alt_text_status == AltTextStatus.PROVIDED.value and att.alt_text_body != body
             previous = att.alt_text_body
             att.alt_text_body = body
             att.alt_text_status = AltTextStatus.PROVIDED.value

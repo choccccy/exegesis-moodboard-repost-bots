@@ -155,3 +155,92 @@ async def test_resolve_links_no_video_url_no_attachment(session, board, tmp_path
 
     atts = await _video_attachments(session, sub.id)
     assert atts == []
+
+
+# --- stream (reddit) videos: ffmpeg fetches + muxes video+audio --------------
+
+
+def _stream_meta(url="https://v.redd.it/abc/HLSPlaylist.m3u8"):
+    return ResolvedMetadata(
+        title="reddit vid", description="r/x", image_url="https://preview.redd.it/s.jpg",
+        video_url=url, video_width=1920, video_height=1080,
+        video_is_stream=True, via="reddit_api",
+    )
+
+
+async def test_stream_video_muxed_and_attached(session, board, tmp_path):
+    sub, link = await _submission_with_link(session, board, url="https://www.reddit.com/r/x/comments/1/t/")
+    out = tmp_path / f"linkvid_{link.id}.mp4"
+    out.write_bytes(b"muxed-mp4")
+
+    with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.discord_ingest.service._fetch_stream_video",
+               new_callable=AsyncMock, return_value=str(out)) as mock_mux, \
+         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock) as mock_dl:
+        await _ingest_resolved_video(session, sub, link, _stream_meta(), _settings(), AsyncMock())
+
+    mock_mux.assert_awaited_once()  # went through the ffmpeg mux path
+    mock_dl.assert_not_awaited()    # not the direct-download path
+    atts = await _video_attachments(session, sub.id)
+    assert len(atts) == 1 and atts[0].local_path == str(out)
+
+
+async def test_stream_video_mux_failure_falls_back(session, board, tmp_path):
+    sub, link = await _submission_with_link(session, board, url="https://www.reddit.com/r/x/comments/1/t/")
+    with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.discord_ingest.service._fetch_stream_video", new_callable=AsyncMock, return_value=None):
+        await _ingest_resolved_video(session, sub, link, _stream_meta(), _settings(), AsyncMock())
+    assert await _video_attachments(session, sub.id) == []  # no broken attachment
+
+
+async def test_fetch_stream_video_success(tmp_path):
+    from bot.discord_ingest.service import _fetch_stream_video
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    with patch("bot.discord_ingest.service.has_free_space", return_value=True), \
+         patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, return_value=proc):
+        path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
+    assert path == str(tmp_path / "out.mp4")
+
+
+async def test_fetch_stream_video_ffmpeg_error(tmp_path):
+    from bot.discord_ingest.service import _fetch_stream_video
+    proc = MagicMock()
+    proc.returncode = 1
+    proc.communicate = AsyncMock(return_value=(b"", b"boom"))
+    with patch("bot.discord_ingest.service.has_free_space", return_value=True), \
+         patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, return_value=proc):
+        path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
+    assert path is None
+
+
+async def test_fetch_stream_video_timeout(tmp_path):
+    from bot.discord_ingest.service import _fetch_stream_video
+    proc = MagicMock()
+    proc.kill = MagicMock()
+    proc.communicate = AsyncMock(side_effect=__import__("asyncio").TimeoutError)
+    with patch("bot.discord_ingest.service.has_free_space", return_value=True), \
+         patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, return_value=proc):
+        path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
+    assert path is None
+    proc.kill.assert_called_once()
+
+
+async def test_fetch_stream_video_no_space(tmp_path):
+    from bot.discord_ingest.service import _fetch_stream_video
+    with patch("bot.discord_ingest.service.has_free_space", return_value=False):
+        path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
+    assert path is None
+
+
+async def test_fetch_stream_video_ffmpeg_missing(tmp_path):
+    from bot.discord_ingest.service import _fetch_stream_video
+    with patch("bot.discord_ingest.service.has_free_space", return_value=True), \
+         patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
+               new_callable=AsyncMock, side_effect=OSError("ffmpeg not found")):
+        path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
+    assert path is None

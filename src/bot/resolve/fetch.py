@@ -23,12 +23,16 @@ class ResolvedMetadata:
     description: str | None = None
     image_url: str | None = None
     via: str = "none"  # oembed | opengraph | html | discord | none | skipped
-    # Direct video file URL (mp4) when the source is a video/GIF post and the
-    # resolver API exposes one (fxtwitter, vxtwitter, tikwm, reddit GIFs).
-    # image_url still carries the thumbnail still for fallback/preview use.
+    # Video URL when the source is a video/GIF post and the resolver exposes one
+    # (fxtwitter, vxtwitter, tikwm, reddit). image_url still carries the thumbnail
+    # still for fallback/preview use.
     video_url: str | None = None
     video_width: int | None = None
     video_height: int | None = None
+    # True when video_url is a stream manifest (HLS/DASH) that ffmpeg must fetch and
+    # mux (e.g. reddit, where video and audio are separate streams) rather than a
+    # single downloadable file.
+    video_is_stream: bool = False
 
 
 class _MetaParser(HTMLParser):
@@ -368,17 +372,26 @@ async def _wikipedia_api(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     )
 
 
-def _reddit_gif_video(post: dict) -> dict | None:
-    """Return the reddit_video dict when the post is a GIF-style video.
-
-    Only is_gif videos are usable: reddit's fallback_url is the video stream
-    without the audio track, so posting a regular video from it would be silent.
-    GIFs have no audio to lose.
-    """
+def _reddit_video(post: dict) -> dict | None:
+    """Return the reddit_video dict for a v.redd.it post, or None."""
     rv = ((post.get("secure_media") or post.get("media") or {}) or {}).get("reddit_video") or {}
-    if rv.get("is_gif") and rv.get("fallback_url"):
-        return rv
-    return None
+    return rv if rv.get("fallback_url") else None
+
+
+def _reddit_video_fields(rv: dict) -> tuple[str | None, bool]:
+    """Map a reddit_video dict to (video_url, is_stream).
+
+    GIFs have no audio, so their video-only fallback_url can be downloaded directly.
+    Regular videos store audio as a separate stream, so we hand the HLS/DASH manifest
+    to ffmpeg to fetch and mux; without a manifest we skip (a bare fallback_url would
+    be silent).
+    """
+    if rv.get("is_gif"):
+        return rv.get("fallback_url"), False
+    manifest = rv.get("hls_url") or rv.get("dash_url")
+    if manifest:
+        return manifest, True
+    return None, False
 
 
 def _reddit_image_url(post: dict) -> str | None:
@@ -433,25 +446,78 @@ async def _reddit_json_api(url: str, client: httpx.AsyncClient) -> ResolvedMetad
 
     # Try to get an image from the post itself first.
     image_url = _reddit_image_url(post)
-    gif_video = _reddit_gif_video(post)
+    rv = _reddit_video(post)
 
     # For crossposts, fall through to the original post's media.
     if post.get("crosspost_parent_list"):
         parent = post["crosspost_parent_list"][0]
         if not image_url:
             image_url = _reddit_image_url(parent)
-        if not gif_video:
-            gif_video = _reddit_gif_video(parent)
+        if not rv:
+            rv = _reddit_video(parent)
 
+    video_url, video_is_stream = _reddit_video_fields(rv) if rv else (None, False)
     return ResolvedMetadata(
         title=title,
         description=subreddit,
         image_url=image_url,
-        video_url=(gif_video or {}).get("fallback_url"),
-        video_width=(gif_video or {}).get("width"),
-        video_height=(gif_video or {}).get("height"),
+        video_url=video_url,
+        video_width=(rv or {}).get("width"),
+        video_height=(rv or {}).get("height"),
+        video_is_stream=video_is_stream,
         via="reddit_api",
     )
+
+
+def _extract_og_video(html: str) -> str | None:
+    """Pull a direct video URL from a page's OpenGraph tags (og:video:secure_url)."""
+    parser = _MetaParser()
+    parser.feed(html)
+    url = _first(parser.metas, "og:video:secure_url", "og:video:url", "og:video")
+    return url.replace("&amp;", "&") if url else None
+
+
+async def _reddit_mirror(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Resolve reddit via the vxreddit embed mirror.
+
+    Reddit's own JSON API 403s from datacenter IPs. The mirror serves an OpenGraph
+    page (to our normal UA) whose og:video is a server-side muxed mp4 - video + the
+    separate audio track combined - that downloads directly. Used when the JSON API
+    yields no video.
+    """
+    mirror_url = _reddit_mirror_url(url)
+    if mirror_url == url:
+        return None
+    try:
+        resp = await client.get(mirror_url, headers=_HEADERS, timeout=_FETCH_TIMEOUT, follow_redirects=True)
+    except httpx.HTTPError as exc:
+        log.info("reddit mirror fetch failed for %s: %s", url, exc)
+        return None
+    if resp.status_code != 200 or "html" not in resp.headers.get("content-type", ""):
+        log.info("reddit mirror returned %d (%s) for %s", resp.status_code, resp.headers.get("content-type", ""), url)
+        return None
+    html = resp.text[:_MAX_HTML_BYTES]
+    meta = parse_html_metadata(html, str(resp.url))
+    video = _extract_og_video(html)
+    if video:
+        meta.video_url = video
+        meta.video_is_stream = False  # mirror mp4 is pre-muxed and directly downloadable
+    meta.via = "reddit_mirror"
+    return meta
+
+
+async def _reddit_resolve(url: str, client: httpx.AsyncClient) -> ResolvedMetadata | None:
+    """Reddit resolution, tiered for resilience.
+
+    1. reddit.com JSON API - richest (full reddit_video manifest); works off
+       datacenter IPs or if reddit unblocks this host. A success is trusted whole.
+    2. vxreddit mirror - only when the JSON API fails (e.g. 403 on a datacenter IP);
+       serves a muxed mp4 in og:video that downloads directly.
+    """
+    meta = await _reddit_json_api(url, client)
+    if meta is not None:
+        return meta
+    return await _reddit_mirror(url, client)
 
 
 def _twitter_mirror_url(url: str) -> str:
@@ -492,13 +558,14 @@ _OEMBED_HANDLERS = {
     "twitter": _twitter_fxtwitter_api,
     "instagram": _instagram_oembed,
     "tiktok": _tiktok_tikwm,
-    "reddit": _reddit_json_api,
+    "reddit": _reddit_resolve,
     "wikipedia": _wikipedia_api,
 }
 
+# Note: reddit is absent here - _reddit_resolve already consults the vxreddit mirror
+# internally (and extracts og:video), so a generic mirror-OG retry would be redundant.
 _MIRROR_URL_FUNCS = {
     "twitter": _twitter_mirror_url,
-    "reddit": _reddit_mirror_url,
     "instagram": _instagram_mirror_url,
     "deviantart": _deviantart_mirror_url,
     "youtube": _youtube_watch_url,
@@ -580,4 +647,5 @@ async def resolve(
         video_url=meta.video_url,
         video_width=meta.video_width,
         video_height=meta.video_height,
+        video_is_stream=meta.video_is_stream,
     )
