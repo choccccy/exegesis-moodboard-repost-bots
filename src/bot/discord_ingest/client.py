@@ -729,13 +729,11 @@ class RepostBot(discord.Client):
 
         async with session_scope() as session:
             rows = await session.execute(
-                select(SubmissionThread.thread_id, Submission.id.label("submission_id"))
-                .join(
-                    Submission,
-                    (Submission.board_id == SubmissionThread.board_id)
-                    & (Submission.source_discord_message_id == SubmissionThread.source_discord_message_id),
+                select(Submission.thread_id, Submission.id.label("submission_id"))
+                .where(
+                    Submission.state.in_(_PENDING_STATES),
+                    Submission.thread_id.is_not(None),
                 )
-                .where(Submission.state.in_(_PENDING_STATES))
             )
             pending = [(r.thread_id, r.submission_id) for r in rows]
 

@@ -286,6 +286,7 @@ async def _add_pending_thread(session, board, *, source_msg_id=1, thread_id=777,
                               state=SubmissionState.AWAITING_ALT_TEXT.value,
                               updated_at=None):
     sub = make_submission(board, state=state, source_discord_message_id=source_msg_id)
+    sub.thread_id = thread_id  # catch-up now reads this directly from Submission
     if updated_at is not None:
         sub.updated_at = updated_at
     session.add(sub)
