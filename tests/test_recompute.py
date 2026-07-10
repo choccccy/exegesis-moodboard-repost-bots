@@ -77,7 +77,7 @@ def test_awaiting_image_to_ready_is_fresh():
 
 from sqlalchemy import select
 
-from bot.discord_ingest.service import recompute_and_request
+from bot.discord_ingest.service import cancel_submission_for_deleted_thread, recompute_and_request
 from bot.models import (
     Attachment,
     AttachmentAltTextRequest,
@@ -333,3 +333,75 @@ async def test_recompute_reposts_confirmation_when_discord_message_deleted(sessi
     assert len(rows) == 1
     assert rows[0].bot_message_id != 99999  # new message, not the deleted one
     assert any("queue this for posting" in s.lower() for s in dest.sent)
+
+
+async def test_recompute_reposts_confirmation_when_riding_on_checklist(session, board):
+    """Legacy submissions recorded the ConfirmationRequest against the status checklist
+    message; the checklist is now edited with view=None, stripping the button on every
+    recompute. Recompute must detect the collapse (bot_message_id == status_message_id)
+    and repost a fresh standalone confirmation."""
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    sub.status_message_id = 555000  # checklist message
+    session.add(sub)
+    await session.flush()
+    _add_link(session, sub, resolved_via="opengraph", resolved_image_path="/t.jpg")
+    # The stale row points at the SAME message as the checklist (legacy shared message).
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=555000))
+    await session.flush()
+
+    dest = MockDest()
+    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    # A fresh confirmation on its own message replaces the collapsed one.
+    rows = list(await session.scalars(
+        select(ConfirmationRequest).where(ConfirmationRequest.submission_id == sub.id)
+    ))
+    assert len(rows) == 1
+    assert rows[0].bot_message_id != 555000  # standalone message, not the checklist
+    assert rows[0].bot_message_id != sub.status_message_id
+    assert any("queue this for posting" in s.lower() for s in dest.sent)
+
+
+# ---------------------------------------------------------------------------
+# cancel_submission_for_deleted_thread - purge orphaned submissions
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_deleted_thread_purges_open_submission(session, board):
+    """An open submission whose thread was deleted is purged, child rows and all."""
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    sub.thread_id = 4242
+    session.add(sub)
+    await session.flush()
+    _add_link(session, sub)
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=9001))
+    session.add(SourceRequest(submission_id=sub.id, bot_message_id=9002))
+    await session.flush()
+    sub_id = sub.id
+
+    purged = await cancel_submission_for_deleted_thread(session, make_test_settings(), 4242)
+
+    assert purged == sub_id
+    assert await session.get(Submission, sub_id) is None
+    assert await _count(session, ConfirmationRequest, sub_id) == 0
+    assert await _count(session, SourceRequest, sub_id) == 0
+    assert await _count(session, SubmissionLink, sub_id) == 0
+
+
+async def test_cancel_deleted_thread_leaves_terminal_submission(session, board):
+    """A queued/published submission is NOT purged - it doesn't need a live thread."""
+    sub = make_submission(board, state=SubmissionState.QUEUED.value)
+    sub.thread_id = 4243
+    session.add(sub)
+    await session.flush()
+    sub_id = sub.id
+
+    purged = await cancel_submission_for_deleted_thread(session, make_test_settings(), 4243)
+
+    assert purged is None
+    assert await session.get(Submission, sub_id) is not None  # left intact
+
+
+async def test_cancel_deleted_thread_no_match_returns_none(session, board):
+    purged = await cancel_submission_for_deleted_thread(session, make_test_settings(), 999999)
+    assert purged is None

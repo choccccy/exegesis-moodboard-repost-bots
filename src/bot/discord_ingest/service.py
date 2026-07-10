@@ -137,6 +137,31 @@ def _triage_relative(dt: datetime | None) -> str:
 
 _TRIAGE_TERMINAL_STATES = {SubmissionState.PUBLISHED.value, SubmissionState.PUBLISH_FAILED.value}
 
+# Every child table keyed by submission_id. Deleting a submission must purge all of
+# these first (no DB-level cascade). Kept in one place so every delete path stays in sync.
+_SUBMISSION_CHILD_MODELS = (
+    SourceRequest,
+    AttachmentAltTextRequest,
+    ContentLabelRequest,
+    ImageRequest,
+    MetadataRequest,
+    SupplementalImageRequest,
+    SupplementalLinkRequest,
+    CancellationRequest,
+    ConfirmationRequest,
+    PublishAttempt,
+    SubmissionLink,
+    Attachment,
+)
+
+
+async def _delete_submission_cascade(session: AsyncSession, sub_id: int) -> None:
+    """Delete a submission and all of its child rows. Assumes any filesystem cleanup
+    (remove_submission_dir) and Discord cleanup (thread archive) is handled by the caller."""
+    for model in _SUBMISSION_CHILD_MODELS:
+        await session.execute(delete(model).where(model.submission_id == sub_id))
+    await session.execute(delete(Submission).where(Submission.id == sub_id))
+
 
 async def fetch_triage_items(
     session: AsyncSession,
@@ -348,14 +373,7 @@ async def handle_reaction(
                     sub_id = submission.id
                     board = await session.get(Board, submission.board_id)
                     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-                    for model in (
-                        SourceRequest, AttachmentAltTextRequest, ContentLabelRequest,
-                        ImageRequest, MetadataRequest, SupplementalImageRequest,
-                        SupplementalLinkRequest, CancellationRequest, ConfirmationRequest,
-                        PublishAttempt, SubmissionLink, Attachment,
-                    ):
-                        await session.execute(delete(model).where(model.submission_id == sub_id))
-                    await session.execute(delete(Submission).where(Submission.id == sub_id))
+                    await _delete_submission_cascade(session, sub_id)
                     # Remove butterfly so future scans skip this post.
                     await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
                     # Archive immediately - the notice above already says "Closing this thread."
@@ -606,24 +624,7 @@ async def handle_reaction_removed(
     sub_id = submission.id
     thread_id = submission.thread_id
     remove_submission_dir(settings.attachments_dir, board.id, sub_id)
-    # Delete child rows, then the submission itself.
-    # (SQLite has no ON DELETE CASCADE here, so delete children explicitly.)
-    for model in (
-        SourceRequest,
-        AttachmentAltTextRequest,
-        ContentLabelRequest,
-        ImageRequest,
-        MetadataRequest,
-        SupplementalImageRequest,
-        SupplementalLinkRequest,
-        CancellationRequest,
-        ConfirmationRequest,
-        PublishAttempt,
-        SubmissionLink,
-        Attachment,
-    ):
-        await session.execute(delete(model).where(model.submission_id == sub_id))
-    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    await _delete_submission_cascade(session, sub_id)
     log.info("deleted submission %s after 🦋 removal on message %s", sub_id, message_id)
 
     # Notice goes in the thread (never the main channel). The thread is kept and
@@ -856,22 +857,7 @@ async def handle_cancel_reaction(
     thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-    for model in (
-        SourceRequest,
-        AttachmentAltTextRequest,
-        ContentLabelRequest,
-        ImageRequest,
-        MetadataRequest,
-        SupplementalImageRequest,
-        SupplementalLinkRequest,
-        CancellationRequest,
-        ConfirmationRequest,
-        PublishAttempt,
-        SubmissionLink,
-        Attachment,
-    ):
-        await session.execute(delete(model).where(model.submission_id == sub_id))
-    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    await _delete_submission_cascade(session, sub_id)
     log.info("deleted submission %s after ❌ cancel by user %s", sub_id, user_id)
 
     thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
@@ -926,21 +912,7 @@ async def handle_source_cancel_reaction(
             thread_id = thread_id or submission.thread_id
             sub_id = submission.id
             remove_submission_dir(settings.attachments_dir, board.id, sub_id)
-            for model in (
-                SourceRequest,
-                AttachmentAltTextRequest,
-                ContentLabelRequest,
-                ImageRequest,
-                MetadataRequest,
-                SupplementalImageRequest,
-                CancellationRequest,
-                ConfirmationRequest,
-                PublishAttempt,
-                SubmissionLink,
-                Attachment,
-            ):
-                await session.execute(delete(model).where(model.submission_id == sub_id))
-            await session.execute(delete(Submission).where(Submission.id == sub_id))
+            await _delete_submission_cascade(session, sub_id)
             log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
             cancelled_submission = True
             await _clear_trigger_reaction(channel, message_id, settings.trigger_emoji)
@@ -1155,22 +1127,7 @@ async def handle_cancel_button(
     thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-    for model in (
-        SourceRequest,
-        AttachmentAltTextRequest,
-        ContentLabelRequest,
-        ImageRequest,
-        MetadataRequest,
-        SupplementalImageRequest,
-        SupplementalLinkRequest,
-        CancellationRequest,
-        ConfirmationRequest,
-        PublishAttempt,
-        SubmissionLink,
-        Attachment,
-    ):
-        await session.execute(delete(model).where(model.submission_id == sub_id))
-    await session.execute(delete(Submission).where(Submission.id == sub_id))
+    await _delete_submission_cascade(session, sub_id)
     log.info("deleted submission %s after button cancel by user %s", sub_id, user.id)
 
     try:
@@ -2293,6 +2250,28 @@ _QUEUE_TERMINAL = frozenset({
 _DEFERRED = object()  # sentinel: parent butterflied but not yet published
 
 
+async def cancel_submission_for_deleted_thread(
+    session: AsyncSession, settings: Settings, thread_id: int
+) -> int | None:
+    """A submission's Discord thread was deleted - purge the orphaned open submission so
+    it stops cluttering triage with a dead link (it can never be actioned without a thread).
+
+    Terminal submissions (queued/published/failed) are left intact: they don't need a live
+    thread and stand as a record. Returns the purged submission id, or None if nothing was.
+    """
+    submission = await session.scalar(
+        select(Submission).where(Submission.thread_id == thread_id)
+    )
+    if submission is None or submission.state in _QUEUE_TERMINAL:
+        return None
+    sub_id = submission.id
+    board = await session.get(Board, submission.board_id)
+    remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+    await _delete_submission_cascade(session, sub_id)
+    log.info("purged submission %s: its Discord thread %s was deleted", sub_id, thread_id)
+    return sub_id
+
+
 async def _resolve_parent_ref(session: AsyncSession, submission: Submission):
     """Resolve the Bluesky reply ref for a submission that is a Discord reply.
 
@@ -2621,23 +2600,38 @@ async def recompute_and_request(
         has_conf = existing_conf is not None
 
         # On the "silent" path (already READY_TO_QUEUE, typically a bot restart),
-        # verify the Discord message is still there. If it was deleted, clean up
-        # the stale row so the confirmation button gets reposted below.
+        # make sure the confirmation button is actually present and clickable.
         if has_conf and action == "silent" and existing_conf is not None:
-            fetch_message = getattr(destination, "fetch_message", None)
-            if fetch_message is not None:
-                try:
-                    await fetch_message(existing_conf.bot_message_id)
-                except discord.NotFound:
-                    log.warning(
-                        "confirmation message %s for submission %s was deleted; reposting",
-                        existing_conf.bot_message_id, submission.id,
-                    )
-                    await session.delete(existing_conf)
-                    await session.flush()
-                    has_conf = False
-                except (discord.Forbidden, discord.HTTPException):
-                    pass  # cannot verify; assume it exists
+            # Legacy submissions recorded the ConfirmationRequest against the status
+            # checklist message (the button used to live on the checklist). The checklist
+            # is now edited in place with view=None, which strips that button on every
+            # recompute. Detect the collapse and repost a fresh standalone confirmation.
+            if existing_conf.bot_message_id == submission.status_message_id:
+                log.warning(
+                    "confirmation for submission %s rode on the checklist message %s "
+                    "(button stripped); reposting a standalone confirmation",
+                    submission.id, existing_conf.bot_message_id,
+                )
+                await session.delete(existing_conf)
+                await session.flush()
+                has_conf = False
+            else:
+                # Otherwise verify the Discord message still exists; if it was deleted,
+                # clean up the stale row so the confirmation gets reposted below.
+                fetch_message = getattr(destination, "fetch_message", None)
+                if fetch_message is not None:
+                    try:
+                        await fetch_message(existing_conf.bot_message_id)
+                    except discord.NotFound:
+                        log.warning(
+                            "confirmation message %s for submission %s was deleted; reposting",
+                            existing_conf.bot_message_id, submission.id,
+                        )
+                        await session.delete(existing_conf)
+                        await session.flush()
+                        has_conf = False
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass  # cannot verify; assume it exists
 
         if not has_conf:
             try:

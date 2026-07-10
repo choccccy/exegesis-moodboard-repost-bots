@@ -10,12 +10,12 @@ import discord
 from discord import app_commands
 import httpx
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from ..bot_status import scan_finished, scan_started
 from ..config import Settings
 from ..db import session_scope
-from ..models import Submission, SubmissionThread
+from ..models import ConfirmationRequest, Submission, SubmissionThread
 from ..moderation import GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
 from . import replies, service
@@ -66,17 +66,17 @@ def _format_triage(
     if not items:
         qualifier = f" matching '{filter_label}'" if filter_label else ""
         user_qualifier = f" from {user_label}" if user_label else ""
-        return f"All clear — nothing open{qualifier}{user_qualifier} for **#{channel_name}**."
+        return f"All clear - nothing open{qualifier}{user_qualifier} for **#{channel_name}**."
 
     truncated = len(items) > _TRIAGE_MAX_ITEMS
     shown = items[:_TRIAGE_MAX_ITEMS]
 
     if filter_label:
-        header = f"**🦋 #{channel_name}** — {len(items)} open · {filter_label}{by_user}"
+        header = f"**🦋 #{channel_name}** - {len(items)} open · {filter_label}{by_user}"
         lines = [header, ""]
         for item in shown:
             link = f"[{item.title}](<{item.thread_url}>)" if item.thread_url else item.title
-            lines.append(f"• {link} — {item.author_display} · {item.submitted_rel}")
+            lines.append(f"• {link} - {item.author_display} · {item.submitted_rel}")
     else:
         from collections import defaultdict
         grouped: dict[str, list] = defaultdict(list)
@@ -87,7 +87,7 @@ def _format_triage(
         state_order = list(_TRIAGE_STATE_LABELS.keys())
         sorted_states = sorted(grouped, key=lambda s: state_order.index(s) if s in state_order else 99)
 
-        header = f"**🦋 #{channel_name}** — {len(items)} open{by_user}"
+        header = f"**🦋 #{channel_name}** - {len(items)} open{by_user}"
         lines = [header]
         for state in sorted_states:
             group = grouped[state]
@@ -95,7 +95,7 @@ def _format_triage(
             lines.append(f"\n**{label}** ({len(group)})")
             for item in group:
                 link = f"[{item.title}](<{item.thread_url}>)" if item.thread_url else item.title
-                lines.append(f"• {link} — {item.author_display} · {item.submitted_rel}")
+                lines.append(f"• {link} - {item.author_display} · {item.submitted_rel}")
 
     if truncated:
         lines.append(f"\n… and {len(items) - _TRIAGE_MAX_ITEMS} more (use a filter to narrow down)")
@@ -206,7 +206,7 @@ class RepostBot(discord.Client):
             return
         custom_id: str = (interaction.data or {}).get("custom_id", "")
 
-        # The edit button's initial response IS the modal — defer() is not allowed first.
+        # The edit button's initial response IS the modal - defer() is not allowed first.
         # All other buttons defer immediately before any DB work so we stay within
         # Discord's 3-second acknowledgement window even when the bot is rate-limited.
         if custom_id.startswith("edit:"):
@@ -429,6 +429,18 @@ class RepostBot(discord.Client):
                 user_id=payload.user_id,
             )
 
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        """A submission thread was deleted - purge the orphaned open submission so it
+        stops showing in triage with a dead link. Raw event fires for uncached threads."""
+        if payload.parent_id is not None and payload.parent_id not in self._watched_channels:
+            return
+        async with session_scope() as session:
+            purged = await service.cancel_submission_for_deleted_thread(
+                session, self.settings, payload.thread_id
+            )
+        if purged is not None:
+            log.info("purged submission %s after its thread %s was deleted", purged, payload.thread_id)
+
     async def on_message(self, message: discord.Message) -> None:
         if message.author.id == getattr(self.user, "id", None):
             return  # never react to our own messages
@@ -602,7 +614,7 @@ class RepostBot(discord.Client):
                 if timed_out:
                     summary = (
                         f"Scan timed out after {_CATCHUP_CHANNEL_TIMEOUT:.0f}s "
-                        f"({scanned} checked, {processed} processed — some older messages may have been missed)."
+                        f"({scanned} checked, {processed} processed - some older messages may have been missed)."
                     )
                 await status_message.edit(content=summary)
             except (discord.Forbidden, discord.HTTPException):
@@ -626,6 +638,19 @@ class RepostBot(discord.Client):
                 log.warning("cannot access channel %s: %s", channel_id, exc)
                 return None
         return channel
+
+    async def _channel_is_deleted(self, channel_id: int) -> bool:
+        """Definitively confirm a channel/thread no longer exists (404). Distinguishes a
+        genuine deletion from a transient/permission error so callers don't purge on a blip."""
+        if self.get_channel(channel_id) is not None:
+            return False
+        try:
+            await self.fetch_channel(channel_id)
+            return False
+        except discord.NotFound:
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
 
     async def _fetch_message(self, channel_id: int, message_id: int) -> discord.Message | None:
         channel = await self._resolve_channel(channel_id)
@@ -723,16 +748,33 @@ class RepostBot(discord.Client):
             SubmissionState.AWAITING_IMAGE.value,
             SubmissionState.AWAITING_ALT_TEXT.value,
             SubmissionState.AWAITING_GRAPHIC_CLASSIFICATION.value,
-            SubmissionState.READY_TO_QUEUE.value,
         )
         _VOTE_EMOJIS = {GRAPHIC_YES_EMOJI}
 
         async with session_scope() as session:
             rows = await session.execute(
                 select(Submission.thread_id, Submission.id.label("submission_id"))
+                .outerjoin(
+                    ConfirmationRequest,
+                    and_(
+                        ConfirmationRequest.submission_id == Submission.id,
+                        ConfirmationRequest.confirmed_at.is_(None),
+                    ),
+                )
                 .where(
-                    Submission.state.in_(_PENDING_STATES),
                     Submission.thread_id.is_not(None),
+                    or_(
+                        Submission.state.in_(_PENDING_STATES),
+                        # ready_to_queue is otherwise excluded (healthy ones are just
+                        # awaiting a manual queue click - don't disturb them). Only the
+                        # legacy collapse case needs repair: the queue button rode on the
+                        # checklist message (bot_message_id == status_message_id) and gets
+                        # stripped on every recompute. Reposting fixes it.
+                        and_(
+                            Submission.state == SubmissionState.READY_TO_QUEUE.value,
+                            ConfirmationRequest.bot_message_id == Submission.status_message_id,
+                        ),
+                    ),
                 )
                 # Newest first: a just-submitted post gets its buttons back promptly
                 # instead of waiting behind the entire historical backlog (each thread
@@ -747,6 +789,16 @@ class RepostBot(discord.Client):
         for thread_id, submission_id in pending:
             thread = await self._resolve_channel(thread_id)
             if thread is None:
+                # Backstop for deletions that happened while the bot was offline (the
+                # on_raw_thread_delete event would have been missed). Only purge on a
+                # confirmed 404 - never on a transient/permission blip.
+                if await self._channel_is_deleted(thread_id):
+                    async with session_scope() as session:
+                        purged = await service.cancel_submission_for_deleted_thread(
+                            session, self.settings, thread_id
+                        )
+                    if purged is not None:
+                        log.info("purged submission %s: thread %s gone (catch-up)", purged, thread_id)
                 continue
             try:
                 async for message in thread.history(limit=None, oldest_first=True):  # type: ignore[union-attr]

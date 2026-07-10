@@ -1,7 +1,7 @@
 """Tests for _ensure_thread: SubmissionThread DB persistence logic.
 
-This is the platform-agnostic core — creating, reusing, and updating the
-per-submission thread mapping — that will move to the new ingest layer during
+This is the platform-agnostic core - creating, reusing, and updating the
+per-submission thread mapping - that will move to the new ingest layer during
 the platform-agnostic refactor.
 """
 
@@ -106,7 +106,7 @@ async def test_ensure_thread_new_passes_title_to_create_thread(session, board):
 
 
 # ---------------------------------------------------------------------------
-# Existing mapping — thread found
+# Existing mapping - thread found
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -167,12 +167,12 @@ async def test_ensure_thread_no_anchor_on_rescan(session, board):
 
 
 # ---------------------------------------------------------------------------
-# Existing mapping — thread gone (stale)
+# Existing mapping - thread gone (stale)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_ensure_thread_stale_mapping_creates_new_and_updates(session, board):
-    """Mapping exists but the thread is gone — creates a new thread, updates the mapping in-place."""
+    """Mapping exists but the thread is gone - creates a new thread, updates the mapping in-place."""
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value, source_discord_message_id=45)
     session.add(sub)
     await session.flush()

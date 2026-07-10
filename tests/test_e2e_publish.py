@@ -7,8 +7,8 @@ things mocked out:
     write resolved metadata directly to the DB)
   - The Bluesky API (publisher.publish_submission)
 
-Everything in between — _ingest_content, _capture_embed, _ingest_attachment,
-_ensure_thread, recompute_and_request, _snapshot, _attempt_publish — runs real
+Everything in between - _ingest_content, _capture_embed, _ingest_attachment,
+_ensure_thread, recompute_and_request, _snapshot, _attempt_publish - runs real
 code against the real in-memory SQLite DB.
 """
 
@@ -78,7 +78,7 @@ def _discord_message(
 ) -> tuple[MagicMock, MagicMock]:
     """Return (message, thread) mocks.
 
-    The thread is what create_thread() will return — its `send` mock uses a
+    The thread is what create_thread() will return - its `send` mock uses a
     counter so every call gets a unique `.id`, avoiding bot_message_id clashes.
     """
     thread = MagicMock(spec=discord.Thread)

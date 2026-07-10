@@ -16,7 +16,7 @@ import discord
 import pytest
 
 from bot.discord_ingest.client import RepostBot
-from bot.models import SubmissionThread
+from bot.models import ConfirmationRequest, SubmissionThread
 from bot.state import SubmissionState
 from conftest import bound_session_scope, make_submission
 
@@ -345,14 +345,78 @@ async def test_thread_catchup_replays_reactions_and_replies(repost_bot, session,
 async def test_thread_catchup_skips_missing_thread(repost_bot, session, board):
     await _add_pending_thread(session, board)
     repost_bot._resolve_channel = AsyncMock(return_value=None)
+    # Transient/permission blip (not a confirmed deletion): skip, don't purge.
+    repost_bot._channel_is_deleted = AsyncMock(return_value=False)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
         patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread", new_callable=AsyncMock) as purge,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
     recompute.assert_not_awaited()
+    purge.assert_not_awaited()  # transient error must not purge
+
+
+async def test_thread_catchup_purges_confirmed_deleted_thread(repost_bot, session, board):
+    """A thread confirmed deleted (404) during catch-up purges the orphaned submission
+    (backstop for deletions missed while the bot was offline)."""
+    sub = await _add_pending_thread(session, board)
+    repost_bot._resolve_channel = AsyncMock(return_value=None)
+    repost_bot._channel_is_deleted = AsyncMock(return_value=True)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
+        patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread", new_callable=AsyncMock, return_value=sub.id) as purge,
+        patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
+    ):
+        await repost_bot._run_thread_catchup()
+    purge.assert_awaited_once()
+    assert purge.await_args.args[2] == sub.thread_id
+
+
+def _thread_delete_payload(*, thread_id=1234, parent_id=100, guild_id=1):
+    payload = MagicMock(spec=discord.RawThreadDeleteEvent)
+    payload.thread_id = thread_id
+    payload.parent_id = parent_id
+    payload.guild_id = guild_id
+    return payload
+
+
+async def test_on_raw_thread_delete_purges_watched(repost_bot, session, board):
+    payload = _thread_delete_payload(thread_id=1234, parent_id=100)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread",
+              new_callable=AsyncMock, return_value=42) as purge,
+    ):
+        await repost_bot.on_raw_thread_delete(payload)
+    purge.assert_awaited_once()
+    assert purge.await_args.args[2] == 1234
+
+
+async def test_on_raw_thread_delete_ignores_unwatched_parent(repost_bot, session, board):
+    payload = _thread_delete_payload(thread_id=1234, parent_id=999999)  # not a board channel
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread",
+              new_callable=AsyncMock) as purge,
+    ):
+        await repost_bot.on_raw_thread_delete(payload)
+    purge.assert_not_awaited()
+
+
+async def test_on_raw_thread_delete_unknown_parent_still_checks(repost_bot, session, board):
+    # parent_id None (uncached) -> can't rule it out, so still look it up.
+    payload = _thread_delete_payload(thread_id=1234, parent_id=None)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread",
+              new_callable=AsyncMock, return_value=None) as purge,
+    ):
+        await repost_bot.on_raw_thread_delete(payload)
+    purge.assert_awaited_once()
 
 
 async def test_thread_catchup_recompute_failure_is_logged_not_raised(repost_bot, session, board):
@@ -470,12 +534,26 @@ async def test_thread_catchup_does_not_duplicate_existing_checklist(repost_bot, 
     assert not any(c.startswith("**post status**") for c in thread.sent)
 
 
-async def test_thread_catchup_includes_ready_to_queue_submissions(repost_bot, session, board):
-    """READY_TO_QUEUE submissions must be included in the catch-up scan so that a
-    missing confirmation button (e.g. message deleted after restart) gets reposted."""
-    sub = await _add_pending_thread(
-        session, board, state=SubmissionState.READY_TO_QUEUE.value, thread_id=888,
+async def test_thread_catchup_includes_only_collapsed_ready_to_queue(repost_bot, session, board):
+    """ready_to_queue is excluded from the catch-up EXCEPT the legacy collapse case
+    (confirmation rode on the checklist message). A healthy ready_to_queue (standalone
+    confirmation) must NOT be touched - its thread is left undisturbed."""
+    # Collapsed: bot_message_id == status_message_id -> needs repair, included.
+    collapsed = await _add_pending_thread(
+        session, board, state=SubmissionState.READY_TO_QUEUE.value,
+        source_msg_id=1, thread_id=888,
     )
+    collapsed.status_message_id = 700700
+    session.add(ConfirmationRequest(submission_id=collapsed.id, bot_message_id=700700))
+    # Healthy: standalone confirmation (different message) -> excluded, not disturbed.
+    healthy = await _add_pending_thread(
+        session, board, state=SubmissionState.READY_TO_QUEUE.value,
+        source_msg_id=2, thread_id=999,
+    )
+    healthy.status_message_id = 800800
+    session.add(ConfirmationRequest(submission_id=healthy.id, bot_message_id=800801))
+    await session.flush()
+
     thread = MagicMock()
     install_history(thread, [])
     repost_bot._resolve_channel = AsyncMock(return_value=thread)
@@ -486,8 +564,9 @@ async def test_thread_catchup_includes_ready_to_queue_submissions(repost_bot, se
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
-    recompute.assert_awaited_once()
-    assert recompute.await_args.args[1].id == sub.id
+    processed_ids = {c.args[1].id for c in recompute.await_args_list}
+    assert collapsed.id in processed_ids  # repaired
+    assert healthy.id not in processed_ids  # left alone
 
 
 async def test_thread_catchup_processes_newest_submissions_first(repost_bot, session, board):
@@ -793,6 +872,33 @@ async def test_resolve_channel_fetch_failure_returns_none(repost_bot):
     repost_bot.get_channel = MagicMock(return_value=None)
     repost_bot.fetch_channel = AsyncMock(side_effect=_not_found())
     assert await repost_bot._resolve_channel(100) is None
+
+
+async def test_channel_is_deleted_cache_hit_false(repost_bot):
+    repost_bot.get_channel = MagicMock(return_value=MagicMock())
+    repost_bot.fetch_channel = AsyncMock()
+    assert await repost_bot._channel_is_deleted(100) is False
+    repost_bot.fetch_channel.assert_not_awaited()  # cached -> exists, no API call
+
+
+async def test_channel_is_deleted_true_on_404(repost_bot):
+    repost_bot.get_channel = MagicMock(return_value=None)
+    repost_bot.fetch_channel = AsyncMock(side_effect=_not_found())
+    assert await repost_bot._channel_is_deleted(100) is True
+
+
+async def test_channel_is_deleted_false_when_fetch_succeeds(repost_bot):
+    repost_bot.get_channel = MagicMock(return_value=None)
+    repost_bot.fetch_channel = AsyncMock(return_value=MagicMock())
+    assert await repost_bot._channel_is_deleted(100) is False
+
+
+async def test_channel_is_deleted_false_on_transient(repost_bot):
+    repost_bot.get_channel = MagicMock(return_value=None)
+    repost_bot.fetch_channel = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "no")
+    )
+    assert await repost_bot._channel_is_deleted(100) is False  # transient, not a deletion
 
 
 async def test_fetch_message_ok(repost_bot):

@@ -3,19 +3,19 @@
 Each factory returns a View with timeout=None (persistent). Buttons carry
 explicit custom_ids so on_interaction can route them after any restart.
 
-Custom ID scheme (must stay stable — old buttons carry these forever):
-  confirm:{submission_id}   — queue the submission
-  cancel:{submission_id}    — cancel the submission
-  meta_ok:{submission_id}   — confirm current link as best available
-  graphic:{submission_id}   — mark as graphic/gore content
-  pl_skip:{submission_id}   — skip YouTube playlist addition
-  edit:{submission_id}      — open edit-post modal (caption + up to 4 images' alt)
-  edit_post:{submission_id} — modal custom_id for the edit-post modal
-  alt_edit:{submission_id}  — open the alt-text image picker (posts with >4 images)
-  alt_pick:{submission_id}  — select custom_id for the alt-text image picker
-  edit_alt:{attachment_id}  — modal custom_id for single-image alt editing
-  alt_skip:{attachment_id}  — waive alt text for one attachment
-  no_source:{submission_id} — waive the source requirement (no findable source)
+Custom ID scheme (must stay stable - old buttons carry these forever):
+  confirm:{submission_id}   - queue the submission
+  cancel:{submission_id}    - cancel the submission
+  meta_ok:{submission_id}   - confirm current link as best available
+  graphic:{submission_id}   - mark as graphic/gore content
+  pl_skip:{submission_id}   - skip YouTube playlist addition
+  edit:{submission_id}      - open edit-post modal (caption + up to 4 images' alt)
+  edit_post:{submission_id} - modal custom_id for the edit-post modal
+  alt_edit:{submission_id}  - open the alt-text image picker (posts with >4 images)
+  alt_pick:{submission_id}  - select custom_id for the alt-text image picker
+  edit_alt:{attachment_id}  - modal custom_id for single-image alt editing
+  alt_skip:{attachment_id}  - waive alt text for one attachment
+  no_source:{submission_id} - waive the source requirement (no findable source)
 """
 
 from __future__ import annotations
