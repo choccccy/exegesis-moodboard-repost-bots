@@ -2376,9 +2376,15 @@ def _archive_thread_after_delay(thread: discord.Thread, *, notice: str | None = 
 
 
 async def _archive_thread(thread: discord.Thread, *, notice: str | None = None) -> None:
-    """Immediately archive (close) a thread."""
-    if thread.archived:
-        return
+    """Immediately archive (close) a thread.
+
+    NB: we do NOT gate on ``thread.archived``. discord.py's ``Thread.edit()`` returns a
+    fresh object rather than mutating in place, so a thread that was unarchived earlier in
+    the same flow (e.g. reused then re-closed) still reports ``archived=True`` locally.
+    Trusting that stale flag silently skipped the archive - the notice would post and the
+    thread would stay open. Issuing the edit unconditionally is a harmless no-op when the
+    thread really is archived.
+    """
     if notice:
         try:
             await thread.send(notice)
@@ -2392,9 +2398,12 @@ async def _archive_thread(thread: discord.Thread, *, notice: str | None = None) 
 
 
 async def _unarchive_thread(thread: discord.Thread) -> None:
-    """Reopen an archived thread so the bot can post into it."""
-    if not thread.archived:
-        return
+    """Reopen an archived thread so the bot can post into it.
+
+    Like _archive_thread, this does not trust the possibly-stale local ``archived`` flag
+    (Thread.edit() returns a new object, never mutating in place) - it always issues the
+    edit, which is a no-op when the thread is already open.
+    """
     try:
         await thread.edit(archived=False)
         log.debug("unarchived thread %s for reuse", thread.id)
@@ -2709,7 +2718,8 @@ async def _attempt_publish(
         submission.state = SubmissionState.PUBLISH_FAILED.value
         session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
         try:
-            await destination.send(replies.publish_failed_notice(err))
+            await destination.send(replies.publish_failed_notice(
+                err, mention_user_ids=board_cfg.curator_user_ids if board_cfg else None))
         except Exception as exc:
             log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
         return PublishOutcome.FAILED
@@ -2721,7 +2731,8 @@ async def _attempt_publish(
         submission.state = SubmissionState.PUBLISH_FAILED.value
         session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
         try:
-            await destination.send(replies.publish_failed_notice(err))
+            await destination.send(replies.publish_failed_notice(
+                err, mention_user_ids=board_cfg.curator_user_ids))
         except Exception as exc:
             log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
         return PublishOutcome.FAILED
@@ -2820,7 +2831,8 @@ async def _attempt_publish(
     submission.state = SubmissionState.PUBLISH_FAILED.value
     log.error("submission %s publish failed: %s", submission.id, result.error)
     try:
-        await destination.send(replies.publish_failed_notice(result.error))
+        await destination.send(replies.publish_failed_notice(
+            result.error, mention_user_ids=board_cfg.curator_user_ids))
     except Exception as exc:
         log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
     return PublishOutcome.FAILED

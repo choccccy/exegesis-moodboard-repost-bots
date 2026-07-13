@@ -13,6 +13,13 @@ log = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (compatible; ExegesisRepostBot/0.1; +https://bsky.app)"
 _HEADERS = {"User-Agent": _UA, "Accept": "text/html,application/xhtml+xml"}
+
+# Embed-mirror services (vxreddit and friends) serve their OpenGraph embed page only
+# to recognised link-unfurl crawlers; a plain UA gets a 302 bounce to the real site
+# (which 403s our datacenter IP). We still identify ourselves honestly, but append the
+# Discordbot crawler token these services whitelist so they hand us the embed.
+_CRAWLER_UA = "Mozilla/5.0 (compatible; ExegesisRepostBot/0.1; +https://bsky.app; Discordbot/2.0)"
+_CRAWLER_HEADERS = {"User-Agent": _CRAWLER_UA, "Accept": "text/html,application/xhtml+xml"}
 _FETCH_TIMEOUT = 15.0
 _MAX_HTML_BYTES = 2_000_000  # don't parse arbitrarily large bodies
 
@@ -481,15 +488,15 @@ async def _reddit_mirror(url: str, client: httpx.AsyncClient) -> ResolvedMetadat
     """Resolve reddit via the vxreddit embed mirror.
 
     Reddit's own JSON API 403s from datacenter IPs. The mirror serves an OpenGraph
-    page (to our normal UA) whose og:video is a server-side muxed mp4 - video + the
-    separate audio track combined - that downloads directly. Used when the JSON API
-    yields no video.
+    page (only to a recognised crawler UA - see _CRAWLER_HEADERS; a plain UA is bounced
+    to reddit) whose og:video is a server-side muxed mp4 - video + the separate audio
+    track combined - that downloads directly. Used when the JSON API yields no video.
     """
     mirror_url = _reddit_mirror_url(url)
     if mirror_url == url:
         return None
     try:
-        resp = await client.get(mirror_url, headers=_HEADERS, timeout=_FETCH_TIMEOUT, follow_redirects=True)
+        resp = await client.get(mirror_url, headers=_CRAWLER_HEADERS, timeout=_FETCH_TIMEOUT, follow_redirects=True)
     except httpx.HTTPError as exc:
         log.info("reddit mirror fetch failed for %s: %s", url, exc)
         return None

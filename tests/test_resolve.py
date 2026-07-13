@@ -1382,3 +1382,18 @@ async def test_reddit_mirror_unrewritable_url_returns_none():
     result = await _reddit_mirror("https://old.reddit.com/r/x/comments/1/t/", client)
     assert result is None
     client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reddit_mirror_uses_crawler_user_agent():
+    # vxreddit only serves its embed page to a recognised crawler UA; a plain UA is
+    # bounced to reddit (403 on our IP). The mirror fetch must send the crawler token.
+    from bot.resolve.fetch import _CRAWLER_HEADERS
+    client = AsyncMock()
+    vid = "https://vxreddit.com/redditvideo.mp4?video_url=https%3A%2F%2Fv.redd.it%2Fabc%2F"
+    client.get.return_value = _reddit_mirror_resp(vid)
+    await _reddit_mirror("https://www.reddit.com/r/x/comments/1/t/", client)
+    sent_headers = client.get.call_args.kwargs["headers"]
+    assert sent_headers is _CRAWLER_HEADERS
+    assert "Discordbot" in sent_headers["User-Agent"]
+    assert "ExegesisRepostBot" in sent_headers["User-Agent"]  # still identifies us

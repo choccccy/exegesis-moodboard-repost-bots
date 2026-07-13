@@ -8,7 +8,10 @@ import re
 # suppressed-embed links in <...>, which we strip.
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 # Trailing punctuation that is almost never part of the URL itself (excluding ")").
-_TRAILING = ".,;!?\"'>]}"
+# Includes Discord markdown wrappers - `|` (spoiler ||...||), `*` (bold/italic), and
+# backtick (inline code) - which cling to the end of a pasted link. `_` and `~` are
+# deliberately excluded: they can legitimately end a URL path.
+_TRAILING = ".,;!?\"'>]}|*`"
 
 
 def _strip_trailing(url: str) -> str:

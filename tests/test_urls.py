@@ -31,3 +31,22 @@ def test_unbalanced_trailing_paren_stripped():
 def test_deduplication():
     url = "https://example.com"
     assert extract_urls(f"{url} {url}") == [url]
+
+
+def test_discord_spoiler_wrapper_stripped():
+    # A link posted inside a Discord spoiler (||...||) must not keep the trailing ||,
+    # which would corrupt e.g. a bsky.app rkey and 400 on publish.
+    url = "https://bsky.app/profile/saladbearer.bsky.social/post/3liikok3usk2h"
+    assert extract_urls(f"||{url}||") == [url]
+
+
+def test_discord_markdown_wrappers_stripped():
+    url = "https://example.com/post"
+    assert extract_urls(f"*{url}*") == [url]        # italic/bold
+    assert extract_urls(f"`{url}`") == [url]        # inline code
+
+
+def test_trailing_underscore_and_tilde_preserved():
+    # `_` and `~` can be part of a real URL path - do not strip them.
+    assert extract_urls("https://example.com/foo_") == ["https://example.com/foo_"]
+    assert extract_urls("https://example.com/~user") == ["https://example.com/~user"]

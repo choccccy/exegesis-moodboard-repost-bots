@@ -126,11 +126,15 @@ async def test_archive_thread_archives_open_thread():
     thread.edit.assert_awaited_once_with(archived=True)
 
 
-async def test_archive_thread_already_archived_is_noop():
+async def test_archive_thread_ignores_stale_archived_flag():
+    # The local `archived` flag can be stale (Thread.edit returns a new object and never
+    # mutates in place), so a thread unarchived earlier in the same flow still reads True.
+    # _archive_thread must NOT trust it - always issue the edit (harmless no-op if truly
+    # archived). Regression: trusting the flag left duplicate/closed threads open.
     thread = _thread(archived=True)
     await _archive_thread(thread, notice="all done")
-    thread.send.assert_not_awaited()
-    thread.edit.assert_not_awaited()
+    thread.send.assert_awaited_once_with("all done")
+    thread.edit.assert_awaited_once_with(archived=True)
 
 
 async def test_archive_thread_notice_failure_still_archives():
@@ -152,10 +156,12 @@ async def test_unarchive_thread_reopens():
     thread.edit.assert_awaited_once_with(archived=False)
 
 
-async def test_unarchive_thread_open_thread_is_noop():
+async def test_unarchive_thread_ignores_stale_archived_flag():
+    # Same staleness rationale as _archive_thread: always issue the edit rather than
+    # trusting the possibly-stale local flag (no-op if the thread is already open).
     thread = _thread(archived=False)
     await _unarchive_thread(thread)
-    thread.edit.assert_not_awaited()
+    thread.edit.assert_awaited_once_with(archived=False)
 
 
 async def test_unarchive_thread_edit_failure_swallowed():

@@ -209,9 +209,11 @@ def updated_notice() -> str:
     return "post updated - the new content will be included when published"
 
 
-def publish_failed_notice(error: str | None) -> str:
+def publish_failed_notice(error: str | None, mention_user_ids: list[int] | None = None) -> str:
+    mentions = " ".join(f"<@{uid}>" for uid in (mention_user_ids or []))
+    prefix = f"{mentions} " if mentions else ""
     return (
-        f"publish failed: {error or 'unknown error'}\n"
+        f"{prefix}⚠️ publish failed: {error or 'unknown error'}\n"
         "will retry automatically at the next available queue slot"
     )
 

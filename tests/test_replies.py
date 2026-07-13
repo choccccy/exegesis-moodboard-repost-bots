@@ -29,6 +29,17 @@ def test_publish_failed_notice_mentions_retry():
     assert "retry" in msg.lower()
 
 
+def test_publish_failed_notice_pings_curators():
+    msg = replies.publish_failed_notice("boom", mention_user_ids=[184475973356355584, 42])
+    assert "<@184475973356355584>" in msg and "<@42>" in msg
+    assert msg.startswith("<@184475973356355584>")  # mentions lead so they ping
+
+
+def test_publish_failed_notice_no_mentions_when_empty():
+    assert not replies.publish_failed_notice("boom").startswith("<@")
+    assert not replies.publish_failed_notice("boom", mention_user_ids=[]).startswith("<@")
+
+
 def test_metadata_confirm_emoji_is_link():
     assert replies.METADATA_CONFIRM_EMOJI == "🔗"
 
