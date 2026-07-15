@@ -417,3 +417,223 @@ async def test_status_command_closure_delegates(repost_bot, session):
         repost_bot._handle_status_slash.assert_awaited_once_with(interaction)
     finally:
         await repost_bot._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# /reingest, /no_source, /skip_alt - thread-scoped commands
+# ---------------------------------------------------------------------------
+
+
+def _thread_interaction(user_id=999, channel_id=5000):
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.user = MagicMock()
+    interaction.user.id = user_id
+    interaction.channel = MagicMock()
+    interaction.channel.id = channel_id
+    interaction.response = MagicMock()
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
+async def test_reingest_slash_happy_path(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    repost_bot._fetch_message = AsyncMock(return_value=MagicMock())
+    repost_bot._http = MagicMock()  # httpx_client property asserts this is set
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    reingest.assert_awaited_once()
+    assert reingest.await_args.kwargs["message"] is repost_bot._fetch_message.return_value
+    recompute.assert_awaited_once()
+    assert "Reingested" in interaction.followup.send.await_args.args[0]
+
+
+async def test_reingest_slash_not_in_thread(repost_bot, session, board):
+    interaction = _thread_interaction(channel_id=999999)  # not a submission thread
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    reingest.assert_not_awaited()
+    assert "inside a submission" in interaction.followup.send.await_args.args[0]
+
+
+async def test_reingest_slash_unauthorized(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=1)  # OP is someone else
+    interaction = _thread_interaction(user_id=555)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    reingest.assert_not_awaited()
+    assert "not authorised" in interaction.followup.send.await_args.args[0]
+
+
+async def test_reingest_slash_terminal_blocked(repost_bot, session, board):
+    from bot.state import SubmissionState
+    await _seed_thread_submission(session, board, author_id=999, state=SubmissionState.QUEUED.value)
+    interaction = _thread_interaction(user_id=999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    reingest.assert_not_awaited()
+    assert "already queued or published" in interaction.followup.send.await_args.args[0]
+
+
+async def test_reingest_slash_source_message_deleted(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    repost_bot._fetch_message = AsyncMock(return_value=None)  # message gone
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    reingest.assert_not_awaited()
+    assert "deleted or is unreachable" in interaction.followup.send.await_args.args[0]
+
+
+async def test_no_source_slash_waives(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock, return_value=True) as waive,
+    ):
+        await repost_bot._handle_nosource_slash(interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    waive.assert_awaited_once()
+    assert waive.await_args.kwargs["user_id"] == 999
+    assert "Marked as no known source" in interaction.followup.send.await_args.args[0]
+
+
+async def test_no_source_slash_already_waived(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock, return_value=False),
+    ):
+        await repost_bot._handle_nosource_slash(interaction)
+    assert "Already marked" in interaction.followup.send.await_args.args[0]
+
+
+async def test_no_source_slash_not_in_thread(repost_bot, session, board):
+    interaction = _thread_interaction(channel_id=999999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock) as waive,
+    ):
+        await repost_bot._handle_nosource_slash(interaction)
+    waive.assert_not_awaited()
+    assert "inside a submission" in interaction.followup.send.await_args.args[0]
+
+
+async def test_no_source_slash_unauthorized(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=1)
+    interaction = _thread_interaction(user_id=555)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock) as waive,
+    ):
+        await repost_bot._handle_nosource_slash(interaction)
+    waive.assert_not_awaited()
+    assert "not authorised" in interaction.followup.send.await_args.args[0]
+
+
+async def test_skip_alt_slash_skips(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock, return_value=2) as skip,
+    ):
+        await repost_bot._handle_skipalt_slash(interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    skip.assert_awaited_once()
+    assert "Skipped alt text for 2 image(s)" in interaction.followup.send.await_args.args[0]
+
+
+async def test_skip_alt_slash_nothing_pending(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock, return_value=0),
+    ):
+        await repost_bot._handle_skipalt_slash(interaction)
+    assert "No images are waiting" in interaction.followup.send.await_args.args[0]
+
+
+async def test_skip_alt_slash_not_in_thread(repost_bot, session, board):
+    interaction = _thread_interaction(channel_id=999999)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock) as skip,
+    ):
+        await repost_bot._handle_skipalt_slash(interaction)
+    skip.assert_not_awaited()
+    assert "inside a submission" in interaction.followup.send.await_args.args[0]
+
+
+async def test_reingest_slash_submission_vanished_after_fetch(repost_bot, session, board):
+    # Rare race: submission deleted between the auth check and the reingest session.
+    sub = await _seed_thread_submission(session, board, author_id=999)
+    interaction = _thread_interaction(user_id=999)
+    repost_bot._fetch_message = AsyncMock(return_value=MagicMock())
+    repost_bot._http = MagicMock()
+    repost_bot._submission_for_thread = AsyncMock(side_effect=[sub, None])  # exists, then gone
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
+        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock),
+    ):
+        await repost_bot._handle_reingest_slash(interaction)
+    reingest.assert_not_awaited()
+    assert "no longer exists" in interaction.followup.send.await_args.args[0]
+
+
+async def test_skip_alt_slash_unauthorized(repost_bot, session, board):
+    await _seed_thread_submission(session, board, author_id=1)
+    interaction = _thread_interaction(user_id=555)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock) as skip,
+    ):
+        await repost_bot._handle_skipalt_slash(interaction)
+    skip.assert_not_awaited()
+    assert "not authorised" in interaction.followup.send.await_args.args[0]
+
+
+async def test_new_command_closures_delegate(repost_bot, session):
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch.object(repost_bot.tree, "sync", new_callable=AsyncMock, return_value=[]),
+    ):
+        await repost_bot.setup_hook()
+    try:
+        repost_bot._handle_reingest_slash = AsyncMock()
+        repost_bot._handle_nosource_slash = AsyncMock()
+        repost_bot._handle_skipalt_slash = AsyncMock()
+        interaction = _thread_interaction()
+        await repost_bot.tree.get_command("reingest").callback(interaction)
+        await repost_bot.tree.get_command("no_source").callback(interaction)
+        await repost_bot.tree.get_command("skip_alt").callback(interaction)
+        repost_bot._handle_reingest_slash.assert_awaited_once_with(interaction)
+        repost_bot._handle_nosource_slash.assert_awaited_once_with(interaction)
+        repost_bot._handle_skipalt_slash.assert_awaited_once_with(interaction)
+    finally:
+        await repost_bot._http.aclose()

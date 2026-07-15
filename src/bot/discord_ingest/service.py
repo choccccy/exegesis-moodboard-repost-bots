@@ -1307,84 +1307,22 @@ async def handle_graphic_button(
     await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
-async def handle_alt_skip_button(
+async def waive_source(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    attachment_id: int,
+    submission: Submission,
+    *,
     settings: Settings,
+    user_id: int,
+    destination: Notifier,
     yt_client=None,
-) -> None:
-    """Skip alt text button clicked: waive alt text for one attachment (OP or curator)."""
-    att = await session.get(Attachment, attachment_id)
-    if att is None:
-        await interaction.followup.send("Attachment not found.", ephemeral=True)
-        return
-    submission = await session.get(Submission, att.submission_id)
-    if submission is None:
-        return
+) -> bool:
+    """Mark a submission as having no known source (the `/nosource` action).
 
-    board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to skip alt text here.", ephemeral=True)
-        return
-    if att.alt_text_status != AltTextStatus.NEEDED.value:
-        await interaction.followup.send("Alt text already handled for this image.", ephemeral=True)
-        return
-
-    att.alt_text_status = AltTextStatus.SKIPPED.value
-    att.alt_text_author = user.id
-    req = await session.scalar(
-        select(AttachmentAltTextRequest).where(
-            AttachmentAltTextRequest.submission_id == submission.id,
-            AttachmentAltTextRequest.attachment_id == attachment_id,
-            AttachmentAltTextRequest.answered_at.is_(None),
-        )
-    )
-    if req is not None:
-        req.answer = "skipped"
-        req.answered_by = user.id
-        req.answered_at = _now()
-
-    try:
-        await interaction.message.edit(view=views.make_disabled_view("Alt text skipped ⏭️"))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone alt-skip button for attachment %s: %s", attachment_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
-    await channel.send(replies.alt_text_skipped(att.filename))
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
-
-
-async def handle_no_source_button(
-    session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
-    settings: Settings,
-    yt_client=None,
-) -> None:
-    """No known source button: waive the source requirement (OP or curator).
-
-    Only offered when the post has uploaded media; the post then publishes with a
-    "source unknown" note instead of a link.
+    Caller is responsible for authorization. Returns False if already waived (no-op),
+    True after waiving. Posts the "source unknown" notice and recomputes state.
     """
-    submission = await session.get(Submission, submission_id)
-    if submission is None:
-        return
-
-    board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
-        return
     if submission.source_waived:
-        await interaction.followup.send("Already marked as no known source.", ephemeral=True)
-        return
-
+        return False
     submission.source_waived = True
     req = await session.scalar(
         select(SourceRequest).where(
@@ -1394,18 +1332,139 @@ async def handle_no_source_button(
     )
     if req is not None:
         req.answer = "no_source"
+        req.answered_by = user_id
+        req.answered_at = _now()
+    await destination.send(replies.no_source_marked())
+    await recompute_and_request(session, submission, settings=settings, destination=destination, yt_client=yt_client)
+    return True
+
+
+async def skip_all_alt_text(
+    session: AsyncSession,
+    submission: Submission,
+    *,
+    settings: Settings,
+    user_id: int,
+    destination: Notifier,
+    yt_client=None,
+) -> int:
+    """Skip alt text for every image/video still needing it (the `/skipalt` action).
+
+    Caller is responsible for authorization. Returns the number of attachments skipped
+    (0 = nothing pending, no notice posted). Per-image editing stays available via the
+    Edit alt text modal/picker.
+    """
+    pending = list(
+        await session.scalars(
+            select(Attachment).where(
+                Attachment.submission_id == submission.id,
+                Attachment.alt_text_status == AltTextStatus.NEEDED.value,
+            )
+        )
+    )
+    if not pending:
+        return 0
+    for att in pending:
+        att.alt_text_status = AltTextStatus.SKIPPED.value
+        att.alt_text_author = user_id
+    reqs = await session.scalars(
+        select(AttachmentAltTextRequest).where(
+            AttachmentAltTextRequest.submission_id == submission.id,
+            AttachmentAltTextRequest.attachment_id.in_([a.id for a in pending]),
+            AttachmentAltTextRequest.answered_at.is_(None),
+        )
+    )
+    for req in reqs:
+        req.answer = "skipped"
+        req.answered_by = user_id
+        req.answered_at = _now()
+    await destination.send(replies.alt_text_skipped_all(len(pending)))
+    await recompute_and_request(session, submission, settings=settings, destination=destination, yt_client=yt_client)
+    return len(pending)
+
+
+# Max length of a free-text non-URL source note (a citation, not an essay).
+_SOURCE_NOTE_MAX = 300
+
+
+async def handle_source_note_confirm(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Confirm-button on the 'that's not a URL - use it as the source?' prompt.
+
+    Commits the pending source_note so it counts as the source (OP or curator).
+    """
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        return
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
+        return
+    if not submission.source_note:
+        await interaction.followup.send("Nothing to confirm - reply with the source first.", ephemeral=True)
+        return
+
+    submission.source_note_confirmed = True
+    # Close any open source request - the note satisfies it.
+    req = await session.scalar(
+        select(SourceRequest).where(
+            SourceRequest.submission_id == submission.id,
+            SourceRequest.answered_at.is_(None),
+        )
+    )
+    if req is not None:
+        req.answer = "source_note"
         req.answered_by = user.id
         req.answered_at = _now()
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("No known source 🚫"))
+        await interaction.message.edit(view=views.make_disabled_view("Source noted 📄"))
     except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone no-source button for submission %s: %s", submission_id, exc)
+        log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
 
     channel = interaction.channel
     if channel is None:
         return
-    await channel.send(replies.no_source_marked())
+    await channel.send(replies.source_note_confirmed(submission.source_note))
+    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+
+
+async def handle_source_note_reject(
+    session: AsyncSession,
+    interaction: discord.Interaction,
+    submission_id: int,
+    settings: Settings,
+    yt_client=None,
+) -> None:
+    """Cancel-button on the source-note prompt: discard the pending note and re-prompt."""
+    submission = await session.get(Submission, submission_id)
+    if submission is None:
+        return
+    board_cfg = settings.board_for_channel(submission.channel_id)
+    user = interaction.user
+    member = user if isinstance(user, discord.Member) else None
+    if not _reaction_authorized(member, user.id, submission, board_cfg):
+        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
+        return
+
+    submission.source_note = None
+    submission.source_note_confirmed = False
+    try:
+        await interaction.message.edit(view=views.make_disabled_view("Discarded 🗑️"))
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    await channel.send(replies.source_note_rejected())
     await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
@@ -1642,6 +1701,83 @@ async def _resolve_thread_by_id(
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return None
     return resolved if isinstance(resolved, discord.Thread) else None
+
+
+async def reingest_submission(
+    session: AsyncSession,
+    submission: Submission,
+    *,
+    message: discord.Message,
+    settings: Settings,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Re-read the original Discord message and refresh this submission in place.
+
+    Rebuilds links, embed capture, and Discord attachments from the *current* message
+    state (picking up edits: changed caption, added/removed attachments, changed links)
+    and re-resolves link metadata/media - the useful half of unbutterfly+rebutterfly,
+    without the destructive full delete.
+
+    Preserved: curator-entered alt text (matched by the stable discord_attachment_id;
+    PROVIDED and SKIPPED are deliberate resolutions) and all submission-level decisions
+    (source waiver/note, graphic label, playlist opt-out) which live on the Submission
+    row and are never touched here. The resolver-sourced video (discord_attachment_id
+    == 0), if any, is kept as-is - its _ingest_resolved_video guard makes the re-resolve
+    a no-op, so the file and its alt survive (a changed upstream video won't refresh via
+    reingest; rebutterfly for that).
+
+    Non-attachment request rows (source, metadata, graphic, ...) are left intact, so
+    recompute_and_request won't re-prompt for things already answered. The caller runs
+    recompute_and_request afterward.
+    """
+    existing_atts = list(
+        await session.scalars(
+            select(Attachment).where(Attachment.submission_id == submission.id)
+        )
+    )
+    # discord_attachment_id -> (body, status, author) for human-resolved alt only.
+    preserved_alt = {
+        a.discord_attachment_id: (a.alt_text_body, a.alt_text_status, a.alt_text_author)
+        for a in existing_atts
+        if a.alt_text_status in (AltTextStatus.PROVIDED.value, AltTextStatus.SKIPPED.value)
+    }
+
+    # Drop Discord-sourced attachments (rebuilt from the message) plus their per-image
+    # alt-text request rows (keyed by attachment_id - they'd dangle otherwise). Keep the
+    # resolver video (id 0) and its request row.
+    removed_ids = [a.id for a in existing_atts if a.discord_attachment_id != 0]
+    if removed_ids:
+        await session.execute(
+            delete(AttachmentAltTextRequest).where(
+                AttachmentAltTextRequest.attachment_id.in_(removed_ids)
+            )
+        )
+        await session.execute(delete(Attachment).where(Attachment.id.in_(removed_ids)))
+
+    # Links and captured embed fields are fully derived from the message - rebuild them.
+    await session.execute(
+        delete(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
+    )
+    submission.embed_title = None
+    submission.embed_description = None
+    submission.embed_thumb_url = None
+    await session.flush()
+
+    inbound = discord_message_to_inbound(message)
+    thumb_proxy_url = await _ingest_content(session, submission, inbound, settings, http_client)
+    await _resolve_links(
+        session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url
+    )
+
+    # Re-apply preserved alt onto re-created attachments that still match by id.
+    if preserved_alt:
+        for a in await session.scalars(
+            select(Attachment).where(Attachment.submission_id == submission.id)
+        ):
+            snap = preserved_alt.get(a.discord_attachment_id)
+            if snap is not None:
+                a.alt_text_body, a.alt_text_status, a.alt_text_author = snap
+        await session.flush()
 
 
 async def _ingest_content(
@@ -2089,6 +2225,7 @@ async def _snapshot(
         resolved_via=resolved_via,
         metadata_confirmed=confirmed_meta is not None,
         source_waived=bool(submission.source_waived),
+        source_note=submission.source_note if submission.source_note_confirmed else None,
     )
     return snap, atts, links
 
@@ -2502,16 +2639,11 @@ async def recompute_and_request(
     if Gap.SOURCE in gaps and not await _has_open_request(
         session, SourceRequest, submission.id
     ):
-        # Offer the "no known source" waiver only when there is media to post without a link.
+        # Mention the /nosource waiver only when there is media to post without a link.
         has_media = any(a.is_image or a.is_video for a in atts)
         try:
-            if has_media:
-                msg = await destination.send(
-                    replies.source_request_with_waiver(),
-                    view=views.make_no_source_view(submission.id),
-                )
-            else:
-                msg = await destination.send(replies.source_request())
+            prompt = replies.source_request_with_waiver() if has_media else replies.source_request()
+            msg = await destination.send(prompt)
             session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post source request for submission %s: %s", submission.id, exc)
@@ -2548,20 +2680,19 @@ async def recompute_and_request(
                 session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
             ):
                 continue
-            skip_view = views.make_alt_skip_view(att.id)
             try:
                 if att.local_path and att.is_image:
                     try:
                         file = _discord_file_for_attachment(att.local_path, att.filename)
-                        msg = await destination.send(replies.alt_text_request(att.filename), file=file, view=skip_view)
+                        msg = await destination.send(replies.alt_text_request(att.filename), file=file)
                     except Exception as exc:
                         log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
                         msg = await destination.send(
-                            replies.alt_text_request(att.filename) + f"\n{att.discord_url}", view=skip_view
+                            replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                         )
                 else:
                     msg = await destination.send(
-                        replies.alt_text_request(att.filename) + f"\n{att.discord_url}", view=skip_view
+                        replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                     )
                 session.add(
                     AttachmentAltTextRequest(
@@ -2900,6 +3031,7 @@ async def _build_post_preview(
         image_source=image_source,
         reply_to_bsky_url=reply_to_bsky_url,
         reply_to_pending=reply_to_pending,
+        source_note=submission.source_note if submission.source_note_confirmed else None,
     )
 
 
@@ -2986,7 +3118,20 @@ async def _apply_answer(
     elif isinstance(req, SourceRequest):
         urls = extract_urls(message.content)
         if not urls:
-            await message.reply(replies.source_not_found(), mention_author=False)
+            # No URL in the reply. It might be a genuine non-URL source (an old magazine,
+            # a historical document, etc.). Stash it as a candidate note and ask for
+            # confirmation, so ordinary thread chatter is never silently taken as a source.
+            candidate = (message.content or "").strip()
+            if not candidate:
+                await message.reply(replies.source_not_found(), mention_author=False)
+                return False
+            submission.source_note = candidate[:_SOURCE_NOTE_MAX]
+            submission.source_note_confirmed = False
+            await message.reply(
+                replies.source_note_confirm(submission.source_note),
+                view=views.make_source_note_confirm_view(submission.id),
+                mention_author=False,
+            )
             return False
         start = await session.scalar(
             select(SubmissionLink.order_index)

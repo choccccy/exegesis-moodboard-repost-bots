@@ -402,7 +402,9 @@ async def test_handle_reply_source_url_creates_link(session, board):
     assert "artstation.com" in links[0].canonical_url
 
 
-async def test_handle_reply_source_no_url_nudges(session, board):
+async def test_handle_reply_source_non_url_offers_confirmation(session, board):
+    # A non-URL reply is stashed as a candidate source note and confirmed before use,
+    # so ordinary chatter is never silently taken as the source.
     sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value)
     session.add(sub)
     await session.flush()
@@ -411,14 +413,33 @@ async def test_handle_reply_source_no_url_nudges(session, board):
     msg = _make_message(
         reply_to_id=req.bot_message_id,
         author_id=sub.author_id,
-        content="here is my art",  # no URL
+        content="Popular Mechanics, March 1965",  # no URL
     )
-    settings = _mock_settings()
+    result = await handle_reply(session, settings=_mock_settings(), message=msg, http_client=MagicMock())
 
-    result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
-
-    assert result is True  # handled (nudge sent), request stays open
+    assert result is True
     msg.reply.assert_called_once()
+    # candidate stashed but NOT yet confirmed; request stays open until the button is clicked
+    # (checked in-memory: handle_reply commits via session_scope in production, not here)
+    assert sub.source_note == "Popular Mechanics, March 1965"
+    assert sub.source_note_confirmed is False
+    fresh_req = await session.get(SourceRequest, req.id)
+    assert fresh_req.answered_at is None
+
+
+async def test_handle_reply_source_empty_nudges(session, board):
+    # A whitespace-only reply has no candidate text - fall back to the plain nudge.
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value)
+    session.add(sub)
+    await session.flush()
+    req = await _add_source_request(session, sub)
+
+    msg = _make_message(reply_to_id=req.bot_message_id, author_id=sub.author_id, content="   ")
+    result = await handle_reply(session, settings=_mock_settings(), message=msg, http_client=MagicMock())
+
+    assert result is True
+    await session.refresh(sub)
+    assert sub.source_note is None  # nothing stashed
     fresh_req = await session.get(SourceRequest, req.id)
     assert fresh_req.answered_at is None
 

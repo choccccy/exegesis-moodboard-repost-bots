@@ -27,6 +27,12 @@ _MAX_GRAPHEMES = 300
 # Post text for a media post whose source was explicitly waived (no findable source).
 _SOURCE_UNKNOWN_TEXT = "source unknown"
 
+
+def _sourceless_text(source_note: str | None) -> str:
+    """Root-post text for a media post with no canonical link: a confirmed free-text
+    source ("source: Popular Mechanics, March 1965") or the waived fallback."""
+    return f"source: {source_note}" if source_note else _SOURCE_UNKNOWN_TEXT
+
 # Matches Bluesky hashtags: # followed by at least one letter (not a bare digit-only tag),
 # then any word characters. Negative lookbehind avoids matching inside URLs (#anchor).
 _TAG_RE = re.compile(r"(?<!\w)#([a-zA-Z][a-zA-Z0-9_]*)(?!\w)")
@@ -74,6 +80,7 @@ async def publish_submission(
     all_tags = list(board_cfg.tags)
     if board_cfg.nsfw:
         all_tags.append("nsfw")
+    source_note = submission.source_note if submission.source_note_confirmed else None
 
     reply = None
     if kind != "record" and reply_parent_uri and reply_parent_cid and reply_root_uri and reply_root_cid:
@@ -88,9 +95,9 @@ async def publish_submission(
         elif kind == "external":
             result = await _publish_external(client, links, labels, all_tags, reply=reply)
         elif kind == "images":
-            result = await _publish_images(client, links, attachments, labels, all_tags, reply=reply)
+            result = await _publish_images(client, links, attachments, labels, all_tags, reply=reply, source_note=source_note)
         elif kind == "video":
-            result = await _publish_video(client, links, attachments, labels, all_tags, reply=reply)
+            result = await _publish_video(client, links, attachments, labels, all_tags, reply=reply, source_note=source_note)
         else:
             return PublishResult(success=False, error=f"unsupported embed kind: {kind}")
     except Exception as exc:
@@ -478,6 +485,7 @@ async def _publish_images(
     tags: list[str],
     *,
     reply=None,
+    source_note: str | None = None,
 ) -> PublishResult:
     images = []
     upload_errors: list[str] = []
@@ -510,8 +518,8 @@ async def _publish_images(
     if url:
         text, facets = _post_text_and_facets(title, url)
     else:
-        # No link: the source was waived. Say so rather than posting bare media.
-        text, facets = _SOURCE_UNKNOWN_TEXT, []
+        # No link: a confirmed non-URL source, or the waived "source unknown" fallback.
+        text, facets = _sourceless_text(source_note), []
 
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
@@ -558,6 +566,7 @@ async def _publish_video(
     tags: list[str],
     *,
     reply=None,
+    source_note: str | None = None,
 ) -> PublishResult:
     """Publish the first video attachment as the root post."""
     first_video = next((a for a in attachments if a.is_video), None)
@@ -587,8 +596,8 @@ async def _publish_video(
     if url:
         text, facets = _post_text_and_facets(title, url)
     else:
-        # No link: the source was waived. Say so rather than posting bare media.
-        text, facets = _SOURCE_UNKNOWN_TEXT, []
+        # No link: a confirmed non-URL source, or the waived "source unknown" fallback.
+        text, facets = _sourceless_text(source_note), []
     text, facets = _append_tags(text, facets, tags)
     return await _create_post(client, text=text, facets=facets, embed=embed, labels=labels, reply=reply)
 

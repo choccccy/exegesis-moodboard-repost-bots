@@ -361,7 +361,7 @@ async def test_alt_text_request_posted_per_image(session, board):
 
     dest = await _recompute(session, sub, board)
 
-    alt_text_msgs = [m for m in dest.sent if "with the alt text for" in m]
+    alt_text_msgs = [m for m in dest.sent if "alt text for" in m]
     assert len(alt_text_msgs) == 2
 
 
@@ -386,7 +386,7 @@ async def test_alt_text_request_not_duplicated(session, board):
     dest1 = await _recompute(session, sub, board)
     dest2 = await _recompute(session, sub, board)
 
-    alt_text_msgs1 = [m for m in dest1.sent if "with the alt text for" in m]
-    alt_text_msgs2 = [m for m in dest2.sent if "with the alt text for" in m]
+    alt_text_msgs1 = [m for m in dest1.sent if "alt text for" in m]
+    alt_text_msgs2 = [m for m in dest2.sent if "alt text for" in m]
     assert len(alt_text_msgs1) == 1
     assert len(alt_text_msgs2) == 0  # already open, not re-posted

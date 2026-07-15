@@ -43,6 +43,21 @@ def test_checklist_source_waived():
     assert "Ready to queue" in out
 
 
+def test_checklist_source_note():
+    out = replies.status_checklist(
+        _snap(has_canonical_link=False, source_note="Popular Mechanics, March 1965"), ready=True
+    )
+    assert "✅ source: Popular Mechanics, March 1965" in out
+    assert "Ready to queue" in out
+
+
+def test_checklist_source_note_truncated():
+    out = replies.status_checklist(
+        _snap(has_canonical_link=False, source_note="x" * 100), ready=True
+    )
+    assert "..." in out  # long notes are truncated in the checklist
+
+
 def test_checklist_metadata_needed():
     out = replies.status_checklist(
         _snap(needs_metadata=True, resolved_via="none"), ready=False
@@ -113,19 +128,42 @@ def test_checklist_no_source_domain():
 # --- escape-hatch copy ------------------------------------------------------
 
 
-def test_source_request_with_waiver_warns_and_suggests_search():
+def test_source_request_with_waiver_points_to_slash_and_search():
     out = replies.source_request_with_waiver()
-    assert "No known source" in out
-    assert "only" in out.lower()
-    assert "reverse image search" in out.lower()
+    assert "/no_source" in out              # the waiver is now a slash command, last resort
+    assert "reverse-image-search" in out.lower()
+    assert out.startswith("**reply with the source URL")
 
 
 def test_no_source_marked_mentions_source_unknown():
     assert "source unknown" in replies.no_source_marked()
 
 
-def test_alt_text_skipped_names_file():
-    assert "robot.jpg" in replies.alt_text_skipped("robot.jpg")
+def test_source_note_confirm_quotes_the_note():
+    out = replies.source_note_confirm("Popular Mechanics, March 1965")
+    assert "Popular Mechanics, March 1965" in out
+    assert "URL" in out
+
+
+def test_source_note_confirm_truncates_long_note():
+    assert "..." in replies.source_note_confirm("x" * 200)
+
+
+def test_source_note_confirmed_and_rejected_copy():
+    assert "Popular Mechanics" in replies.source_note_confirmed("Popular Mechanics")
+    assert "source:" in replies.source_note_confirmed("anything")
+    assert "URL" in replies.source_note_rejected()
+
+
+def test_alt_text_skipped_all_counts():
+    assert "1 image" in replies.alt_text_skipped_all(1)
+    assert "3 images" in replies.alt_text_skipped_all(3)
+
+
+def test_alt_text_request_hints_skip_alt():
+    out = replies.alt_text_request("robot.jpg")
+    assert "robot.jpg" in out
+    assert "/skip_alt" in out  # quiet last-resort aside
 
 
 # --- preview: sourceless media shows "source unknown" -----------------------
@@ -144,6 +182,23 @@ def test_preview_sourceless_media_shows_source_unknown():
     )
     pages = replies.format_post_preview(preview)
     assert any("source unknown" in p for p in pages)
+
+
+def test_preview_source_note_shows_source_line():
+    preview = replies.PostPreview(
+        kind="images",
+        title=None,
+        links=[],
+        images=[("pic.jpg", "a pic")],
+        embed_title=None,
+        embed_description=None,
+        embed_has_thumb=False,
+        board_name="robots",
+        source_note="Popular Mechanics, March 1965",
+    )
+    pages = replies.format_post_preview(preview)
+    assert any("source: Popular Mechanics, March 1965" in p for p in pages)
+    assert not any("source unknown" in p for p in pages)  # note wins over the waived fallback
 
 
 def test_preview_no_links_no_media_shows_none():

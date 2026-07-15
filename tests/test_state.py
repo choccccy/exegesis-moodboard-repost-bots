@@ -148,6 +148,20 @@ def test_source_waived_still_blocks_on_alt_text():
     assert evaluate_state(s) == SubmissionState.AWAITING_ALT_TEXT
 
 
+def test_source_note_suppresses_source_gap():
+    # A confirmed non-URL source note satisfies the SOURCE gap, like a link or waiver.
+    s = snap(has_canonical_link=False, source_note="Popular Mechanics, March 1965")
+    assert Gap.SOURCE not in missing_gaps(s)
+    assert evaluate_state(s) == SubmissionState.READY_TO_QUEUE
+
+
+def test_source_note_still_blocks_on_alt_text():
+    s = snap(has_canonical_link=False, source_note="an old catalog",
+             image_alt_statuses=[AltTextStatus.NEEDED])
+    assert Gap.SOURCE not in missing_gaps(s)
+    assert evaluate_state(s) == SubmissionState.AWAITING_ALT_TEXT
+
+
 def test_skipped_alt_text_is_not_a_gap():
     s = snap(image_alt_statuses=[AltTextStatus.SKIPPED, AltTextStatus.PROVIDED])
     assert Gap.ALT_TEXT not in missing_gaps(s)

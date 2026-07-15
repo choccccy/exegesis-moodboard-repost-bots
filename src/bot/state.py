@@ -89,6 +89,10 @@ class SubmissionSnapshot:
     # True when an OP/curator marked the post as having no findable source. The
     # SOURCE gap is then satisfied and the post publishes with a "source unknown" note.
     source_waived: bool = False
+    # A confirmed free-text, non-URL source (e.g. "Popular Mechanics, March 1965").
+    # Satisfies the SOURCE gap and publishes as "source: <note>". None when unset or
+    # still awaiting confirmation.
+    source_note: str | None = None
 
 
 def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
@@ -98,7 +102,7 @@ def missing_gaps(snap: SubmissionSnapshot) -> list[Gap]:
     METADATA before IMAGE so that a better link has a chance to provide an image.
     """
     gaps: list[Gap] = []
-    if not snap.has_canonical_link and not snap.source_waived:
+    if not snap.has_canonical_link and not snap.source_waived and not snap.source_note:
         gaps.append(Gap.SOURCE)
     if (
         snap.needs_metadata

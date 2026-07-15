@@ -121,8 +121,8 @@ async def test_on_interaction_expired_defer_without_channel(repost_bot):
         ("meta_ok:13", "handle_metadata_confirm_button", 13),
         ("graphic:14", "handle_graphic_button", 14),
         ("pl_skip:15", "handle_playlist_skip_button", 15),
-        ("alt_skip:16", "handle_alt_skip_button", 16),
-        ("no_source:17", "handle_no_source_button", 17),
+        ("srcnote_ok:18", "handle_source_note_confirm", 18),
+        ("srcnote_no:19", "handle_source_note_reject", 19),
     ],
 )
 async def test_on_interaction_routes_prefix_to_handler(

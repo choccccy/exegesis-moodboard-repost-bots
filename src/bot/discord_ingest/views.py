@@ -14,8 +14,10 @@ Custom ID scheme (must stay stable - old buttons carry these forever):
   alt_edit:{submission_id}  - open the alt-text image picker (posts with >4 images)
   alt_pick:{submission_id}  - select custom_id for the alt-text image picker
   edit_alt:{attachment_id}  - modal custom_id for single-image alt editing
-  alt_skip:{attachment_id}  - waive alt text for one attachment
-  no_source:{submission_id} - waive the source requirement (no findable source)
+  srcnote_ok:{submission_id} / srcnote_no:{submission_id} - confirm/discard a non-URL source
+
+(The source waiver and per-image alt skip are now the /no_source and /skip_alt slash
+commands, not buttons.)
 """
 
 from __future__ import annotations
@@ -192,24 +194,20 @@ def make_playlist_skip_view(submission_id: int) -> discord.ui.View:
     return view
 
 
-def make_alt_skip_view(attachment_id: int) -> discord.ui.View:
+def make_source_note_confirm_view(submission_id: int) -> discord.ui.View:
+    """Yes/No on the 'that reply isn't a URL - use it as the source?' prompt."""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(
-        style=discord.ButtonStyle.secondary,
-        label="Skip alt text",
-        emoji="⏭️",
-        custom_id=f"alt_skip:{attachment_id}",
+        style=discord.ButtonStyle.success,
+        label="Use as source",
+        emoji="📄",
+        custom_id=f"srcnote_ok:{submission_id}",
     ))
-    return view
-
-
-def make_no_source_view(submission_id: int) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(
         style=discord.ButtonStyle.secondary,
-        label="No known source",
-        emoji="🚫",
-        custom_id=f"no_source:{submission_id}",
+        label="Discard",
+        emoji="🗑️",
+        custom_id=f"srcnote_no:{submission_id}",
     ))
     return view
 

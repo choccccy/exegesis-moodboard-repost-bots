@@ -74,6 +74,12 @@ class Submission(Base):
     # Set True when an OP/curator marks the post as having no findable source; the
     # SOURCE requirement is then waived and the post publishes with a "source unknown" note.
     source_waived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Free-text, non-URL source (e.g. "Popular Mechanics, March 1965") for images with no
+    # canonical link. Held unconfirmed until the replier OKs the "that's not a URL" prompt;
+    # only counts as a source (closes the SOURCE gap, publishes as "source: ...") once
+    # source_note_confirmed is True.
+    source_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_note_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     # Message ID of the live "post status" checklist message in the submission thread,
     # edited in place as gaps are filled. Null until the checklist is first posted.
     status_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

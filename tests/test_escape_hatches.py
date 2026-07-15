@@ -14,9 +14,11 @@ from sqlalchemy import select
 from bot.config import BoardConfig
 from bot.discord_ingest import service
 from bot.discord_ingest.service import (
-    handle_alt_skip_button,
-    handle_no_source_button,
+    handle_source_note_confirm,
+    handle_source_note_reject,
     recompute_and_request,
+    skip_all_alt_text,
+    waive_source,
     _edit_status_message,
     render_submission_status,
 )
@@ -67,80 +69,68 @@ async def _img(session, sub, *, status=AltTextStatus.NEEDED.value):
     return att
 
 
-# --- skip alt text ----------------------------------------------------------
+# --- skip all alt text (/skip_alt service fn) -------------------------------
 
 
-async def test_alt_skip_op_marks_skipped(session, board):
+async def test_skip_all_alt_marks_all_needed(session, board):
     sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=999)
     session.add(sub)
     await session.flush()
-    att = await _img(session, sub)
-    session.add(AttachmentAltTextRequest(
-        submission_id=sub.id, attachment_id=att.id, bot_message_id=next(_ids),
+    a1 = await _img(session, sub)
+    a2 = await _img(session, sub)
+    session.add(AttachmentAltTextRequest(submission_id=sub.id, attachment_id=a1.id, bot_message_id=next(_ids)))
+    session.add(AttachmentAltTextRequest(submission_id=sub.id, attachment_id=a2.id, bot_message_id=next(_ids)))
+    await session.flush()
+
+    dest = MockDest()
+    count = await skip_all_alt_text(session, sub, settings=_settings(), user_id=999, destination=dest)
+
+    assert count == 2  # noqa: PLR2004
+    for a in (a1, a2):
+        await session.refresh(a)
+        assert a.alt_text_status == AltTextStatus.SKIPPED.value
+        assert a.alt_text_author == 999
+    reqs = list(await session.scalars(
+        select(AttachmentAltTextRequest).where(AttachmentAltTextRequest.submission_id == sub.id)
     ))
-    await session.flush()
-
-    await handle_alt_skip_button(session, _interaction(999), att.id, _settings())
-
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.SKIPPED.value
-    assert att.alt_text_author == 999
-    req = await session.scalar(
-        select(AttachmentAltTextRequest).where(AttachmentAltTextRequest.attachment_id == att.id)
-    )
-    assert req.answered_at is not None and req.answer == "skipped"
+    assert all(r.answered_at is not None and r.answer == "skipped" for r in reqs)
+    assert any("skipped" in m.lower() for m in dest.sent)
 
 
-async def test_alt_skip_curator_allowed(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=1)
+async def test_skip_all_alt_leaves_resolved_alone(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=999)
     session.add(sub)
     await session.flush()
-    att = await _img(session, sub)
+    needed = await _img(session, sub)
+    provided = await _img(session, sub, status=AltTextStatus.PROVIDED.value)
 
-    await handle_alt_skip_button(session, _interaction(555), att.id, _settings(curator_ids=[555]))
+    dest = MockDest()
+    count = await skip_all_alt_text(session, sub, settings=_settings(), user_id=999, destination=dest)
 
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.SKIPPED.value
-
-
-async def test_alt_skip_unauthorized_rejected(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=1)
-    session.add(sub)
-    await session.flush()
-    att = await _img(session, sub)
-
-    inter = _interaction(555)  # not OP, not curator
-    await handle_alt_skip_button(session, inter, att.id, _settings())
-
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.NEEDED.value
-    inter.followup.send.assert_awaited_once()
+    assert count == 1
+    await session.refresh(needed)
+    await session.refresh(provided)
+    assert needed.alt_text_status == AltTextStatus.SKIPPED.value
+    assert provided.alt_text_status == AltTextStatus.PROVIDED.value  # untouched
 
 
-async def test_alt_skip_attachment_missing(session, board):
-    inter = _interaction(999)
-    await handle_alt_skip_button(session, inter, 999999, _settings())
-    inter.followup.send.assert_awaited_once()
-
-
-async def test_alt_skip_already_handled(session, board):
+async def test_skip_all_alt_nothing_pending_returns_zero(session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, author_id=999)
     session.add(sub)
     await session.flush()
-    att = await _img(session, sub, status=AltTextStatus.PROVIDED.value)
+    await _img(session, sub, status=AltTextStatus.PROVIDED.value)
 
-    inter = _interaction(999)
-    await handle_alt_skip_button(session, inter, att.id, _settings())
+    dest = MockDest()
+    count = await skip_all_alt_text(session, sub, settings=_settings(), user_id=999, destination=dest)
 
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.PROVIDED.value
-    inter.followup.send.assert_awaited_once()
-
-
-# --- no known source --------------------------------------------------------
+    assert count == 0
+    assert dest.sent == []  # nothing pending -> no notice, no recompute posts
 
 
-async def test_no_source_op_waives(session, board):
+# --- no known source (/no_source service fn) --------------------------------
+
+
+async def test_waive_source_waives(session, board):
     sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
     session.add(sub)
     await session.flush()
@@ -148,117 +138,185 @@ async def test_no_source_op_waives(session, board):
     session.add(SourceRequest(submission_id=sub.id, bot_message_id=next(_ids)))
     await session.flush()
 
-    inter = _interaction(999)
-    await handle_no_source_button(session, inter, sub.id, _settings())
+    dest = MockDest()
+    waived = await waive_source(session, sub, settings=_settings(), user_id=999, destination=dest)
 
+    assert waived is True
     await session.refresh(sub)
     assert sub.source_waived is True
     req = await session.scalar(select(SourceRequest).where(SourceRequest.submission_id == sub.id))
     assert req.answered_at is not None and req.answer == "no_source"
-    # A "source unknown" notice was posted to the thread.
-    assert any("source unknown" in m for m in inter.channel.sent)
+    assert any("source unknown" in m for m in dest.sent)
 
 
-async def test_no_source_unauthorized(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=1)
-    session.add(sub)
-    await session.flush()
-
-    inter = _interaction(555)
-    await handle_no_source_button(session, inter, sub.id, _settings())
-
-    await session.refresh(sub)
-    assert sub.source_waived is False
-    inter.followup.send.assert_awaited_once()
-
-
-async def test_no_source_already_waived(session, board):
+async def test_waive_source_already_waived_returns_false(session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value,
                           author_id=999, source_waived=True)
     session.add(sub)
     await session.flush()
 
+    dest = MockDest()
+    waived = await waive_source(session, sub, settings=_settings(), user_id=999, destination=dest)
+
+    assert waived is False
+    assert dest.sent == []  # no-op, no notice
+
+
+# --- non-URL source note confirmation --------------------------------------
+
+
+async def test_source_note_confirm_commits_note(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "Popular Mechanics, March 1965"
+    sub.source_note_confirmed = False
+    session.add(sub)
+    await session.flush()
+    await _img(session, sub, status=AltTextStatus.PROVIDED.value)
+    session.add(SourceRequest(submission_id=sub.id, bot_message_id=next(_ids)))
+    await session.flush()
+
     inter = _interaction(999)
-    await handle_no_source_button(session, inter, sub.id, _settings())
+    await handle_source_note_confirm(session, inter, sub.id, _settings())
+
+    await session.refresh(sub)
+    assert sub.source_note_confirmed is True
+    req = await session.scalar(select(SourceRequest).where(SourceRequest.submission_id == sub.id))
+    assert req.answered_at is not None and req.answer == "source_note"
+    assert any("Popular Mechanics" in m for m in inter.channel.sent)
+
+
+async def test_source_note_confirm_unauthorized(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=1)
+    sub.source_note = "an old catalog"
+    session.add(sub)
+    await session.flush()
+
+    inter = _interaction(555)
+    await handle_source_note_confirm(session, inter, sub.id, _settings())
+
+    await session.refresh(sub)
+    assert sub.source_note_confirmed is False
     inter.followup.send.assert_awaited_once()
 
 
-async def test_no_source_missing_submission(session, board):
+async def test_source_note_confirm_without_candidate(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    session.add(sub)
+    await session.flush()
     inter = _interaction(999)
-    await handle_no_source_button(session, inter, 999999, _settings())
-    # No crash; nothing to do.
+    await handle_source_note_confirm(session, inter, sub.id, _settings())
+    inter.followup.send.assert_awaited_once()  # nothing to confirm
+
+
+async def test_source_note_confirm_missing_submission(session, board):
+    inter = _interaction(999)
+    await handle_source_note_confirm(session, inter, 999999, _settings())
     inter.followup.send.assert_not_awaited()
 
 
-async def test_no_source_without_open_request_still_waives(session, board):
+async def test_source_note_reject_discards(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "misfired chatter"
+    sub.source_note_confirmed = False
+    session.add(sub)
+    await session.flush()
+
+    inter = _interaction(999)
+    await handle_source_note_reject(session, inter, sub.id, _settings())
+
+    await session.refresh(sub)
+    assert sub.source_note is None
+    assert sub.source_note_confirmed is False
+    assert any("discarded" in m.lower() for m in inter.channel.sent)
+
+
+async def test_source_note_reject_unauthorized(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=1)
+    sub.source_note = "keep me"
+    session.add(sub)
+    await session.flush()
+    inter = _interaction(555)
+    await handle_source_note_reject(session, inter, sub.id, _settings())
+    await session.refresh(sub)
+    assert sub.source_note == "keep me"  # unauthorized: unchanged
+    inter.followup.send.assert_awaited_once()
+
+
+async def test_source_note_reject_missing_submission(session, board):
+    inter = _interaction(999)
+    await handle_source_note_reject(session, inter, 999999, _settings())
+    inter.followup.send.assert_not_awaited()
+
+
+async def test_source_note_confirm_without_open_request(session, board):
+    # No open SourceRequest row (e.g. offered via checklist only); confirmation still applies.
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "an old catalog"
+    session.add(sub)
+    await session.flush()
+    await handle_source_note_confirm(session, _interaction(999), sub.id, _settings())
+    await session.refresh(sub)
+    assert sub.source_note_confirmed is True
+
+
+async def test_source_note_confirm_channel_none_returns_after_commit(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "an old catalog"
+    session.add(sub)
+    await session.flush()
+    inter = _interaction(999)
+    inter.channel = None
+    await handle_source_note_confirm(session, inter, sub.id, _settings())
+    # committed even with nowhere to post the notice (in-memory: no recompute/flush on this path)
+    assert sub.source_note_confirmed is True
+
+
+async def test_source_note_confirm_tombstone_edit_error_swallowed(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "an old catalog"
+    session.add(sub)
+    await session.flush()
+    inter = _interaction(999)
+    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+    await handle_source_note_confirm(session, inter, sub.id, _settings())  # must not raise
+    await session.refresh(sub)
+    assert sub.source_note_confirmed is True
+
+
+async def test_source_note_reject_channel_none_returns_after_discard(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "misfire"
+    session.add(sub)
+    await session.flush()
+    inter = _interaction(999)
+    inter.channel = None
+    await handle_source_note_reject(session, inter, sub.id, _settings())
+    assert sub.source_note is None  # in-memory: no recompute/flush on the channel-None path
+
+
+async def test_source_note_reject_tombstone_edit_error_swallowed(session, board):
+    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
+    sub.source_note = "misfire"
+    session.add(sub)
+    await session.flush()
+    inter = _interaction(999)
+    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+    await handle_source_note_reject(session, inter, sub.id, _settings())  # must not raise
+    await session.refresh(sub)
+    assert sub.source_note is None
+
+
+async def test_waive_source_without_open_request(session, board):
     # No open SourceRequest row (e.g. offered via checklist only); waiver still applies.
     sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
     session.add(sub)
     await session.flush()
     await _img(session, sub, status=AltTextStatus.PROVIDED.value)
 
-    await handle_no_source_button(session, _interaction(999), sub.id, _settings())
+    waived = await waive_source(session, sub, settings=_settings(), user_id=999, destination=MockDest())
+    assert waived is True
     await session.refresh(sub)
     assert sub.source_waived is True
-
-
-async def test_no_source_channel_none_returns_after_waiving(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    session.add(sub)
-    await session.flush()
-    inter = _interaction(999)
-    inter.channel = None
-    await handle_no_source_button(session, inter, sub.id, _settings())
-    await session.refresh(sub)
-    assert sub.source_waived is True  # waiver persisted even with nowhere to post the notice
-
-
-async def test_no_source_tombstone_edit_error_swallowed(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    session.add(sub)
-    await session.flush()
-    await _img(session, sub, status=AltTextStatus.PROVIDED.value)
-    inter = _interaction(999)
-    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-    await handle_no_source_button(session, inter, sub.id, _settings())  # must not raise
-    await session.refresh(sub)
-    assert sub.source_waived is True
-
-
-async def test_alt_skip_submission_gone(session, board):
-    # Attachment whose submission row is absent (FK not enforced in the test DB).
-    att = Attachment(
-        submission_id=999999, discord_attachment_id=next(_ids), filename="x.jpg",
-        discord_url="https://x", is_image=True, alt_text_status=AltTextStatus.NEEDED.value,
-    )
-    session.add(att)
-    await session.flush()
-    inter = _interaction(999)
-    await handle_alt_skip_button(session, inter, att.id, _settings())  # returns, no crash
-
-
-async def test_alt_skip_channel_none_returns_after_marking(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=999)
-    session.add(sub)
-    await session.flush()
-    att = await _img(session, sub)
-    inter = _interaction(999)
-    inter.channel = None
-    await handle_alt_skip_button(session, inter, att.id, _settings())
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.SKIPPED.value
-
-
-async def test_alt_skip_tombstone_edit_error_swallowed(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_ALT_TEXT.value, author_id=999)
-    session.add(sub)
-    await session.flush()
-    att = await _img(session, sub)
-    inter = _interaction(999)
-    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-    await handle_alt_skip_button(session, inter, att.id, _settings())  # must not raise
-    await session.refresh(att)
-    assert att.alt_text_status == AltTextStatus.SKIPPED.value
 
 
 async def test_ready_keeps_checklist_and_puts_confirmation_last(session, board):
@@ -291,32 +349,29 @@ async def test_ready_keeps_checklist_and_puts_confirmation_last(session, board):
     assert sub.status_message_id is not None
 
 
-# --- recompute offers the waiver button only with media ---------------------
+# --- recompute mentions the /no_source waiver only with media ---------------
 
 
-async def test_recompute_offers_no_source_button_with_media(session, board):
+async def test_recompute_source_prompt_mentions_waiver_with_media(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
     await _img(session, sub, status=AltTextStatus.PROVIDED.value)  # media, but no link -> SOURCE gap
 
     dest = MockDest()
-    with patch("bot.discord_ingest.service.views.make_no_source_view") as mk:
-        await recompute_and_request(session, sub, settings=_settings(), destination=dest)
-    mk.assert_called_once_with(sub.id)
-    assert any("No known source" in m for m in dest.sent)
+    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    assert any("/no_source" in m for m in dest.sent)  # waiver hinted only when there's media
 
 
 async def test_recompute_plain_source_prompt_without_media(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
-    await session.flush()  # no media, no link -> SOURCE gap, no waiver offered
+    await session.flush()  # no media, no link -> SOURCE gap, no waiver hinted
 
     dest = MockDest()
-    with patch("bot.discord_ingest.service.views.make_no_source_view") as mk:
-        await recompute_and_request(session, sub, settings=_settings(), destination=dest)
-    mk.assert_not_called()
-    assert any("with the source URL" in m for m in dest.sent)
+    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    assert any("source URL" in m for m in dest.sent)
+    assert not any("/no_source" in m for m in dest.sent)
 
 
 # --- render_submission_status (used by /status) -----------------------------

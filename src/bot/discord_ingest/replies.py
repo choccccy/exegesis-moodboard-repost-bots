@@ -21,16 +21,15 @@ CONFIRMATION_EMOJI = "✅"
 
 
 def source_request() -> str:
-    return "**reply to this message** with the source URL"
+    return "**reply with the source URL.**"
 
 
 def source_request_with_waiver() -> str:
-    """Source prompt shown when a 'No known source' button is offered (media present)."""
+    """Source prompt shown when the media could publish sourceless (media present)."""
     return (
-        "**reply to this message** with the source URL.\n"
-        "-# genuinely no findable source? use **No known source** below - but *only* if you "
-        "truly can't find it. try a Google or reverse image search (images.google.com, TinEye, "
-        "SauceNAO) first."
+        "**reply with the source URL.**\n"
+        "-# truly untraceable (old scan, etc.)? reverse-image-search first "
+        "(Google / TinEye / SauceNAO), then `/no_source` as a last resort."
     )
 
 
@@ -38,8 +37,29 @@ def no_source_marked() -> str:
     return 'marked as no known source - this post will publish with a "source unknown" note'
 
 
-def alt_text_skipped(filename: str) -> str:
-    return f"alt text skipped for **{filename}**"
+def _truncate_note(note: str, limit: int = 120) -> str:
+    return note if len(note) <= limit else note[: limit - 3] + "..."
+
+
+def source_note_confirm(note: str) -> str:
+    """Ask whether a non-URL reply should be used as a free-text source."""
+    return (
+        f'that doesn\'t look like a URL. use "{_truncate_note(note)}" as the source? '
+        "it will publish as **source: ...** instead of a link."
+    )
+
+
+def source_note_confirmed(note: str) -> str:
+    return f'source set: "{_truncate_note(note)}" - this post will publish with a "source: ..." note'
+
+
+def source_note_rejected() -> str:
+    return "discarded - reply with the source URL, or the source text again to retry"
+
+
+def alt_text_skipped_all(count: int) -> str:
+    noun = "image" if count == 1 else "images"
+    return f"⏭️ alt text skipped for {count} {noun} - this post will publish without descriptions"
 
 
 def alt_text_overwritten(filename: str, previous: str | None) -> str:
@@ -66,6 +86,8 @@ def status_checklist(
 
     if snap.has_canonical_link:
         lines.append(f"✅ source: {source_domain}" if source_domain else "✅ source")
+    elif snap.source_note:
+        lines.append(f"✅ source: {_truncate_note(snap.source_note, 60)}")
     elif snap.source_waived:
         lines.append("🚫 source: unknown (waived)")
     else:
@@ -124,7 +146,10 @@ def media_not_found() -> str:
 
 
 def alt_text_request(filename: str) -> str:
-    return f"**reply to this message** with the alt text for **{filename}**"
+    return (
+        f"**reply with alt text for {filename}** - a short description for screen-reader users.\n"
+        "-# can't caption these? `/skip_alt` waives alt for the whole post (last resort)."
+    )
 
 
 def graphic_request() -> str:
@@ -276,8 +301,8 @@ def thread_anchor(
     if content_title:
         parts.append(f"📌 \"{content_title}\"")
     parts.append(
-        f"\n{bot_mention} will ask a few questions below (alt text, content rating, etc.). "
-        "You can answer them yourself, or wait for a curator - either works."
+        f"\n-# {bot_mention} will ask below for anything missing (source, alt text, rating). "
+        "Answer here, or leave it to a curator."
     )
     if dashboard_url:
         parts.append(f"\nYou can see what else is queued on the [dashboard](<{dashboard_url}>).")
@@ -289,11 +314,11 @@ def closing_notice(reason: str) -> str:
 
 
 def supplemental_image_request() -> str:
-    return "🖼️ **reply to this message** with any additional images or videos to include in the post."
+    return "-# 🖼️ reply here to add more images or videos to this post."
 
 
 def supplemental_link_request() -> str:
-    return "🔗 **reply to this message** with any additional links to include as thread replies in the post."
+    return "-# 🔗 reply here to add links as extra thread replies."
 
 
 def supplemental_link_not_found() -> str:
@@ -347,6 +372,7 @@ class PostPreview:
     image_source: str = "n/a"
     reply_to_bsky_url: str | None = None
     reply_to_pending: bool = False
+    source_note: str | None = None  # confirmed non-URL free-text source, if any
 
 
 _DISCORD_MSG_LIMIT = 1900
@@ -426,6 +452,8 @@ def format_post_preview(p: PostPreview) -> list[str]:
         lines.append(f"  {p.title}")
     if primary_url:
         lines.append(f"  {primary_url}")
+    elif p.source_note:
+        lines.append(f"  source: {p.source_note}")  # non-URL free-text source
     elif p.images or p.videos:
         lines.append("  source unknown")  # sourceless media post (source waived)
     else:

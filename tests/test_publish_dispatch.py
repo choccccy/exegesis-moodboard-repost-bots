@@ -724,6 +724,32 @@ async def test_publish_images_no_links_notes_source_unknown():
     assert record.text == "source unknown"
 
 
+async def test_publish_images_with_source_note():
+    client = _fake_client()
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+        result = await _publish_images(
+            client, [], [_image_attachment()], labels=None, tags=["robots"],
+            source_note="Popular Mechanics, March 1965",
+        )
+    assert result.success
+    record = _record_of(client.com.atproto.repo.create_record.call_args)
+    # Non-URL source publishes as "source: <note>" instead of "source unknown".
+    assert record.text == "source: Popular Mechanics, March 1965 #robots"
+
+
+async def test_publish_video_with_source_note(tmp_path):
+    f = tmp_path / "clip.mp4"
+    f.write_bytes(b"fake-video")
+    client = _fake_client()
+    att = _video_attachment(local_path=str(f), width=None, height=None)
+    result = await _publish_video(
+        client, [], [att], labels=None, tags=[], source_note="US National Archives",
+    )
+    assert result.success
+    record = _record_of(client.com.atproto.repo.create_record.call_args)
+    assert record.text == "source: US National Archives"
+
+
 async def test_publish_video_reply_upload_failure_raises():
     client = _fake_client()
     att = _video_attachment(local_path=None, att_id=42)

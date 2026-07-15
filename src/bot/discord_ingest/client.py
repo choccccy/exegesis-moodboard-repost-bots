@@ -170,6 +170,18 @@ class RepostBot(discord.Client):
         async def _status(interaction: discord.Interaction) -> None:
             await bot_ref._handle_status_slash(interaction)
 
+        @self.tree.command(name="reingest", description="Re-read the source message and refresh this submission (run in its thread)")
+        async def _reingest(interaction: discord.Interaction) -> None:
+            await bot_ref._handle_reingest_slash(interaction)
+
+        @self.tree.command(name="no_source", description="Mark this submission as having no findable source (run in its thread)")
+        async def _no_source(interaction: discord.Interaction) -> None:
+            await bot_ref._handle_nosource_slash(interaction)
+
+        @self.tree.command(name="skip_alt", description="Skip alt text for all remaining images on this submission (run in its thread)")
+        async def _skip_alt(interaction: discord.Interaction) -> None:
+            await bot_ref._handle_skipalt_slash(interaction)
+
         guild_ids = {b.discord_guild_id for b in self.settings.boards}
         log.info("syncing slash commands to %d guild(s): %s", len(guild_ids), guild_ids)
         for guild_id in guild_ids:
@@ -273,14 +285,14 @@ class RepostBot(discord.Client):
                     session, interaction, int(custom_id.removeprefix("pl_skip:")),
                     self.settings, self._yt_client,
                 )
-            elif custom_id.startswith("alt_skip:"):
-                await service.handle_alt_skip_button(
-                    session, interaction, int(custom_id.removeprefix("alt_skip:")),
+            elif custom_id.startswith("srcnote_ok:"):
+                await service.handle_source_note_confirm(
+                    session, interaction, int(custom_id.removeprefix("srcnote_ok:")),
                     self.settings, self._yt_client,
                 )
-            elif custom_id.startswith("no_source:"):
-                await service.handle_no_source_button(
-                    session, interaction, int(custom_id.removeprefix("no_source:")),
+            elif custom_id.startswith("srcnote_no:"):
+                await service.handle_source_note_reject(
+                    session, interaction, int(custom_id.removeprefix("srcnote_no:")),
                     self.settings, self._yt_client,
                 )
 
@@ -529,21 +541,27 @@ class RepostBot(discord.Client):
         )
         await interaction.followup.send(content, ephemeral=True)
 
+    async def _submission_for_thread(self, session, channel):
+        """Map a thread channel back to its Submission (or None). Thread-scoped slash
+        commands run inside a submission's private thread; SubmissionThread is the durable
+        (board, source message) -> thread map."""
+        if channel is None:
+            return None
+        return await session.scalar(
+            select(Submission)
+            .join(
+                SubmissionThread,
+                (SubmissionThread.board_id == Submission.board_id)
+                & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
+            )
+            .where(SubmissionThread.thread_id == channel.id)
+        )
+
     async def _handle_status_slash(self, interaction: discord.Interaction) -> None:
         """Handle /status - show what the submission for this thread is waiting on."""
         channel = interaction.channel
         async with session_scope() as session:
-            submission = None
-            if channel is not None:
-                submission = await session.scalar(
-                    select(Submission)
-                    .join(
-                        SubmissionThread,
-                        (SubmissionThread.board_id == Submission.board_id)
-                        & (SubmissionThread.source_discord_message_id == Submission.source_discord_message_id),
-                    )
-                    .where(SubmissionThread.thread_id == channel.id)
-                )
+            submission = await self._submission_for_thread(session, channel)
             if submission is None:
                 await interaction.response.send_message(
                     "Run `/status` inside a submission's thread.", ephemeral=True
@@ -560,6 +578,100 @@ class RepostBot(discord.Client):
 
             content = await service.render_submission_status(session, submission)
         await interaction.response.send_message(content, ephemeral=True)
+
+    async def _handle_reingest_slash(self, interaction: discord.Interaction) -> None:
+        """Handle /reingest - re-read the source message and refresh this submission."""
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.channel
+        async with session_scope() as session:
+            submission = await self._submission_for_thread(session, channel)
+            if submission is None:
+                await interaction.followup.send("Run `/reingest` inside a submission's thread.", ephemeral=True)
+                return
+            board_cfg = self.settings.board_for_channel(submission.channel_id)
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+                await interaction.followup.send("You're not authorised to reingest this submission.", ephemeral=True)
+                return
+            if submission.state in service._QUEUE_TERMINAL:
+                await interaction.followup.send(
+                    "This submission is already queued or published - reingest isn't available.", ephemeral=True
+                )
+                return
+            source_channel_id = submission.channel_id
+            source_message_id = submission.source_discord_message_id
+
+        message = await self._fetch_message(source_channel_id, source_message_id)
+        if message is None:
+            await interaction.followup.send(
+                "Original message was deleted or is unreachable - can't reingest.", ephemeral=True
+            )
+            return
+
+        async with service._message_processing_locks.setdefault(source_message_id, asyncio.Lock()):
+            async with session_scope() as session:
+                submission = await self._submission_for_thread(session, channel)
+                if submission is None:
+                    await interaction.followup.send("Submission no longer exists.", ephemeral=True)
+                    return
+                await service.reingest_submission(
+                    session, submission, message=message,
+                    settings=self.settings, http_client=self.httpx_client,
+                )
+                await service.recompute_and_request(
+                    session, submission, settings=self.settings, destination=channel,
+                    yt_client=self._yt_client, bot_id=getattr(self.user, "id", None),
+                )
+        await interaction.followup.send(
+            "Reingested - links, media, and caption refreshed from the source message. "
+            "Alt text and source/graphic decisions were preserved.", ephemeral=True
+        )
+
+    async def _handle_nosource_slash(self, interaction: discord.Interaction) -> None:
+        """Handle /nosource - waive the source requirement for this submission."""
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.channel
+        async with session_scope() as session:
+            submission = await self._submission_for_thread(session, channel)
+            if submission is None:
+                await interaction.followup.send("Run `/no_source` inside a submission's thread.", ephemeral=True)
+                return
+            board_cfg = self.settings.board_for_channel(submission.channel_id)
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+                await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
+                return
+            waived = await service.waive_source(
+                session, submission, settings=self.settings, user_id=interaction.user.id,
+                destination=channel, yt_client=self._yt_client,
+            )
+        await interaction.followup.send(
+            "Marked as no known source." if waived else "Already marked as no known source.",
+            ephemeral=True,
+        )
+
+    async def _handle_skipalt_slash(self, interaction: discord.Interaction) -> None:
+        """Handle /skipalt - skip alt text for all images still needing it."""
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.channel
+        async with session_scope() as session:
+            submission = await self._submission_for_thread(session, channel)
+            if submission is None:
+                await interaction.followup.send("Run `/skip_alt` inside a submission's thread.", ephemeral=True)
+                return
+            board_cfg = self.settings.board_for_channel(submission.channel_id)
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+                await interaction.followup.send("You're not authorised to skip alt text here.", ephemeral=True)
+                return
+            count = await service.skip_all_alt_text(
+                session, submission, settings=self.settings, user_id=interaction.user.id,
+                destination=channel, yt_client=self._yt_client,
+            )
+        await interaction.followup.send(
+            f"Skipped alt text for {count} image(s)." if count else "No images are waiting for alt text.",
+            ephemeral=True,
+        )
 
     async def _run_channel_scan(
         self,
