@@ -163,6 +163,23 @@ async def test_recompute_resolved_link_without_image_posts_image_request(session
     assert await _count(session, ImageRequest, sub.id) == 1
 
 
+async def test_recompute_unavailable_link_posts_age_restricted_image_request(session, board):
+    """A link the resolver flagged 'unavailable' (age-restricted twitter) lands in the IMAGE
+    gap with the explanatory age-restriction copy, not the generic 'no preview image' prompt."""
+    sub = make_submission(board)
+    session.add(sub)
+    await session.flush()
+    _add_link(session, sub, resolved_via="unavailable", resolved_title=None, resolved_image_path=None)
+    await session.flush()
+
+    dest = MockDest()
+    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    assert state == SubmissionState.AWAITING_IMAGE
+    assert await _count(session, ImageRequest, sub.id) == 1
+    assert any("age-restricted" in s for s in dest.sent)
+
+
 async def test_recompute_needed_alt_text_posts_request(session, board):
     """Image attachment with alt text NEEDED: awaiting_alt_text, per-attachment request."""
     sub = make_submission(board)
@@ -191,6 +208,68 @@ async def test_recompute_needed_alt_text_posts_request(session, board):
     assert reqs[0].attachment_id == att.id
     # no local copy of the image, so the prompt falls back to the Discord URL
     assert any("cdn.discord.com/robot.jpg" in s for s in dest.sent)
+
+
+async def _seed_ready_with_stale_conf(session, board, *, bot_message_id):
+    """A submission that was READY_TO_QUEUE with an open confirmation, then gained an image
+    needing alt text - i.e. it has regressed out of ready with a stale Queue button live."""
+    sub = make_submission(board, state=READY, source_waived=True)
+    session.add(sub)
+    await session.flush()
+    session.add(Attachment(
+        submission_id=sub.id, discord_attachment_id=1, filename="pic.jpg", discord_url="u",
+        is_image=True, alt_text_status=AltTextStatus.NEEDED.value,
+    ))
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=bot_message_id))
+    await session.flush()
+    return sub
+
+
+async def test_recompute_retracts_stale_confirmation_on_regression(session, board):
+    """Regression out of ready: the open ConfirmationRequest is dropped and its button is
+    tombstoned via make_disabled_view so a stale click can't queue a submission with a gap."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4242)
+
+    conf_msg = MagicMock()
+    conf_msg.edit = AsyncMock()
+    dest = MockDest()
+    dest.fetch_message = AsyncMock(return_value=conf_msg)
+
+    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    assert state == SubmissionState.AWAITING_ALT_TEXT
+    assert await _count(session, ConfirmationRequest, sub.id) == 0  # stale row dropped
+    dest.fetch_message.assert_awaited_once_with(4242)
+    conf_msg.edit.assert_awaited_once()
+    assert conf_msg.edit.call_args.kwargs.get("view") is not None  # disabled view applied
+
+
+async def test_recompute_regression_without_fetch_message_still_drops_row(session, board):
+    """A destination lacking fetch_message (can't tombstone) still drops the stale row."""
+    sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4243)
+
+    dest = MockDest()  # no fetch_message attribute
+    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    assert await _count(session, ConfirmationRequest, sub.id) == 0
+
+
+async def test_recompute_regression_tombstone_failure_is_swallowed(session, board):
+    """If tombstoning the stale button fails (e.g. deleted/forbidden), the row is still dropped."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import discord
+
+    sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4244)
+
+    dest = MockDest()
+    dest.fetch_message = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
+
+    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+
+    assert await _count(session, ConfirmationRequest, sub.id) == 0
 
 
 async def test_recompute_graphic_classification_posts_request(session, board):

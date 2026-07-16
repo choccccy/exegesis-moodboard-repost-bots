@@ -155,6 +155,12 @@ def test_source_note_confirmed_and_rejected_copy():
     assert "URL" in replies.source_note_rejected()
 
 
+def test_queue_blocked_notice_names_gaps():
+    out = replies.queue_blocked_notice("alt text, image")
+    assert "alt text, image" in out
+    assert "checklist" in out.lower()
+
+
 def test_alt_text_skipped_all_counts():
     assert "1 image" in replies.alt_text_skipped_all(1)
     assert "3 images" in replies.alt_text_skipped_all(3)

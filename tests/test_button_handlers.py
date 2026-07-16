@@ -22,6 +22,7 @@ from bot.discord_ingest.service import (
     handle_playlist_skip_button,
 )
 from bot.models import (
+    Attachment,
     CancellationRequest,
     ConfirmationRequest,
     ContentLabelRequest,
@@ -31,7 +32,7 @@ from bot.models import (
     SubmissionLink,
     YoutubePlaylistAdd,
 )
-from bot.state import GraphicStatus, SubmissionState
+from bot.state import AltTextStatus, GraphicStatus, SubmissionState
 
 from conftest import make_submission
 
@@ -183,7 +184,10 @@ async def test_cancel_button_not_found(session, board):
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
 @patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirm_button_queues_submission(mock_pclose, mock_playlist, session, board):
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, author_id=AUTHOR_ID, channel_id=100)
+    sub = make_submission(
+        board, state=SubmissionState.READY_TO_QUEUE.value, author_id=AUTHOR_ID,
+        channel_id=100, source_waived=True,
+    )
     session.add(sub)
     await session.flush()
 
@@ -198,6 +202,36 @@ async def test_confirm_button_queues_submission(mock_pclose, mock_playlist, sess
     assert sub.state == SubmissionState.QUEUED.value
     assert req.confirmed_at is not None
     assert req.confirmed_by == CURATOR_ID
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_confirm_button_refuses_when_gap_reopened(mock_recompute, session, board):
+    """A gap that reopened after the Queue button was posted (e.g. a late-added image needing
+    alt text) must block the click: no queue, an ephemeral refusal, and a recompute to refresh."""
+    sub = make_submission(
+        board, state=SubmissionState.READY_TO_QUEUE.value, author_id=AUTHOR_ID,
+        channel_id=100, source_waived=True,
+    )
+    session.add(sub)
+    await session.flush()
+    session.add(Attachment(
+        submission_id=sub.id, discord_attachment_id=1, filename="pic.jpg", discord_url="u",
+        is_image=True, is_video=False, alt_text_status=AltTextStatus.NEEDED.value,
+    ))
+    req = ConfirmationRequest(submission_id=sub.id, bot_message_id=8050)
+    session.add(req)
+    await session.flush()
+
+    interaction = _interaction(user_id=CURATOR_ID)
+    await handle_confirm_button(session, interaction, sub.id, _settings())
+
+    assert sub.state == SubmissionState.READY_TO_QUEUE.value  # not queued
+    assert req.confirmed_at is None
+    mock_recompute.assert_awaited_once()
+    interaction.followup.send.assert_called_once()
+    args, kwargs = interaction.followup.send.call_args
+    assert "alt text" in args[0]
+    assert kwargs.get("ephemeral") is True
 
 
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
@@ -430,7 +464,10 @@ async def test_metadata_reaction_unauthorized_ignored(mock_recompute, session, b
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
 @patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirmation_reaction_queues_submission(mock_pclose, mock_playlist, session, board):
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100, author_id=AUTHOR_ID)
+    sub = make_submission(
+        board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100,
+        author_id=AUTHOR_ID, source_waived=True,
+    )
     session.add(sub)
     await session.flush()
 
@@ -454,6 +491,70 @@ async def test_confirmation_reaction_queues_submission(mock_pclose, mock_playlis
     assert result is True
     assert sub.state == SubmissionState.QUEUED.value
     assert req.confirmed_by == CURATOR_ID
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_confirmation_reaction_refuses_when_gap_reopened(mock_recompute, session, board):
+    """The ✅ reaction path re-validates gaps too: a reopened gap blocks the queue."""
+    sub = make_submission(
+        board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100,
+        author_id=AUTHOR_ID, source_waived=True,
+    )
+    session.add(sub)
+    await session.flush()
+    session.add(Attachment(
+        submission_id=sub.id, discord_attachment_id=1, filename="pic.jpg", discord_url="u",
+        is_image=True, is_video=False, alt_text_status=AltTextStatus.NEEDED.value,
+    ))
+    req = ConfirmationRequest(submission_id=sub.id, bot_message_id=7050)
+    session.add(req)
+    await session.flush()
+
+    channel = _channel_mock()
+    member = MagicMock()
+    member.roles = []
+
+    result = await handle_confirmation_reaction(
+        session, settings=_settings(), channel=channel, message_id=7050,
+        member=member, user_id=CURATOR_ID,
+    )
+
+    assert result is False
+    assert sub.state == SubmissionState.READY_TO_QUEUE.value  # not queued
+    assert req.confirmed_at is None
+    mock_recompute.assert_awaited_once()
+    channel.send.assert_awaited_once()
+    assert "alt text" in channel.send.call_args.args[0]
+
+
+@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+async def test_confirmation_reaction_refusal_notice_send_failure_swallowed(mock_recompute, session, board):
+    """A failure posting the blocked-notice must not crash the refusal path."""
+    sub = make_submission(
+        board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100,
+        author_id=AUTHOR_ID, source_waived=True,
+    )
+    session.add(sub)
+    await session.flush()
+    session.add(Attachment(
+        submission_id=sub.id, discord_attachment_id=1, filename="pic.jpg", discord_url="u",
+        is_image=True, is_video=False, alt_text_status=AltTextStatus.NEEDED.value,
+    ))
+    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=7060))
+    await session.flush()
+
+    channel = _channel_mock()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=500), "boom"))
+    member = MagicMock()
+    member.roles = []
+
+    result = await handle_confirmation_reaction(
+        session, settings=_settings(), channel=channel, message_id=7060,
+        member=member, user_id=CURATOR_ID,
+    )
+
+    assert result is False
+    assert sub.state == SubmissionState.READY_TO_QUEUE.value
 
 
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)

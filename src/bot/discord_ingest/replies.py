@@ -133,7 +133,14 @@ def status_checklist(
     return "\n".join(lines)
 
 
-def image_request() -> str:
+def image_request(source_unavailable: bool = False) -> str:
+    if source_unavailable:
+        return (
+            "⚠️ this twitter post is age-restricted, so twitter won't provide me an image "
+            "(it may look fine to you because you're logged in). the link stays as the source - "
+            "**reply to this message** attaching the image(s) yourself, or use `/no_source` if "
+            "there's nothing to post."
+        )
     return "this link has no preview image. **reply to this message** attaching at least one image to use"
 
 
@@ -232,6 +239,13 @@ def queued_notice(
 
 def updated_notice() -> str:
     return "post updated - the new content will be included when published"
+
+
+def queue_blocked_notice(gaps: str) -> str:
+    return (
+        f"⚠️ not queued - this submission still needs: {gaps}. "
+        "Check the status checklist above; the Queue button reopens once everything's resolved."
+    )
 
 
 def publish_failed_notice(error: str | None, mention_user_ids: list[int] | None = None) -> str:

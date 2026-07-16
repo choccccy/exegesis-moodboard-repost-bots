@@ -449,7 +449,7 @@ async def test_confirmation_reaction_terminal_state_returns_false(session, board
 
 
 async def test_confirmation_reaction_playlist_skipped_archives_thread(session, board):
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, source_waived=True)
     sub.playlist_skipped = True
     session.add(sub)
     await session.flush()
@@ -607,7 +607,7 @@ async def test_cancel_button_tombstone_failure_and_cached_source_channel(session
 
 
 async def test_confirm_button_skipped_playlist_edit_failure_no_channel(session, board):
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, source_waived=True)
     sub.playlist_skipped = True
     session.add(sub)
     await session.flush()
@@ -624,7 +624,7 @@ async def test_confirm_button_skipped_playlist_edit_failure_no_channel(session, 
 
 
 async def test_confirm_button_playlist_pending_blocks_archive(session, board):
-    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value)
+    sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, source_waived=True)
     session.add(sub)
     await session.flush()
     session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=909))

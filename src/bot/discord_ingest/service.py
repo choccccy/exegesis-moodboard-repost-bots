@@ -706,6 +706,11 @@ async def handle_metadata_reaction(
     await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
 
 
+def _gap_summary(gaps) -> str:
+    """Human-readable, comma-separated list of blocking gaps for a refusal notice."""
+    return ", ".join(g.value.replace("_", " ") for g in gaps)
+
+
 async def handle_confirmation_reaction(
     session: AsyncSession,
     *,
@@ -732,12 +737,25 @@ async def handle_confirmation_reaction(
     if not _reaction_authorized(member, user_id, submission, board_cfg):
         return False
 
+    # Re-validate gaps at react time: a gap (e.g. alt text for a late-added image) may have
+    # opened after this confirmation was posted. Refuse and refresh rather than queue blindly.
+    snap, _atts, links = await _snapshot(session, submission)
+    gaps = missing_gaps(snap)
+    if gaps:
+        log.info("refusing to queue submission %s via ✅: gaps reopened (%s)", submission.id, _gap_summary(gaps))
+        await recompute_and_request(
+            session, submission, settings=settings, destination=channel, yt_client=yt_client
+        )
+        try:
+            await channel.send(replies.queue_blocked_notice(_gap_summary(gaps)))
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return False
+
     req.confirmed_at = _now()
     req.confirmed_by = user_id
     submission.state = SubmissionState.QUEUED.value
     log.info("submission %s queued by %s via ✅ confirmation", submission.id, user_id)
-
-    _snap, _atts, links = await _snapshot(session, submission)
     videos_added = 0
     if not submission.playlist_skipped:
         videos_added = await _auto_add_to_playlist(
@@ -1180,12 +1198,28 @@ async def handle_confirm_button(
         await interaction.followup.send("You're not authorised to queue this submission.", ephemeral=True)
         return
 
+    # Re-validate gaps at click time: a gap (e.g. alt text for a late-added image) may have
+    # opened after this button was posted. Refuse and refresh rather than queue blindly.
+    snap, _atts, links = await _snapshot(session, submission)
+    gaps = missing_gaps(snap)
+    if gaps:
+        log.info("refusing to queue submission %s via button: gaps reopened (%s)", submission.id, _gap_summary(gaps))
+        channel = interaction.channel
+        if channel is not None:
+            await recompute_and_request(
+                session, submission, settings=settings, destination=channel, yt_client=yt_client
+            )
+        await interaction.followup.send(
+            f"Can't queue yet - still needs: {_gap_summary(gaps)}. See the checklist in this thread.",
+            ephemeral=True,
+        )
+        return
+
     req.confirmed_at = _now()
     req.confirmed_by = user.id
     submission.state = SubmissionState.QUEUED.value
     log.info("submission %s queued by %s via button", submission.id, user.id)
 
-    _snap, _atts, links = await _snapshot(session, submission)
     videos_added = 0
     if not submission.playlist_skipped:
         videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg, yt_client)
@@ -2666,8 +2700,10 @@ async def recompute_and_request(
     if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
         session, ImageRequest, submission.id
     ):
+        primary = _primary_link(links)
+        source_unavailable = primary is not None and primary.resolved_via == "unavailable"
         try:
-            msg = await destination.send(replies.image_request())
+            msg = await destination.send(replies.image_request(source_unavailable=source_unavailable))
             session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("could not post image request for submission %s: %s", submission.id, exc)
@@ -2728,6 +2764,30 @@ async def recompute_and_request(
         await _upsert_status_checklist(
             submission, destination, snap, ready=ready, source_domain=source_domain
         )
+
+    # Regression: a submission that was ready (has an open, unconfirmed confirmation) has slipped
+    # back to a gap state because content changed under it (e.g. a late-added image needing alt
+    # text). Retract the stale Queue button so it can't be clicked into a bad queue; a fresh
+    # confirmation is reposted by the "fresh" path once the gaps close again.
+    if old_state not in _QUEUE_TERMINAL and new_state != SubmissionState.READY_TO_QUEUE:
+        stale_conf = await session.scalar(
+            select(ConfirmationRequest).where(
+                ConfirmationRequest.submission_id == submission.id,
+                ConfirmationRequest.confirmed_at.is_(None),
+            )
+        )
+        if stale_conf is not None:
+            fetch_message = getattr(destination, "fetch_message", None)
+            if fetch_message is not None:
+                try:
+                    conf_msg = await fetch_message(stale_conf.bot_message_id)
+                    await conf_msg.edit(view=views.make_disabled_view("Not ready - see checklist"))
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    # NotFound (deleted message) is a subclass of HTTPException; either way the
+                    # button is gone/unreachable and dropping the DB row below is enough.
+                    log.debug("could not tombstone stale confirmation for submission %s: %s", submission.id, exc)
+            await session.delete(stale_conf)
+            await session.flush()
 
     action = _queue_action(old_state, new_state)
     if action in ("fresh", "silent"):

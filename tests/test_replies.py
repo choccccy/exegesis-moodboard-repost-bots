@@ -118,6 +118,17 @@ def test_supplemental_image_request_is_string():
     assert "image" in msg.lower()
 
 
+def test_image_request_default_vs_source_unavailable():
+    plain = replies.image_request()
+    assert "no preview image" in plain
+    assert "age-restricted" not in plain
+
+    blocked = replies.image_request(source_unavailable=True)
+    assert "age-restricted" in blocked
+    assert "twitter" in blocked  # never "X" - keep calling it twitter
+    assert "/no_source" in blocked
+
+
 # ---------------------------------------------------------------------------
 # _paginate
 # ---------------------------------------------------------------------------

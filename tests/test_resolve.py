@@ -264,6 +264,66 @@ async def test_resolve_twitter_vxtwitter_empty_body_falls_to_mirror():
 
 
 @pytest.mark.asyncio
+async def test_resolve_twitter_age_restricted_reports_unavailable():
+    """fxtwitter 401 PRIVATE_TWEET + vxtwitter scan-failure (200 non-JSON) => 'unavailable',
+    and the mirror/canonical OG steps are short-circuited (no junk 'post doesn't exist' card)."""
+    scan_fail = MagicMock()
+    scan_fail.status_code = 200
+    scan_fail.json.side_effect = ValueError("not json")
+    client = AsyncMock()
+    client.get.side_effect = [
+        _error_response(401),  # fxtwitter API - PRIVATE_TWEET
+        scan_fail,             # vxtwitter API - 200 HTML error page
+    ]
+    result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
+    assert result.via == "unavailable"
+    assert result.title is None and result.image_url is None
+    assert client.get.call_count == 2  # noqa: PLR2004 - no fall-through to OG mirror
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_403_also_unavailable():
+    """A 403 from fxtwitter (blocked) with no vxtwitter recovery is likewise 'unavailable'."""
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(403), _error_response(500)]
+    result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
+    assert result.via == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_unavailable_honors_discord_fallback():
+    """When Discord already captured an embed, an age-restricted tweet uses that (via=discord)
+    rather than surfacing 'unavailable'."""
+    scan_fail = MagicMock()
+    scan_fail.status_code = 200
+    scan_fail.json.side_effect = ValueError("not json")
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(401), scan_fail]
+    result = await resolve(
+        "https://twitter.com/user/status/123", "twitter", client=client,
+        fallback_title="Discord unfurled this", fallback_image_url="https://cdn/x.jpg",
+    )
+    assert result.via == "discord"
+    assert result.title == "Discord unfurled this"
+
+
+@pytest.mark.asyncio
+async def test_resolve_twitter_401_but_vxtwitter_recovers():
+    """fxtwitter 401 but vxtwitter succeeds => use vxtwitter, not 'unavailable'."""
+    vx = MagicMock()
+    vx.status_code = 200
+    vx.json.return_value = {
+        "text": "recovered tweet", "user_name": "Poster",
+        "media_extended": [{"type": "image", "url": "https://pbs.twimg.com/media/ok.jpg"}],
+    }
+    client = AsyncMock()
+    client.get.side_effect = [_error_response(401), vx]
+    result = await resolve("https://twitter.com/user/status/123", "twitter", client=client)
+    assert result.via == "vxtwitter_api"
+    assert result.image_url == "https://pbs.twimg.com/media/ok.jpg"
+
+
+@pytest.mark.asyncio
 async def test_resolve_instagram_uses_oembed():
     client = AsyncMock()
     client.get.return_value = _oembed_response("More hands patting Cria", "https://cdn.instagram.com/thumb.jpg")

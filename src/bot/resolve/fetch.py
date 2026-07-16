@@ -29,7 +29,11 @@ class ResolvedMetadata:
     title: str | None = None
     description: str | None = None
     image_url: str | None = None
-    via: str = "none"  # oembed | opengraph | html | discord | none | skipped
+    # oembed | opengraph | html | discord | none | skipped | unavailable.
+    # "unavailable" = the source exists but can't be fetched without an authenticated,
+    # age-verified session (e.g. an age-restricted twitter tweet); callers surface a
+    # clear "attach the media yourself" notice rather than a broken empty card.
+    via: str = "none"
     # Video URL when the source is a video/GIF post and the resolver exposes one
     # (fxtwitter, vxtwitter, tikwm, reddit). image_url still carries the thumbnail
     # still for fallback/preview use.
@@ -247,6 +251,13 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
         return None
     handle, tweet_id = parts[0], parts[2]
 
+    # A tweet that needs an authenticated, age-verified session (protected account or,
+    # far more commonly, age-restricted media) can't be fetched by the guest-token
+    # mirrors. fxtwitter answers 401 PRIVATE_TWEET for it; vxtwitter's scan then fails
+    # too. When both give up that way we report it as "unavailable" so the caller can
+    # tell the curator to attach the media directly rather than showing a dead card.
+    needs_auth = False
+
     endpoint = f"https://api.fxtwitter.com/{handle}/status/{tweet_id}"
     try:
         resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
@@ -267,23 +278,27 @@ async def _twitter_fxtwitter_api(url: str, client: httpx.AsyncClient) -> Resolve
                 )
         else:
             log.info("fxtwitter api returned %d for %s", resp.status_code, url)
+            if resp.status_code in (401, 403):
+                needs_auth = True
     except httpx.HTTPError:
         pass
+
+    _blocked = ResolvedMetadata(via="unavailable") if needs_auth else None
 
     # Fallback: vxtwitter API (different response format, different backend)
     endpoint = f"https://api.vxtwitter.com/{handle}/status/{tweet_id}"
     try:
         resp = await client.get(endpoint, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
     except httpx.HTTPError:
-        return None
+        return _blocked
     if resp.status_code != 200:
         log.info("vxtwitter api returned %d for %s", resp.status_code, url)
-        return None
+        return _blocked
     try:
         data = resp.json()
     except ValueError:
         log.info("vxtwitter api returned non-JSON for %s", url)
-        return None
+        return _blocked
     # media_extended distinguishes images from videos/GIFs; the flat mediaURLs
     # list would hand an .mp4 URL to the thumbnail downloader for video tweets.
     image_url = None
@@ -621,6 +636,19 @@ async def resolve(
             meta = await _OEMBED_HANDLERS[family](url, client)
         except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
             log.info("oembed fetch failed for %s: %s", url, exc)
+    # A resolver that reports the source is fetch-blocked (age-restricted / private)
+    # short-circuits: the mirror/canonical OG pages for those return a junk "post
+    # doesn't exist" card, so fall through only to a Discord-captured embed if we have
+    # one, otherwise propagate "unavailable" for the caller to explain.
+    if meta is not None and meta.via == "unavailable":
+        if fallback_title or fallback_image_url:
+            return ResolvedMetadata(
+                title=fallback_title,
+                description=fallback_description,
+                image_url=fallback_image_url,
+                via="discord",
+            )
+        return ResolvedMetadata(via="unavailable")
     # 2. Try mirror URL for OpenGraph (better than canonical for blocked platforms).
     if meta is None and family in _MIRROR_URL_FUNCS:
         mirror = _MIRROR_URL_FUNCS[family](url)
