@@ -7,6 +7,6 @@ produced the metadata. Bluesky links are skipped here (resolved natively at
 publish time). Mirrors/scraping/auth remain extension points for later.
 """
 
-from .fetch import ResolvedMetadata, resolve
+from .fetch import ResolvedMetadata, resolve, resolve_bluesky_at_uri
 
-__all__ = ["ResolvedMetadata", "resolve"]
+__all__ = ["ResolvedMetadata", "resolve", "resolve_bluesky_at_uri"]

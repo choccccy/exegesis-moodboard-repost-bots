@@ -355,10 +355,21 @@ async def _create_post(
     return PublishResult(success=True, at_uri=response.uri, at_cid=response.cid)
 
 
-async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tuple[str, str]:
-    """Resolve a bsky.app URL to (at_uri, cid).
+async def _cid_for_at_uri(client: AsyncClient, at_uri: str) -> str:
+    """Fetch the current cid for an at:// post URI (required alongside the URI to
+    repost/like a record). Raises if the post no longer exists."""
+    posts_resp = await client.get_posts([at_uri])
+    if not posts_resp.posts:
+        raise ValueError(f"Bluesky post not found: {at_uri}")
+    return posts_resp.posts[0].cid
 
-    Handles both handle-based and DID-based profile URLs.
+
+async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tuple[str, str]:
+    """Resolve a bsky.app URL to (at_uri, cid) by resolving the handle live.
+
+    Handles both handle-based and DID-based profile URLs. Fallback path for links
+    captured before we pinned the DID (``source_at_uri``); it fails if the author
+    has since renamed or deactivated the handle in the URL.
     """
     parsed = urlparse(canonical_url)
     # path: /profile/{handle_or_did}/post/{rkey}
@@ -373,17 +384,20 @@ async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tupl
         did = resp.did
 
     at_uri = f"at://{did}/app.bsky.feed.post/{rkey}"
-    posts_resp = await client.get_posts([at_uri])
-    if not posts_resp.posts:
-        raise ValueError(f"Bluesky post not found: {at_uri}")
-    return at_uri, posts_resp.posts[0].cid
+    return at_uri, await _cid_for_at_uri(client, at_uri)
 
 
 async def _publish_record(client: AsyncClient, links: list[SubmissionLink]) -> PublishResult:
     """Create a native Bluesky repost of a bsky.app source link, and like the original."""
-    canonical_url = links[0].canonical_url
+    link = links[0]
     try:
-        at_uri, cid = await _resolve_bluesky_post(client, canonical_url)
+        # Prefer the DID-based URI pinned at capture time; it survives source handle
+        # renames. Fall back to live handle resolution for links captured earlier.
+        if link.source_at_uri:
+            at_uri = link.source_at_uri
+            cid = await _cid_for_at_uri(client, at_uri)
+        else:
+            at_uri, cid = await _resolve_bluesky_post(client, link.canonical_url)
     except Exception as exc:
         return PublishResult(success=False, error=f"could not resolve Bluesky post: {exc}")
 

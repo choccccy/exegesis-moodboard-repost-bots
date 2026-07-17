@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- DID pinning for Bluesky sources: the source post's permanent DID is resolved and stored (`source_at_uri` on `submission_links`) at ingest, while the handle is still live, so a later handle rename or deactivation can no longer break the repost
+- `bot.admin.backfill_bsky_did` one-shot to pin DIDs onto submissions ingested before the change
+
+### Fixed
+- Bluesky reposts failing permanently with "Unable to resolve handle" when a source account renamed or deactivated its handle between submission and publish: publishing now prefers the pinned DID and only falls back to live handle resolution for legacy rows
+
 ## [1.0.0] - 2026-06-23
 
 ### Added

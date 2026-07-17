@@ -53,7 +53,7 @@ from ..moderation import (
     GRAPHIC_YES_EMOJI,
     graphic_from_emoji,
 )
-from ..resolve import ResolvedMetadata, resolve
+from ..resolve import ResolvedMetadata, resolve, resolve_bluesky_at_uri
 from ..state import (
     AltTextStatus,
     GraphicStatus,
@@ -1931,6 +1931,15 @@ async def _resolve_links(
         link.resolved_description = meta.description
         link.resolved_image_url = meta.image_url
         link.resolved_via = meta.via
+        # Pin the permanent DID now, while the source handle still resolves, so a
+        # later handle rename/deactivation can't break the repost at publish time.
+        # Cleared for non-bluesky links so a re-resolve after an edit can't leave a
+        # stale URI behind.
+        link.source_at_uri = (
+            await resolve_bluesky_at_uri(link.canonical_url, http_client)
+            if link.domain_family == "bluesky"
+            else None
+        )
         if meta.image_url:
             dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
             extra_headers: dict[str, str] = {}

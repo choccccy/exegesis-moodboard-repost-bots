@@ -45,6 +45,7 @@ def _link(
     resolved_title: str = "Cool Artwork",
     resolved_description: str = "A great piece",
     resolved_image_path: str | None = None,
+    source_at_uri: str | None = None,
 ) -> SubmissionLink:
     link = MagicMock(spec=SubmissionLink)
     link.canonical_url = canonical_url
@@ -52,6 +53,7 @@ def _link(
     link.resolved_title = resolved_title
     link.resolved_description = resolved_description
     link.resolved_image_path = resolved_image_path
+    link.source_at_uri = source_at_uri
     return link
 
 
@@ -606,6 +608,36 @@ async def test_publish_record_like_failure_still_succeeds():
     result = await _publish_record(client, [link])
     assert result.success
     assert result.is_repost
+
+
+async def test_publish_record_prefers_pinned_at_uri_over_handle():
+    # A pinned DID-based at:// URI must be used verbatim, never re-resolving the
+    # (possibly stale) handle in canonical_url.
+    client = _fake_client()
+    at_uri = "at://did:plc:pinned000/app.bsky.feed.post/rk123"
+    link = _link(
+        canonical_url="https://bsky.app/profile/oldhandle.bsky.social/post/rk123",
+        domain_family="bluesky",
+        source_at_uri=at_uri,
+    )
+    result = await _publish_record(client, [link])
+    assert result.success and result.is_repost
+    client.resolve_handle.assert_not_awaited()  # handle never touched
+    client.get_posts.assert_awaited_once_with([at_uri])
+    client.repost.assert_awaited_once_with(at_uri, "bafyreitarget000")
+
+
+async def test_publish_record_falls_back_to_handle_when_no_pinned_uri():
+    # Legacy rows without a pinned URI resolve the handle live.
+    client = _fake_client()
+    link = _link(
+        canonical_url="https://bsky.app/profile/live.bsky.social/post/rk777",
+        domain_family="bluesky",
+        source_at_uri=None,
+    )
+    result = await _publish_record(client, [link])
+    assert result.success and result.is_repost
+    client.resolve_handle.assert_awaited_once_with("live.bsky.social")
 
 
 # ---------------------------------------------------------------------------

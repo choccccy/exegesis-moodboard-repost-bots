@@ -2,6 +2,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import httpx
+
 from bot.resolve.fetch import (
     _deviantart_mirror_url,
     _instagram_mirror_url,
@@ -9,6 +11,7 @@ from bot.resolve.fetch import (
     _twitter_mirror_url,
     parse_html_metadata,
     resolve,
+    resolve_bluesky_at_uri,
 )
 
 
@@ -117,6 +120,54 @@ async def test_resolve_bluesky_skipped():
     client = AsyncMock()
     result = await resolve("https://bsky.app/profile/a/post/b", "bluesky", client=client)
     assert result.via == "skipped"
+    client.get.assert_not_called()
+
+
+def _resolve_handle_response(did: str):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"did": did}
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_resolve_bluesky_at_uri_resolves_handle_to_did():
+    client = AsyncMock()
+    client.get.return_value = _resolve_handle_response("did:plc:abc123")
+    at_uri = await resolve_bluesky_at_uri(
+        "https://bsky.app/profile/someone.bsky.social/post/rk9", client
+    )
+    assert at_uri == "at://did:plc:abc123/app.bsky.feed.post/rk9"
+    call = client.get.call_args
+    assert "resolveHandle" in call[0][0]
+    assert call.kwargs["params"] == {"handle": "someone.bsky.social"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_bluesky_at_uri_did_url_skips_network():
+    client = AsyncMock()
+    at_uri = await resolve_bluesky_at_uri(
+        "https://bsky.app/profile/did:plc:xyz789/post/rk1", client
+    )
+    assert at_uri == "at://did:plc:xyz789/app.bsky.feed.post/rk1"
+    client.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_bluesky_at_uri_returns_none_on_resolve_failure():
+    client = AsyncMock()
+    client.get.side_effect = httpx.HTTPError("boom")
+    at_uri = await resolve_bluesky_at_uri(
+        "https://bsky.app/profile/gone.bsky.social/post/rk1", client
+    )
+    assert at_uri is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_bluesky_at_uri_returns_none_on_malformed_url():
+    client = AsyncMock()
+    at_uri = await resolve_bluesky_at_uri("https://bsky.app/notapost", client)
+    assert at_uri is None
     client.get.assert_not_called()
 
 

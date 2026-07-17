@@ -45,6 +45,7 @@ def _link(
     resolved_title: str = "Cool Artwork",
     resolved_description: str = "A great piece",
     resolved_image_path: str | None = None,
+    source_at_uri: str | None = None,
 ) -> SubmissionLink:
     link = MagicMock(spec=SubmissionLink)
     link.canonical_url = canonical_url
@@ -52,6 +53,7 @@ def _link(
     link.resolved_title = resolved_title
     link.resolved_description = resolved_description
     link.resolved_image_path = resolved_image_path
+    link.source_at_uri = source_at_uri
     return link
 
 

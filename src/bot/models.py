@@ -144,6 +144,13 @@ class SubmissionLink(Base):
     canonical_url: Mapped[str] = mapped_column(Text)
     domain_family: Mapped[str] = mapped_column(String(40))
 
+    # Authoritative DID-based at:// URI for bluesky sources, resolved at capture time
+    # while the source handle is still live. Publishing prefers this over re-resolving
+    # the handle in canonical_url, which breaks if the author later renames or
+    # deactivates the account (the DID is permanent, the handle is not). Null for
+    # non-bluesky links and for rows captured before this column existed.
+    source_at_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Metadata resolved from the source (oembed / opengraph / html / discord / none).
     resolved_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_description: Mapped[str | None] = mapped_column(Text, nullable=True)

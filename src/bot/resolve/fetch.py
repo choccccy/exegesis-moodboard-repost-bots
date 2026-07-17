@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -603,6 +603,44 @@ async def _fetch_opengraph(url: str, client: httpx.AsyncClient) -> ResolvedMetad
         return None
     html = resp.text[:_MAX_HTML_BYTES]
     return parse_html_metadata(html, str(resp.url))
+
+
+# Bluesky's public appview; its resolveHandle is the authoritative handle->DID
+# lookup (it performs the DNS / .well-known + PLC resolution for us). No auth needed.
+_BSKY_APPVIEW = "https://public.api.bsky.app"
+
+
+async def resolve_bluesky_at_uri(
+    canonical_url: str, client: httpx.AsyncClient
+) -> str | None:
+    """Resolve a bsky.app post URL to a permanent DID-based ``at://`` URI.
+
+    Called at capture time, while the source handle is still live, so a later
+    handle rename or account deactivation can't break publishing (the DID never
+    changes; the handle does). Returns None if the URL isn't a well-formed bsky
+    post URL or the handle can't be resolved - callers fall back to resolving the
+    handle live at publish. Only authoritative resolution is used; no fuzzy search.
+    """
+    parts = urlsplit(canonical_url).path.strip("/").split("/")
+    # Expect: profile/<handle-or-did>/post/<rkey>
+    if len(parts) < 4 or parts[0] != "profile" or parts[2] != "post":
+        return None
+    handle_or_did, rkey = parts[1], parts[3]
+    if handle_or_did.startswith("did:"):
+        did = handle_or_did
+    else:
+        try:
+            resp = await client.get(
+                f"{_BSKY_APPVIEW}/xrpc/com.atproto.identity.resolveHandle",
+                params={"handle": handle_or_did},
+                timeout=_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+            did = resp.json()["did"]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            log.info("bluesky handle resolve failed for %s: %s", handle_or_did, exc)
+            return None
+    return f"at://{did}/app.bsky.feed.post/{rkey}"
 
 
 async def resolve(
