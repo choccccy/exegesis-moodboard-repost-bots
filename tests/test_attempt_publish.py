@@ -80,7 +80,7 @@ _OK = PublishResult(
 # ---------------------------------------------------------------------------
 
 
-async def test_no_password_configured_fails(session, board):
+async def test_no_password_configured_fails(session, board, bind_publish_scopes):
     settings = _settings(board, password=None)
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
@@ -88,7 +88,7 @@ async def test_no_password_configured_fails(session, board):
     dest = MockDest()
 
     with patch("bot.publish.publish_submission", new_callable=AsyncMock) as mock_pub:
-        result = await publish_queued_submission(session, settings, sub, dest)
+        result = await publish_queued_submission(settings, sub.id, dest)
 
     assert result is PublishOutcome.FAILED
     mock_pub.assert_not_awaited()
@@ -99,7 +99,7 @@ async def test_no_password_configured_fails(session, board):
     assert any("failed" in m.lower() for m in dest.sent)
 
 
-async def test_deferred_when_parent_butterflied_but_unpublished(session, board):
+async def test_deferred_when_parent_butterflied_but_unpublished(session, board, bind_publish_scopes):
     settings = _settings(board)
     parent = make_submission(board, state=QUEUED, source_discord_message_id=100)
     session.add(parent)
@@ -112,7 +112,7 @@ async def test_deferred_when_parent_butterflied_but_unpublished(session, board):
     await session.flush()
 
     with patch("bot.publish.publish_submission", new_callable=AsyncMock) as mock_pub:
-        result = await publish_queued_submission(session, settings, child, MockDest())
+        result = await publish_queued_submission(settings, child.id, MockDest())
 
     assert result is PublishOutcome.DEFERRED
     mock_pub.assert_not_awaited()
@@ -121,7 +121,7 @@ async def test_deferred_when_parent_butterflied_but_unpublished(session, board):
     assert attempt is None
 
 
-async def test_reply_ref_passed_when_parent_published(session, board):
+async def test_reply_ref_passed_when_parent_published(session, board, bind_publish_scopes):
     settings = _settings(board)
     parent = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=200)
     session.add(parent)
@@ -140,7 +140,7 @@ async def test_reply_ref_passed_when_parent_published(session, board):
     await _add_link(session, child.id, "https://example.com/reply-content")
 
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK) as mock_pub:
-        result = await publish_queued_submission(session, settings, child, MockDest())
+        result = await publish_queued_submission(settings, child.id, MockDest())
 
     assert result is PublishOutcome.PUBLISHED
     kwargs = mock_pub.call_args.kwargs
@@ -151,7 +151,7 @@ async def test_reply_ref_passed_when_parent_published(session, board):
     assert kwargs["reply_root_cid"] == "parentcid"
 
 
-async def test_duplicate_notice_send_failure_still_cleans_up(session, board):
+async def test_duplicate_notice_send_failure_still_cleans_up(session, board, bind_publish_scopes):
     settings = _settings(board)
     prior = make_submission(board, state=SubmissionState.PUBLISHED.value, source_discord_message_id=300)
     session.add(prior)
@@ -168,7 +168,7 @@ async def test_duplicate_notice_send_failure_still_cleans_up(session, board):
 
     dest = _RaisingDest()
     with patch("bot.publish.publish_submission", new_callable=AsyncMock) as mock_pub:
-        result = await publish_queued_submission(session, settings, dup, dest)
+        result = await publish_queued_submission(settings, dup.id, dest)
 
     assert result is PublishOutcome.DUPLICATE
     mock_pub.assert_not_awaited()
@@ -176,7 +176,7 @@ async def test_duplicate_notice_send_failure_still_cleans_up(session, board):
     assert dest.archived, "thread must be archived even when the notice send fails"
 
 
-async def test_published_notice_send_failure_still_published_and_archived(session, board):
+async def test_published_notice_send_failure_still_published_and_archived(session, board, bind_publish_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
@@ -185,7 +185,7 @@ async def test_published_notice_send_failure_still_published_and_archived(sessio
 
     dest = _RaisingDest()
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK):
-        result = await publish_queued_submission(session, settings, sub, dest)
+        result = await publish_queued_submission(settings, sub.id, dest)
 
     assert result is PublishOutcome.PUBLISHED
     assert sub.state == SubmissionState.PUBLISHED.value
@@ -194,7 +194,7 @@ async def test_published_notice_send_failure_still_published_and_archived(sessio
     assert attempt.success is True and attempt.error is None
 
 
-async def test_repost_result_sends_reposted_notice(session, board):
+async def test_repost_result_sends_reposted_notice(session, board, bind_publish_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
@@ -207,14 +207,14 @@ async def test_repost_result_sends_reposted_notice(session, board):
     )
     dest = MockDest()
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=repost):
-        result = await publish_queued_submission(session, settings, sub, dest)
+        result = await publish_queued_submission(settings, sub.id, dest)
 
     assert result is PublishOutcome.PUBLISHED
     assert replies.reposted_notice("https://bsky.app/repost") in dest.sent
     assert replies.published_notice("https://bsky.app/repost") not in dest.sent
 
 
-async def test_failed_notice_send_failure_swallowed(session, board):
+async def test_failed_notice_send_failure_swallowed(session, board, bind_publish_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
@@ -223,7 +223,7 @@ async def test_failed_notice_send_failure_swallowed(session, board):
     fail = PublishResult(success=False, error="rate limited")
     dest = _RaisingDest()
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=fail):
-        result = await publish_queued_submission(session, settings, sub, dest)
+        result = await publish_queued_submission(settings, sub.id, dest)
 
     assert result is PublishOutcome.FAILED
     assert sub.state == SubmissionState.PUBLISH_FAILED.value

@@ -69,6 +69,7 @@ from ..ingest.types import InboundAttachment, InboundMessage
 from . import replies, views
 from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
 from .urls import extract_urls
+from ..db import session_scope
 
 log = logging.getLogger(__name__)
 
@@ -2880,70 +2881,35 @@ async def recompute_and_request(
     return new_state
 
 
-async def publish_queued_submission(
-    session: AsyncSession,
-    settings: Settings,
-    submission: Submission,
-    destination: Notifier | None,
-) -> PublishOutcome:
-    """Called by the scheduler to publish a QUEUED or PUBLISH_FAILED submission.
-
-    Loads current attachments and links from DB, then delegates to _attempt_publish.
-    ``destination`` is the submission thread (or None if the thread can't be resolved -
-    publish still proceeds, just without a Discord status notice).
-
-    Returns a PublishOutcome so the scheduler can decide whether to spend the
-    tick (PUBLISHED), try the next queue item (FAILED / DUPLICATE / DEFERRED),
-    or how to log what happened.
-    """
-    _snap, atts, links = await _snapshot(session, submission)
-    if destination is None:
-        destination = NullNotifier()
-    return await _attempt_publish(session, settings, submission, atts, links, destination)
+@dataclass
+class _PublishPlan:
+    """Beat-1 decision: everything the network publish needs, captured while the
+    DB lock is held so the lock can be released before any I/O. The ORM objects
+    are detached after the session closes; publish_submission only reads their
+    (already-loaded) column attributes, which is safe with expire_on_commit=False."""
+    submission: Submission
+    links: list[SubmissionLink]
+    atts: list[Attachment]
+    board_cfg: BoardConfig
+    password: str
+    reply_kwargs: dict
+    curator_user_ids: list[int] | None
 
 
-async def _attempt_publish(
-    session: AsyncSession,
-    settings: Settings,
-    submission: Submission,
-    atts: list[Attachment],
-    links: list[SubmissionLink],
-    destination: Notifier,
-) -> PublishOutcome:
-    """Publish to Bluesky and record the result. Returns a PublishOutcome."""
-    board_cfg = settings.board_for_channel(submission.channel_id)
-    if not board_cfg or not board_cfg.bluesky_handle:
-        err = "board has no Bluesky handle configured"
-        log.warning("submission %s: %s", submission.id, err)
-        submission.state = SubmissionState.PUBLISH_FAILED.value
-        session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
-        try:
-            await destination.send(replies.publish_failed_notice(
-                err, mention_user_ids=board_cfg.curator_user_ids if board_cfg else None))
-        except Exception as exc:
-            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
-        return PublishOutcome.FAILED
+async def _safe_send(destination: Notifier, content: str, what: str, submission_id: int) -> None:
+    """Send a Discord notice, swallowing failures (a publish must never be rolled
+    back or a queue tick wasted because a status message couldn't be delivered)."""
+    try:
+        await destination.send(content)
+    except Exception as exc:
+        log.warning("submission %s: could not send %s: %s", submission_id, what, exc)
 
-    password = settings.bsky_password_for(board_cfg.name)
-    if not password:
-        err = f"no app password configured for board {board_cfg.name}"
-        log.warning("submission %s: %s", submission.id, err)
-        submission.state = SubmissionState.PUBLISH_FAILED.value
-        session.add(PublishAttempt(submission_id=submission.id, success=False, error=err))
-        try:
-            await destination.send(replies.publish_failed_notice(
-                err, mention_user_ids=board_cfg.curator_user_ids))
-        except Exception as exc:
-            log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
-        return PublishOutcome.FAILED
 
-    parent_ref = await _resolve_parent_ref(session, submission)
-    if parent_ref is _DEFERRED:
-        log.info("submission %s deferred: parent not yet published", submission.id)
-        return PublishOutcome.DEFERRED
-
-    # Guard against duplicates that slipped into the queue (e.g. from the old warning-only
-    # duplicate check that didn't reject queued-but-not-yet-published content).
+async def _find_publish_time_duplicate(
+    session: AsyncSession, submission: Submission, links: list[SubmissionLink]
+):
+    """Return a prior successful PublishAttempt whose canonical_url matches one of
+    this submission's links (a duplicate that slipped into the queue), or None."""
     for link in links:
         if link.canonical_url is None:
             continue  # null canonical_url would match all other nulls; skip the check
@@ -2961,48 +2927,125 @@ async def _attempt_publish(
             .limit(1)
         )
         if prior_attempt is not None:
-            bsky_url = prior_attempt.bsky_url or prior_attempt.at_uri
-            log.warning("submission %s skipped at publish time - duplicate of %s", submission.id, bsky_url)
-            # Mark as PUBLISHED (not PUBLISH_FAILED) so it is not retried.
-            submission.state = SubmissionState.PUBLISHED.value
-            session.add(PublishAttempt(
-                submission_id=submission.id,
-                success=True,
-                at_uri=prior_attempt.at_uri,
-                at_cid=prior_attempt.at_cid,
-                bsky_root_uri=prior_attempt.bsky_root_uri,
-                bsky_root_cid=prior_attempt.bsky_root_cid,
-                bsky_url=prior_attempt.bsky_url,
-                error="duplicate: content already published by another submission",
-            ))
-            try:
-                await destination.send(replies.duplicate_posted(bsky_url))
-            except Exception as exc:
-                log.warning("submission %s: could not send duplicate notice: %s", submission.id, exc)
-            await destination.archive(replies.closing_notice("duplicate"))
-            return PublishOutcome.DUPLICATE  # cleanup, not a real publish
+            return prior_attempt
+    return None
 
-    reply_kwargs: dict = {}
-    if parent_ref is not None:
-        parent_uri, parent_cid, root_uri, root_cid = parent_ref
-        reply_kwargs = dict(
-            reply_parent_uri=parent_uri,
-            reply_parent_cid=parent_cid,
-            reply_root_uri=root_uri,
-            reply_root_cid=root_cid,
-        )
 
+async def publish_queued_submission(
+    settings: Settings,
+    submission_id: int,
+    destination: Notifier | None = None,
+) -> PublishOutcome:
+    """Publish a QUEUED or PUBLISH_FAILED submission, keeping all network and
+    Discord I/O out of the DB write lock (see docs/db-lock-io-refactor.md).
+
+    Runs in beats: a short DB transaction to load state and decide (beat 1), the
+    Bluesky network publish with no lock held (beat 2), a short DB transaction to
+    record the result (beat 3), then the Discord status notice (beat 4). Opens its
+    own sessions - the caller must NOT hold a session_scope, or the beat-1 acquire
+    would deadlock on the (non-reentrant) global lock.
+
+    ``destination`` is the submission thread (or None if the thread can't be
+    resolved - publish still proceeds, just without a Discord status notice).
+    Returns a PublishOutcome so the scheduler can decide whether the tick is spent.
+    """
+    if destination is None:
+        destination = NullNotifier()
+
+    # ---- Beat 1: load, validate, decide (short DB scope; no I/O) ----
+    plan: _PublishPlan | None = None
+    async with session_scope() as session:
+        submission = await session.get(Submission, submission_id)
+        if submission is None:
+            log.warning("publish: submission %s vanished before publish", submission_id)
+            return PublishOutcome.FAILED
+        _snap, atts, links = await _snapshot(session, submission)
+        board_cfg = settings.board_for_channel(submission.channel_id)
+
+        if not board_cfg or not board_cfg.bluesky_handle:
+            err = "board has no Bluesky handle configured"
+            log.warning("submission %s: %s", submission_id, err)
+            submission.state = SubmissionState.PUBLISH_FAILED.value
+            session.add(PublishAttempt(submission_id=submission_id, success=False, error=err))
+            mention = board_cfg.curator_user_ids if board_cfg else None
+            early: tuple = ("FAILED", err, mention)
+        elif not (password := settings.bsky_password_for(board_cfg.name)):
+            err = f"no app password configured for board {board_cfg.name}"
+            log.warning("submission %s: %s", submission_id, err)
+            submission.state = SubmissionState.PUBLISH_FAILED.value
+            session.add(PublishAttempt(submission_id=submission_id, success=False, error=err))
+            early = ("FAILED", err, board_cfg.curator_user_ids)
+        else:
+            parent_ref = await _resolve_parent_ref(session, submission)
+            if parent_ref is _DEFERRED:
+                early = ("DEFERRED",)
+            elif (dup := await _find_publish_time_duplicate(session, submission, links)) is not None:
+                bsky_url = dup.bsky_url or dup.at_uri
+                log.warning("submission %s skipped at publish time - duplicate of %s", submission_id, bsky_url)
+                # Mark as PUBLISHED (not PUBLISH_FAILED) so it is not retried.
+                submission.state = SubmissionState.PUBLISHED.value
+                session.add(PublishAttempt(
+                    submission_id=submission_id,
+                    success=True,
+                    at_uri=dup.at_uri,
+                    at_cid=dup.at_cid,
+                    bsky_root_uri=dup.bsky_root_uri,
+                    bsky_root_cid=dup.bsky_root_cid,
+                    bsky_url=dup.bsky_url,
+                    error="duplicate: content already published by another submission",
+                ))
+                early = ("DUPLICATE", bsky_url)
+            else:
+                reply_kwargs: dict = {}
+                if parent_ref is not None:
+                    parent_uri, parent_cid, root_uri, root_cid = parent_ref
+                    reply_kwargs = dict(
+                        reply_parent_uri=parent_uri,
+                        reply_parent_cid=parent_cid,
+                        reply_root_uri=root_uri,
+                        reply_root_cid=root_cid,
+                    )
+                plan = _PublishPlan(
+                    submission=submission,
+                    links=links,
+                    atts=atts,
+                    board_cfg=board_cfg,
+                    password=password,
+                    reply_kwargs=reply_kwargs,
+                    curator_user_ids=board_cfg.curator_user_ids,
+                )
+                early = ()
+
+    # ---- Beat 1 early exits: perform their I/O with the lock released ----
+    if plan is None:
+        if early[0] == "FAILED":
+            _, err, mention = early
+            await _safe_send(destination, replies.publish_failed_notice(err, mention_user_ids=mention),
+                             "publish-failed notice", submission_id)
+            return PublishOutcome.FAILED
+        if early[0] == "DEFERRED":
+            log.info("submission %s deferred: parent not yet published", submission_id)
+            return PublishOutcome.DEFERRED
+        # DUPLICATE
+        await _safe_send(destination, replies.duplicate_posted(early[1]), "duplicate notice", submission_id)
+        await destination.archive(replies.closing_notice("duplicate"))
+        return PublishOutcome.DUPLICATE
+
+    # ---- Beat 2: network publish (NO lock held) ----
     result = await publisher.publish_submission(
-        submission=submission,
-        links=links,
-        attachments=atts,
-        board_cfg=board_cfg,
-        password=password,
-        **reply_kwargs,
+        submission=plan.submission,
+        links=plan.links,
+        attachments=plan.atts,
+        board_cfg=plan.board_cfg,
+        password=plan.password,
+        **plan.reply_kwargs,
     )
-    session.add(
-        PublishAttempt(
-            submission_id=submission.id,
+
+    # ---- Beat 3: record the result (short DB scope; no I/O) ----
+    published = bool(result.success and result.at_uri)
+    async with session_scope() as session:
+        session.add(PublishAttempt(
+            submission_id=submission_id,
             success=result.success,
             at_uri=result.at_uri,
             at_cid=result.at_cid,
@@ -3010,31 +3053,26 @@ async def _attempt_publish(
             bsky_root_cid=result.bsky_root_cid,
             bsky_url=result.bsky_url,
             error=result.error,
-        )
-    )
-    if result.success and result.at_uri:
-        submission.state = SubmissionState.PUBLISHED.value
+        ))
+        submission = await session.get(Submission, submission_id)
+        if submission is not None:
+            submission.state = (
+                SubmissionState.PUBLISHED.value if published else SubmissionState.PUBLISH_FAILED.value
+            )
+
+    # ---- Beat 4: Discord status notice (lock released) ----
+    if published:
         bsky_url = result.bsky_url or publisher.at_uri_to_url(result.at_uri)
-        log.info("submission %s published: %s", submission.id, result.at_uri)
-        # Send Discord notice separately - failure here must NOT roll back the publish.
-        try:
-            if result.is_repost:
-                await destination.send(replies.reposted_notice(bsky_url))
-            else:
-                await destination.send(replies.published_notice(bsky_url))
-        except Exception as exc:
-            log.warning("submission %s: published to Bluesky but Discord notice failed: %s", submission.id, exc)
+        log.info("submission %s published: %s", submission_id, result.at_uri)
+        notice = replies.reposted_notice(bsky_url) if result.is_repost else replies.published_notice(bsky_url)
+        await _safe_send(destination, notice, "published notice", submission_id)
         # Archive unconditionally - even if the notice send failed, close the thread.
         await destination.archive(replies.closing_notice("published to Bluesky"))
         return PublishOutcome.PUBLISHED
 
-    submission.state = SubmissionState.PUBLISH_FAILED.value
-    log.error("submission %s publish failed: %s", submission.id, result.error)
-    try:
-        await destination.send(replies.publish_failed_notice(
-            result.error, mention_user_ids=board_cfg.curator_user_ids))
-    except Exception as exc:
-        log.warning("submission %s: could not send publish-failed notice: %s", submission.id, exc)
+    log.error("submission %s publish failed: %s", submission_id, result.error)
+    await _safe_send(destination, replies.publish_failed_notice(
+        result.error, mention_user_ids=plan.curator_user_ids), "publish-failed notice", submission_id)
     return PublishOutcome.FAILED
 
 

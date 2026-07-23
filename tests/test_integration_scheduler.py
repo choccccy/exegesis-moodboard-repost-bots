@@ -55,33 +55,33 @@ def _fake_bot():
 # Core publish path
 # ---------------------------------------------------------------------------
 
-async def test_fire_board_calls_publish(session, board):
+async def test_fire_board_calls_publish(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=42)
     session.add(sub)
     await session.flush()
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_awaited_once()
-    # publish_queued_submission(session, settings, submission, destination) - 4 args
-    _, _, submission_arg, _ = mock_pub.await_args.args
-    assert submission_arg.id == sub.id
+    # publish_queued_submission(settings, submission_id, destination) - 3 args
+    _, submission_id_arg, _ = mock_pub.await_args.args
+    assert submission_id_arg == sub.id
 
 
-async def test_fire_board_no_thread_passes_none_destination(session, board):
+async def test_fire_board_no_thread_passes_none_destination(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=99)
     session.add(sub)
     await session.flush()
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
-    _, _, _, destination = mock_pub.await_args.args
+    _, _, destination = mock_pub.await_args.args
     assert destination is None
 
 
-async def test_fire_board_with_thread_fetches_channel(session, board):
+async def test_fire_board_with_thread_fetches_channel(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=55)
     session.add(sub)
     await session.flush()
@@ -99,15 +99,15 @@ async def test_fire_board_with_thread_fetches_channel(session, board):
     bot.fetch_channel = AsyncMock(return_value=fake_channel)
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, bot, _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(bot, _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     bot.fetch_channel.assert_awaited_once_with(9999)
-    _, _, _, destination = mock_pub.await_args.args
+    _, _, destination = mock_pub.await_args.args
     assert isinstance(destination, DiscordNotifier)
     assert destination._channel is fake_channel
 
 
-async def test_fire_board_thread_fetch_failure_still_publishes(session, board):
+async def test_fire_board_thread_fetch_failure_still_publishes(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=77)
     session.add(sub)
     await session.flush()
@@ -120,10 +120,10 @@ async def test_fire_board_thread_fetch_failure_still_publishes(session, board):
     bot.fetch_channel = AsyncMock(side_effect=Exception("unknown channel"))
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, bot, _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(bot, _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_awaited_once()
-    _, _, _, destination = mock_pub.await_args.args
+    _, _, destination = mock_pub.await_args.args
     assert destination is None
 
 
@@ -131,14 +131,14 @@ async def test_fire_board_thread_fetch_failure_still_publishes(session, board):
 # Skip conditions
 # ---------------------------------------------------------------------------
 
-async def test_fire_board_nothing_queued_skips_publish(session, board):
+async def test_fire_board_nothing_queued_skips_publish(session, board, bind_publish_scopes):
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_not_awaited()
 
 
-async def test_fire_board_at_daily_cap_skips_publish(session, board):
+async def test_fire_board_at_daily_cap_skips_publish(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=11)
     session.add(sub)
     await session.flush()
@@ -154,17 +154,17 @@ async def test_fire_board_at_daily_cap_skips_publish(session, board):
     await session.flush()
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_not_awaited()
 
 
-async def test_fire_board_unknown_board_skips_publish(session, board):
+async def test_fire_board_unknown_board_skips_publish(session, board, bind_publish_scopes):
     cfg = _board_cfg(board)
     cfg.discord_channel_id = 99999  # no DB row for this channel
 
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), cfg, _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), cfg, _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_not_awaited()
 
@@ -217,7 +217,7 @@ async def _add_link(session, submission_id, url, canonical_url=None):
     return link
 
 
-async def test_fire_board_continues_past_duplicate_to_real_post(session, board):
+async def test_fire_board_continues_past_duplicate_to_real_post(session, board, bind_publish_scopes):
     """Regression: duplicate cleanups must not consume the scheduler tick.
 
     When the head of the queue is a duplicate, _fire_board must continue and
@@ -253,7 +253,7 @@ async def test_fire_board_continues_past_duplicate_to_real_post(session, board):
     await _add_link(session, sub_c.id, "https://example.com/new-unique")
 
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK_RESULT) as mock_pub:
-        await _fire_board(session, _fake_bot(), settings, _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), settings, _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     # Sub B cleaned up as duplicate (state=PUBLISHED, error mentions duplicate)
     attempt_b = await session.scalar(select(PublishAttempt).where(PublishAttempt.submission_id == sub_b.id))
@@ -267,7 +267,7 @@ async def test_fire_board_continues_past_duplicate_to_real_post(session, board):
     mock_pub.assert_awaited_once()
 
 
-async def test_duplicate_publish_queued_submission_returns_none(session, board):
+async def test_duplicate_publish_queued_submission_returns_none(session, board, bind_publish_scopes):
     """publish_queued_submission returns None for duplicates so _fire_board can loop past them."""
     settings = _full_settings(board)
 
@@ -284,11 +284,11 @@ async def test_duplicate_publish_queued_submission_returns_none(session, board):
     await session.flush()
     await _add_link(session, sub_b.id, "https://example.com/dup")
 
-    result = await publish_queued_submission(session, settings, sub_b, MockDest())
+    result = await publish_queued_submission(settings, sub_b.id, MockDest())
     assert result is PublishOutcome.DUPLICATE, "duplicate cleanup lets the scheduler continue to next"
 
 
-async def test_null_canonical_url_not_treated_as_duplicate(session, board):
+async def test_null_canonical_url_not_treated_as_duplicate(session, board, bind_publish_scopes):
     """Submissions with canonical_url=None must not match each other as duplicates.
 
     NULL == NULL uses IS NULL in SQL, which would incorrectly flag completely
@@ -313,13 +313,13 @@ async def test_null_canonical_url_not_treated_as_duplicate(session, board):
 
     ok = PublishResult(success=True, at_uri="at://did/b", bsky_url="https://bsky.app/b")
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=ok) as mock_pub:
-        result = await publish_queued_submission(session, settings, sub_b, MockDest())
+        result = await publish_queued_submission(settings, sub_b.id, MockDest())
 
     assert result is PublishOutcome.PUBLISHED, "submission with null canonical_url must not be falsely suppressed"
     mock_pub.assert_awaited_once()
 
 
-async def test_suppression_row_does_not_cascade_to_block_next_submission(session, board):
+async def test_suppression_row_does_not_cascade_to_block_next_submission(session, board, bind_publish_scopes):
     """A duplicate-suppression row (success=True, error='duplicate:...') must not cause
     another submission with the same URL to be suppressed if no real publish exists.
 
@@ -348,7 +348,7 @@ async def test_suppression_row_does_not_cascade_to_block_next_submission(session
 
     ok = PublishResult(success=True, at_uri="at://did/b-real", bsky_url="https://bsky.app/b-real")
     with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=ok) as mock_pub:
-        result = await publish_queued_submission(session, settings, sub_b, MockDest())
+        result = await publish_queued_submission(settings, sub_b.id, MockDest())
 
     assert result is PublishOutcome.PUBLISHED, "suppression row must not cascade to suppress a later submission"
     mock_pub.assert_awaited_once()
@@ -366,7 +366,7 @@ async def test_suppression_row_does_not_cascade_to_block_next_submission(session
 # network down) can't burn the whole queue in one tick.
 
 
-async def test_fire_board_failure_falls_through_to_next_item(session, board):
+async def test_fire_board_failure_falls_through_to_next_item(session, board, bind_publish_scopes):
     sub_a = make_submission(board, state=QUEUED, source_discord_message_id=101,
                             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     sub_b = make_submission(board, state=QUEUED, source_discord_message_id=102,
@@ -379,16 +379,16 @@ async def test_fire_board_failure_falls_through_to_next_item(session, board):
         "bot.scheduler.ingest_service.publish_queued_submission",
         new_callable=AsyncMock, side_effect=outcomes,
     ) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     assert mock_pub.await_count == 2, "a failed attempt must fall through to the next queue item"
-    first_sub = mock_pub.await_args_list[0].args[2]
-    second_sub = mock_pub.await_args_list[1].args[2]
-    assert first_sub.id == sub_a.id
-    assert second_sub.id == sub_b.id
+    first_sub = mock_pub.await_args_list[0].args[1]
+    second_sub = mock_pub.await_args_list[1].args[1]
+    assert first_sub == sub_a.id
+    assert second_sub == sub_b.id
 
 
-async def test_fire_board_gives_up_after_failure_budget(session, board):
+async def test_fire_board_gives_up_after_failure_budget(session, board, bind_publish_scopes):
     for i in range(5):
         session.add(make_submission(
             board, state=QUEUED, source_discord_message_id=200 + i,
@@ -400,7 +400,7 @@ async def test_fire_board_gives_up_after_failure_budget(session, board):
         "bot.scheduler.ingest_service.publish_queued_submission",
         new_callable=AsyncMock, return_value=PublishOutcome.FAILED,
     ) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     assert mock_pub.await_count == 3, (
         "a systemic failure must stop after the per-tick failure budget, "
@@ -408,7 +408,7 @@ async def test_fire_board_gives_up_after_failure_budget(session, board):
     )
 
 
-async def test_fire_board_publish_success_ends_tick(session, board):
+async def test_fire_board_publish_success_ends_tick(session, board, bind_publish_scopes):
     sub_a = make_submission(board, state=QUEUED, source_discord_message_id=301,
                             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     sub_b = make_submission(board, state=QUEUED, source_discord_message_id=302,
@@ -420,7 +420,7 @@ async def test_fire_board_publish_success_ends_tick(session, board):
         "bot.scheduler.ingest_service.publish_queued_submission",
         new_callable=AsyncMock, return_value=PublishOutcome.PUBLISHED,
     ) as mock_pub:
-        await _fire_board(session, _fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_awaited_once()
 

@@ -244,32 +244,34 @@ async def _fire_all_boards(bot, settings: Settings, tz: ZoneInfo) -> None:
         if not board_cfg.bluesky_handle:
             continue
         try:
-            async with session_scope() as session:
-                await _fire_board(session, bot, settings, board_cfg, fresh_cutoff, mt_midnight)
+            await _fire_board(bot, settings, board_cfg, fresh_cutoff, mt_midnight)
         except Exception:
             log.exception("queue tick failed for board %s", board_cfg.name)
             await errors_module.record_error("scheduler", f"board {board_cfg.name}")
 
 
 async def _fire_board(
-    session,
     bot,
     settings: Settings,
     board_cfg: BoardConfig,
     fresh_cutoff: datetime,
     mt_midnight: datetime,
 ) -> None:
-    board = await session.scalar(
-        select(Board).where(Board.discord_channel_id == board_cfg.discord_channel_id)
-    )
-    if board is None:
-        log.warning("queue: no DB row for board %s", board_cfg.name)
-        return
+    # Beat 1: read the board's queue state in a short DB scope, then release the
+    # lock. publish_queued_submission does the network publish with no lock held,
+    # so it must be called outside any session_scope (see docs/db-lock-io-refactor.md).
+    async with session_scope() as session:
+        board = await session.scalar(
+            select(Board).where(Board.discord_channel_id == board_cfg.discord_channel_id)
+        )
+        if board is None:
+            log.warning("queue: no DB row for board %s", board_cfg.name)
+            return
+        board_id = board.id
+        today_count = await queue_module.count_posts_today(session, board_id, mt_midnight)
+        queue_size = await queue_module.count_queued_for_board(session, board_id)
 
-    today_count = await queue_module.count_posts_today(session, board.id, mt_midnight)
-    queue_size = await queue_module.count_queued_for_board(session, board.id)
     cap = queue_module.daily_cap(queue_size, settings)
-
     if today_count >= cap:
         log.info("queue: board %s at daily cap (%d/%d, %d queued)", board_cfg.name, today_count, cap, queue_size)
         return
@@ -279,40 +281,45 @@ async def _fire_board(
     skip_ids: set[int] = set()
     failed_attempts = 0
     for _ in range(_MAX_SKIP_TRIES):
-        submission = await queue_module.pick_next_for_board(
-            session, board.id, fresh_cutoff, skip_ids=frozenset(skip_ids)
-        )
-        if submission is None:
-            log.debug("queue: board %s nothing queued", board_cfg.name)
-            return
+        # Short DB scope: pick the next candidate and note its thread mapping.
+        async with session_scope() as session:
+            submission = await queue_module.pick_next_for_board(
+                session, board_id, fresh_cutoff, skip_ids=frozenset(skip_ids)
+            )
+            if submission is None:
+                log.debug("queue: board %s nothing queued", board_cfg.name)
+                return
+            submission_id = submission.id
+            thread_row = await session.scalar(
+                select(SubmissionThread).where(
+                    SubmissionThread.board_id == submission.board_id,
+                    SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+                )
+            )
+            thread_id = thread_row.thread_id if thread_row is not None else None
 
         log.info(
             "queue: board %s publishing submission %s (%d/%d today, %d queued)",
-            board_cfg.name, submission.id, today_count + 1, cap, queue_size,
+            board_cfg.name, submission_id, today_count + 1, cap, queue_size,
         )
 
+        # Resolve the thread channel (Discord I/O) with the lock released.
         destination = None
-        thread_row = await session.scalar(
-            select(SubmissionThread).where(
-                SubmissionThread.board_id == submission.board_id,
-                SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
-            )
-        )
-        if thread_row is not None:
+        if thread_id is not None:
             try:
-                channel = await bot.fetch_channel(thread_row.thread_id)
+                channel = await bot.fetch_channel(thread_id)
                 destination = DiscordNotifier(channel)
             except Exception as exc:
                 log.warning(
                     "queue: could not resolve thread for submission %s: %s - publishing silently",
-                    submission.id, exc,
+                    submission_id, exc,
                 )
 
-        outcome = await ingest_service.publish_queued_submission(session, settings, submission, destination)
+        outcome = await ingest_service.publish_queued_submission(settings, submission_id, destination)
         if outcome is PublishOutcome.PUBLISHED:
             return  # posted - the tick is spent
 
-        skip_ids.add(submission.id)
+        skip_ids.add(submission_id)
         if outcome is PublishOutcome.FAILED:
             # Fall through to the next item so one permanently-failing submission
             # can't starve the board, but bound the damage: a systemic failure
@@ -327,17 +334,17 @@ async def _fire_board(
                 return
             log.info(
                 "queue: board %s submission %s failed to publish, trying next in queue (%d/%d failures this tick)",
-                board_cfg.name, submission.id, failed_attempts, _MAX_FAILED_ATTEMPTS_PER_TICK,
+                board_cfg.name, submission_id, failed_attempts, _MAX_FAILED_ATTEMPTS_PER_TICK,
             )
         elif outcome is PublishOutcome.DUPLICATE:
             log.info(
                 "queue: board %s submission %s was a duplicate, trying next in queue",
-                board_cfg.name, submission.id,
+                board_cfg.name, submission_id,
             )
         else:  # DEFERRED
             log.info(
                 "queue: board %s submission %s deferred (parent not published), trying next",
-                board_cfg.name, submission.id,
+                board_cfg.name, submission_id,
             )
 
     log.info("queue: board %s hit skip limit (%d) - deferreds/duplicates blocking queue", board_cfg.name, _MAX_SKIP_TRIES)

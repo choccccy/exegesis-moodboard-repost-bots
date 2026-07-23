@@ -231,7 +231,7 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board):
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session, board):
+async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session, board, bind_publish_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=SubmissionState.QUEUED.value,
                           source_discord_message_id=next(_ids))
@@ -256,7 +256,7 @@ async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session,
     bot = MagicMock()
     bot.fetch_channel = AsyncMock(side_effect=Exception("no thread"))
     with _patched_client(fake):
-        await _fire_board(session, bot, settings, board_cfg,
+        await _fire_board(bot, settings, board_cfg,
                           now - timedelta(hours=72), now - timedelta(hours=1))
 
     await session.flush()
@@ -276,7 +276,7 @@ async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session,
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_bot):
+async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_bot, bind_publish_scopes):
     from conftest import bound_session_scope, make_interaction
 
     settings = _settings(board)
@@ -316,7 +316,7 @@ async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_b
     # And the queued submission publishes for real on the next tick.
     fake = _fake_client()
     with _patched_client(fake):
-        outcome = await publish_queued_submission(session, settings, sub, None)
+        outcome = await publish_queued_submission(settings, sub.id, None)
     assert outcome is PublishOutcome.PUBLISHED
     await session.flush()
     assert sub.state == SubmissionState.PUBLISHED.value
@@ -327,7 +327,7 @@ async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_b
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path):
+async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path, bind_publish_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=SubmissionState.QUEUED.value,
                           source_discord_message_id=next(_ids))
@@ -375,7 +375,7 @@ async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path):
     fake.com.atproto.repo.create_record = AsyncMock(side_effect=_create)
 
     with _patched_client(fake):
-        outcome = await publish_queued_submission(session, settings, sub, None)
+        outcome = await publish_queued_submission(settings, sub.id, None)
 
     assert outcome is PublishOutcome.PUBLISHED
     calls = fake.com.atproto.repo.create_record.call_args_list
@@ -402,7 +402,7 @@ async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_parent_reply_deferral_then_reply_publish(session, board):
+async def test_e2e_parent_reply_deferral_then_reply_publish(session, board, bind_publish_scopes):
     settings = _settings(board)
     parent_msg_id = next(_ids)
 
@@ -435,7 +435,7 @@ async def test_e2e_parent_reply_deferral_then_reply_publish(session, board):
     # Tick 1: child is older so it's picked first, defers (parent unpublished),
     # scheduler falls through and publishes the parent instead.
     with _patched_client(fake):
-        await _fire_board(session, bot, settings, board_cfg,
+        await _fire_board(bot, settings, board_cfg,
                           now - timedelta(hours=72), now - timedelta(hours=1))
     await session.flush()
     assert parent.state == SubmissionState.PUBLISHED.value
@@ -448,7 +448,7 @@ async def test_e2e_parent_reply_deferral_then_reply_publish(session, board):
     # Tick 2 (cap allows another): child now publishes as a reply to the parent.
     fake2 = _fake_client()
     with _patched_client(fake2):
-        outcome = await publish_queued_submission(session, settings, child, None)
+        outcome = await publish_queued_submission(settings, child.id, None)
     assert outcome is PublishOutcome.PUBLISHED
     child_record = _record_of(fake2.com.atproto.repo.create_record.call_args)
     assert child_record.reply is not None

@@ -472,7 +472,7 @@ async def test_queue_dispatcher_stop_during_wait_breaks_before_tick():
 # ---------------------------------------------------------------------------
 
 
-async def test_fire_board_hits_skip_limit_on_endless_duplicates(session, board, caplog):
+async def test_fire_board_hits_skip_limit_on_endless_duplicates(session, board, caplog, bind_publish_scopes):
     from datetime import datetime, timedelta, timezone
 
     from bot.scheduler import _fire_board
@@ -501,7 +501,7 @@ async def test_fire_board_hits_skip_limit_on_endless_duplicates(session, board, 
     ) as mock_pub:
         with caplog.at_level(logging.INFO, logger="bot.scheduler"):
             await _fire_board(
-                session, MagicMock(), fake_settings, cfg,
+                MagicMock(), fake_settings, cfg,
                 now - timedelta(hours=72), now.replace(hour=0),
             )
 
@@ -537,7 +537,8 @@ async def test_fire_all_boards_skips_boards_without_handle(session):
         await _fire_all_boards(MagicMock(), settings, ZoneInfo("UTC"))
 
     mock_fire.assert_awaited_once()
-    assert mock_fire.await_args.args[3] is with_handle
+    # _fire_board(bot, settings, board_cfg, fresh_cutoff, mt_midnight): board_cfg is arg 2
+    assert mock_fire.await_args.args[2] is with_handle
 
 
 async def test_fire_all_boards_records_error_on_board_failure(session, caplog):

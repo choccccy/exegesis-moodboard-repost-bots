@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import itertools
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -16,6 +17,69 @@ from bot.models import Base, Board, Submission
 from bot.state import GraphicStatus, SubmissionState
 
 _msg_id = itertools.count(10_000)
+
+
+# ---------------------------------------------------------------------------
+# DB-lock invariant harness (see docs/db-lock-io-refactor.md)
+#
+# The bot's responsiveness bug is that network / Discord I/O runs while the
+# global SQLite write lock is held. These helpers let a test assert the
+# invariant "no I/O is awaited under the DB lock" and pin it through the
+# refactor. `db_lock_held` is a ContextVar, so it answers "is the CURRENT task
+# holding the lock?" - which is exactly right, because the offending I/O is
+# awaited within the same task that holds the lock.
+# ---------------------------------------------------------------------------
+
+db_lock_held: contextvars.ContextVar[bool] = contextvars.ContextVar("db_lock_held", default=False)
+
+
+class InstrumentedLock:
+    """Drop-in for bot.db._db_lock that flips `db_lock_held` while held.
+
+    asyncio.Lock is not reentrant, so there is only ever one holder at a time
+    and a single per-instance reset token is safe.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._token: contextvars.Token | None = None
+
+    async def __aenter__(self) -> "InstrumentedLock":
+        await self._lock.acquire()
+        self._token = db_lock_held.set(True)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._token is not None:
+            db_lock_held.reset(self._token)
+            self._token = None
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
+def record_if_under_lock(where: str, violations: list[str]) -> None:
+    """Append `where` to `violations` if called while holding the DB lock.
+
+    I/O stubs call this instead of raising, because the production code wraps
+    its network calls in broad try/except and would swallow a raised assertion.
+    """
+    if db_lock_held.get():
+        violations.append(where)
+
+
+@pytest_asyncio.fixture
+async def lock_probe(global_engine):
+    """`global_engine` with the DB lock swapped for an InstrumentedLock.
+
+    Yields the `db_lock_held` ContextVar. global_engine restores the saved
+    `_db_lock` on teardown, so no extra cleanup is needed here.
+    """
+    import bot.db as db
+
+    db._db_lock = InstrumentedLock()
+    yield db_lock_held
 
 
 @pytest_asyncio.fixture
@@ -120,6 +184,23 @@ def bound_session_scope(session):
         await session.flush()
 
     return _scope
+
+
+@pytest.fixture
+def bind_publish_scopes(session):
+    """Bind the self-managing publish path's internal `session_scope()` to the test
+    `session`, for tests that use the in-memory `session` fixture.
+
+    `publish_queued_submission` and the scheduler's `_fire_board` became
+    self-managing (they open their own short DB scopes so network/Discord I/O
+    happens with the lock released - see docs/db-lock-io-refactor.md). This fixture
+    points those internal scopes at the test session so seeding and assertions on
+    `session` continue to work.
+    """
+    scope = bound_session_scope(session)
+    with patch("bot.discord_ingest.service.session_scope", scope), \
+         patch("bot.scheduler.session_scope", scope):
+        yield session
 
 
 def make_one_shot_wait_for(stop: asyncio.Event):

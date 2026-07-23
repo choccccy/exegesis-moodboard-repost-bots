@@ -22,8 +22,8 @@ from bot.config import BoardConfig
 from bot.discord_ingest import replies
 from bot.discord_ingest.service import (
     _apply_answer,
-    _attempt_publish,
     _build_post_preview,
+    _find_publish_time_duplicate,
     _curator_authorized,
     _determine_kind,
     _discord_file_for_attachment,
@@ -1022,14 +1022,14 @@ async def test_recompute_from_reply_updated_notice_failure_still_archives(sessio
 # ---------------------------------------------------------------------------
 
 
-async def test_attempt_publish_no_board_handle_fails(session, board):
+async def test_attempt_publish_no_board_handle_fails(session, board, bind_publish_scopes):
     settings = MagicMock()
     settings.board_for_channel.return_value = None
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
     await session.flush()
 
-    result = await publish_queued_submission(session, settings, sub, RaisingDest())
+    result = await publish_queued_submission(settings, sub.id, RaisingDest())
 
     assert result is PublishOutcome.FAILED
     assert sub.state == SubmissionState.PUBLISH_FAILED.value
@@ -1037,13 +1037,13 @@ async def test_attempt_publish_no_board_handle_fails(session, board):
     assert "no Bluesky handle" in attempt.error
 
 
-async def test_attempt_publish_no_password_notice_failure_swallowed(session, board):
+async def test_attempt_publish_no_password_notice_failure_swallowed(session, board, bind_publish_scopes):
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
     await session.flush()
 
     result = await publish_queued_submission(
-        session, _svc_settings(board, password=None), sub, RaisingDest()
+        _svc_settings(board, password=None), sub.id, RaisingDest()
     )
 
     assert result is PublishOutcome.FAILED
@@ -1051,24 +1051,21 @@ async def test_attempt_publish_no_password_notice_failure_swallowed(session, boa
     assert "no app password" in attempt.error
 
 
-async def test_attempt_publish_skips_null_canonical_link(session, board):
+async def test_find_publish_time_duplicate_skips_null_canonical_link(session, board):
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
     await session.flush()
-    # In-memory only: a null canonical URL must not join against other nulls.
+    # canonical_url is NOT NULL in the schema, so this state can't occur via the DB;
+    # the in-memory link exercises the defensive guard that skips null canonical_urls
+    # in the dup check (so a null wouldn't SQL-join against other nulls).
     link = SubmissionLink(
         submission_id=sub.id, order_index=0, raw_url="raw-only",
         canonical_url=None, domain_family="other",
     )
-    ok = PublishResult(
-        success=True, at_uri="at://did/new", at_cid="c", bsky_url="https://bsky.app/new",
-    )
 
-    with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=ok) as mock_pub:
-        result = await _attempt_publish(session, _svc_settings(board), sub, [], [link], MockDest())
+    dup = await _find_publish_time_duplicate(session, sub, [link])
 
-    assert result is PublishOutcome.PUBLISHED
-    mock_pub.assert_awaited_once()
+    assert dup is None
 
 
 # ---------------------------------------------------------------------------

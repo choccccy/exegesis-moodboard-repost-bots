@@ -154,7 +154,7 @@ _FAIL_RESULT = PublishResult(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_external_link_published(session, board):
+async def test_e2e_external_link_published(session, board, bind_publish_scopes):
     """A Discord message with a URL flows to a successful Bluesky external post."""
     settings = _settings(board)
     msg, _ = _discord_message(board, content="https://example.com/cool-robot")
@@ -190,7 +190,7 @@ async def test_e2e_external_link_published(session, board):
 
         # Step 4: publish
         dest = MockDest()
-        published = await publish_queued_submission(session, settings, submission, dest)
+        published = await publish_queued_submission(settings, submission.id, dest)
 
     # --- assertions ---
     assert published is PublishOutcome.PUBLISHED
@@ -230,7 +230,7 @@ async def test_e2e_external_link_published(session, board):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_image_attachment_published(session, board):
+async def test_e2e_image_attachment_published(session, board, bind_publish_scopes):
     """A Discord message with an image attachment flows to a Bluesky images post."""
     settings = _settings(board)
     att = _discord_attachment(att_id=77, filename="robot.jpg", description="A chrome robot")
@@ -268,7 +268,7 @@ async def test_e2e_image_attachment_published(session, board):
         await session.flush()
 
         dest = MockDest()
-        published = await publish_queued_submission(session, settings, submission, dest)
+        published = await publish_queued_submission(settings, submission.id, dest)
 
     assert published is PublishOutcome.PUBLISHED
     mock_pub.assert_awaited_once()
@@ -288,7 +288,7 @@ async def test_e2e_image_attachment_published(session, board):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_publish_failure_recorded(session, board):
+async def test_e2e_publish_failure_recorded(session, board, bind_publish_scopes):
     """When Bluesky returns an error, state becomes PUBLISH_FAILED and the error is saved."""
     settings = _settings(board)
     msg, _ = _discord_message(board)
@@ -306,7 +306,7 @@ async def test_e2e_publish_failure_recorded(session, board):
         await session.flush()
 
         dest = MockDest()
-        published = await publish_queued_submission(session, settings, submission, dest)
+        published = await publish_queued_submission(settings, submission.id, dest)
 
     assert published is PublishOutcome.FAILED  # real attempt was made and failed
 
@@ -363,7 +363,7 @@ async def test_e2e_embed_metadata_captured(session, board):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_duplicate_url_aborts_publish(session, board):
+async def test_e2e_duplicate_url_aborts_publish(session, board, bind_publish_scopes):
     """If the URL was already published by another submission, publish is skipped."""
     settings = _settings(board)
 
@@ -411,7 +411,7 @@ async def test_e2e_duplicate_url_aborts_publish(session, board):
 
     dest = MockDest()
     with patch("bot.publish.publish_submission", new_callable=AsyncMock) as mock_pub:
-        result = await publish_queued_submission(session, settings, sub2, dest)
+        result = await publish_queued_submission(settings, sub2.id, dest)
 
     # Bluesky should NOT have been called - duplicate detected before publish
     assert result is PublishOutcome.DUPLICATE, "duplicate cleanup lets the scheduler continue to next"
