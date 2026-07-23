@@ -6,6 +6,7 @@ M3: native Bluesky reposts and multi-link reply threads.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import mimetypes
@@ -50,6 +51,32 @@ class PublishResult:
     bsky_root_cid: str | None = None
 
 
+# createSession occasionally drops the connection or times out on Bluesky's side.
+# A couple of quick in-process retries absorb those transient blips so a submission
+# doesn't have to wait for the next hourly queue slot to try again.
+_LOGIN_ATTEMPTS = 3
+_LOGIN_BACKOFF_SECONDS = (1.0, 3.0)  # waits between attempts 1->2 and 2->3
+
+
+async def _login_with_retries(client: AsyncClient, handle: str, password: str) -> Exception | None:
+    """Log in, retrying a few times on transient failure. Returns None on success,
+    or the last exception if every attempt failed."""
+    last_exc: Exception | None = None
+    for attempt in range(_LOGIN_ATTEMPTS):
+        try:
+            await client.login(handle, password)
+            return None
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _LOGIN_ATTEMPTS - 1:
+                log.warning(
+                    "Bluesky login attempt %d/%d failed (%s), retrying",
+                    attempt + 1, _LOGIN_ATTEMPTS, _error_detail(exc),
+                )
+                await asyncio.sleep(_LOGIN_BACKOFF_SECONDS[attempt])
+    return last_exc
+
+
 async def publish_submission(
     submission: Submission,
     links: list[SubmissionLink],
@@ -67,11 +94,10 @@ async def publish_submission(
         return PublishResult(success=False, error="no bluesky_handle configured for board")
 
     client = AsyncClient()
-    try:
-        await client.login(board_cfg.bluesky_handle, password)
-    except Exception as exc:
-        log.error("Bluesky login failed for board %s: %s", board_cfg.name, exc)
-        return PublishResult(success=False, error=f"login failed: {exc}")
+    login_exc = await _login_with_retries(client, board_cfg.bluesky_handle, password)
+    if login_exc is not None:
+        log.error("Bluesky login failed for board %s: %s", board_cfg.name, _error_detail(login_exc))
+        return PublishResult(success=False, error=f"login failed: {_error_detail(login_exc)}")
 
     has_uploaded_images = any(a.is_image for a in attachments)
     has_uploaded_video = any(a.is_video for a in attachments)

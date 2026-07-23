@@ -21,6 +21,7 @@ from bot.publish import (
     _build_labels,
     _create_post,
     _determine_kind,
+    _login_with_retries,
     _post_text_and_facets,
     _publish_external,
     _publish_images,
@@ -920,3 +921,57 @@ async def test_publish_submission_single_link_no_reply_posts():
 def test_at_uri_to_url_repost_record_returns_at_uri():
     repost_uri = "at://did:plc:abc/app.bsky.feed.repost/rp1"
     assert at_uri_to_url(repost_uri) == repost_uri
+
+
+# ---------------------------------------------------------------------------
+# _login_with_retries - transient login failures are retried
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_login_succeeds_first_try_no_sleep():
+    client = MagicMock()
+    client.login = AsyncMock()
+    with patch("bot.publish.asyncio.sleep", new=AsyncMock()) as sleep:
+        exc = await _login_with_retries(client, "handle", "pw")
+    assert exc is None
+    assert client.login.await_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_login_retries_then_succeeds():
+    client = MagicMock()
+    client.login = AsyncMock(side_effect=[ConnectionError(), None])
+    with patch("bot.publish.asyncio.sleep", new=AsyncMock()) as sleep:
+        exc = await _login_with_retries(client, "handle", "pw")
+    assert exc is None
+    assert client.login.await_count == 2
+    assert sleep.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_login_returns_last_exception_after_exhausting_retries():
+    boom = ConnectionError("boom")
+    client = MagicMock()
+    client.login = AsyncMock(side_effect=boom)
+    with patch("bot.publish.asyncio.sleep", new=AsyncMock()) as sleep:
+        exc = await _login_with_retries(client, "handle", "pw")
+    assert exc is boom
+    assert client.login.await_count == 3
+    assert sleep.await_count == 2  # slept between each of the 3 attempts
+
+
+@pytest.mark.asyncio
+async def test_publish_submission_reports_exception_type_on_login_failure():
+    board = _board()
+    sub = _submission()
+    link = _link(canonical_url="https://example.com/x", domain_family="generic")
+    with patch("bot.publish.AsyncClient") as MockClient, \
+            patch("bot.publish.asyncio.sleep", new=AsyncMock()):
+        client = MagicMock()
+        client.login = AsyncMock(side_effect=TimeoutError(""))  # str() is empty
+        MockClient.return_value = client
+        result = await publish_submission(sub, [link], [], board, "pw")
+    assert result.success is False
+    # The empty str(exc) would have left a bare "login failed:"; the type name fills it in.
+    assert "TimeoutError" in result.error

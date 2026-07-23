@@ -251,8 +251,12 @@ def queue_blocked_notice(gaps: str) -> str:
 def publish_failed_notice(error: str | None, mention_user_ids: list[int] | None = None) -> str:
     mentions = " ".join(f"<@{uid}>" for uid in (mention_user_ids or []))
     prefix = f"{mentions} " if mentions else ""
+    # Error in a fenced code block so it's easy to select and copy, and so any
+    # backticks/markdown in the message render literally rather than as formatting.
+    detail = (error or "unknown error").replace("```", "``​`")
     return (
-        f"{prefix}⚠️ publish failed: {error or 'unknown error'}\n"
+        f"{prefix}⚠️ publish failed:\n"
+        f"```\n{detail}\n```\n"
         "will retry automatically at the next available queue slot"
     )
 

@@ -268,7 +268,7 @@ wheels = [
 
 [[package]]
 name = "bluesky-repost-bot"
-version = "1.10.3"
+version = "1.11.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },

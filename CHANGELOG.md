@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Bluesky reposts failing permanently with "Unable to resolve handle" when a source account renamed or deactivated its handle between submission and publish: publishing now prefers the pinned DID and only falls back to live handle resolution for legacy rows
+- Transient Bluesky login failures no longer waste a queue slot: `client.login` now retries a few times with short backoff before giving up, so a momentary connection drop or timeout to `createSession` is absorbed in-process instead of deferring the submission to the next hourly tick
+- Publish-failure reports now include the exception type (e.g. `login failed: ConnectTimeout`) instead of a blank when the underlying error stringifies to nothing, and the error is shown in a copyable Discord code block
 
 ## [1.0.0] - 2026-06-23
 
