@@ -227,23 +227,15 @@ async def _seed_ready_with_stale_conf(session, board, *, bot_message_id):
 
 async def test_recompute_retracts_stale_confirmation_on_regression(session, board):
     """Regression out of ready: the open ConfirmationRequest is dropped and its button is
-    tombstoned via make_disabled_view so a stale click can't queue a submission with a gap."""
-    from unittest.mock import AsyncMock, MagicMock
-
+    tombstoned (surface.disable_components) so a stale click can't queue a gapped submission."""
     sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4242)
 
-    conf_msg = MagicMock()
-    conf_msg.edit = AsyncMock()
     dest = MockDest()
-    dest.fetch_message = AsyncMock(return_value=conf_msg)
-
     state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
 
     assert state == SubmissionState.AWAITING_ALT_TEXT
     assert await _count(session, ConfirmationRequest, sub.id) == 0  # stale row dropped
-    dest.fetch_message.assert_awaited_once_with(4242)
-    conf_msg.edit.assert_awaited_once()
-    assert conf_msg.edit.call_args.kwargs.get("view") is not None  # disabled view applied
+    assert (4242, "Not ready - see checklist") in dest.disabled  # button tombstoned
 
 
 async def test_recompute_regression_without_fetch_message_still_drops_row(session, board):
@@ -398,11 +390,8 @@ async def test_recompute_reposts_confirmation_when_discord_message_deleted(sessi
     session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=99999))
     await session.flush()
 
-    class _DeletedConfDest(MockDest):
-        async def fetch_message(self, message_id: int):
-            raise discord.NotFound(MagicMock(), "Unknown Message")
-
-    dest = _DeletedConfDest()
+    dest = MockDest()
+    dest.missing_message_ids = {99999}  # surface.message_exists reports it deleted
     await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
 
     # Stale row must be replaced by a fresh one pointing to a new Discord message.

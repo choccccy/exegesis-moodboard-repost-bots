@@ -13,13 +13,13 @@ from sqlalchemy import select
 
 from bot.config import BoardConfig
 from bot.discord_ingest import service
+from bot.discord_ingest.discord_notifier import DiscordSurface
 from bot.discord_ingest.service import (
     handle_source_note_confirm,
     handle_source_note_reject,
     recompute_and_request,
     skip_all_alt_text,
     waive_source,
-    _edit_status_message,
     render_submission_status,
 )
 from bot.models import Attachment, AttachmentAltTextRequest, SourceRequest, SubmissionLink
@@ -398,29 +398,30 @@ async def test_render_submission_status_queued_terminal(session, board):
     assert "Queued" in out
 
 
-# --- _edit_status_message edge cases ----------------------------------------
+# --- DiscordSurface.edit_or_none edge cases (the checklist upsert semantics) ---
 
 
-async def test_edit_status_message_no_getter_returns_false():
-    dest = MagicMock(spec=[])  # no get_partial_message
-    assert await _edit_status_message(dest, 1, "content", None) is False
-
-
-async def test_edit_status_message_not_found_returns_false():
-    dest = MagicMock()
+def _surface_with_edit(side_effect=None) -> DiscordSurface:
+    channel = MagicMock()
     partial = MagicMock()
-    partial.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
-    dest.get_partial_message = MagicMock(return_value=partial)
-    assert await _edit_status_message(dest, 1, "content", None) is False
+    partial.edit = AsyncMock(side_effect=side_effect)
+    channel.get_partial_message = MagicMock(return_value=partial)
+    return DiscordSurface(channel)
 
 
-async def test_edit_status_message_http_error_returns_true():
-    dest = MagicMock()
-    partial = MagicMock()
-    partial.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-    dest.get_partial_message = MagicMock(return_value=partial)
+async def test_edit_or_none_success_returns_true():
+    assert await _surface_with_edit().edit_or_none(1, "content") is True
+
+
+async def test_edit_or_none_not_found_returns_false():
+    surface = _surface_with_edit(discord.NotFound(MagicMock(), "gone"))
+    assert await surface.edit_or_none(1, "content") is False  # deleted -> caller reposts
+
+
+async def test_edit_or_none_http_error_returns_true():
+    surface = _surface_with_edit(discord.HTTPException(MagicMock(), "boom"))
     # A transient edit error is swallowed (True = handled, don't respawn).
-    assert await _edit_status_message(dest, 1, "content", None) is True
+    assert await surface.edit_or_none(1, "content") is True
 
 
 class _SendOnlyDest:
@@ -430,13 +431,16 @@ class _SendOnlyDest:
     def __init__(self):
         self.sent: list[str] = []
 
-    async def send(self, content=None, **kw):
+    async def send(self, content=None, *, components=None, preview=None, **kw):
         self.sent.append(content or "")
         m = MagicMock()
         m.id = next(_ids)
         return m
 
-    async def archive(self, notice):
+    async def edit_or_none(self, message_id, content, components=None) -> bool:
+        return False  # can't edit -> caller sends fresh
+
+    async def archive(self, notice=None):
         pass
 
 

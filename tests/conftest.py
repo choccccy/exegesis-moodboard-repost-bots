@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import contextvars
 import itertools
+import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -148,6 +149,10 @@ class MockDest:
         self.missing_message_ids: set[int] = set()
 
     async def send(self, content=None, *, components=None, preview=None, **kwargs):
+        # Mirror render_preview: building a preview for a missing file raises, so the
+        # caller's URL-fallback path is exercised just as with the real DiscordSurface.
+        if preview is not None and not os.path.exists(preview.local_path):
+            raise FileNotFoundError(preview.local_path)
         self.sent.append(content or "")
         self.components.append(list(components) if components else [])
         self.previews.append(preview)

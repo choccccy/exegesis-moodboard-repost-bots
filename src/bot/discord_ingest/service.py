@@ -64,11 +64,13 @@ from ..state import (
     evaluate_state,
     missing_gaps,
 )
-from ..notifier import NullNotifier, Notifier
+from ..notifier import NullNotifier, Notifier, Surface
 from ..ingest.types import InboundAttachment, InboundMessage
-from . import replies, views
+from . import prompts, replies, views
 from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
+from .discord_notifier import DiscordSurface
 from .urls import extract_urls
+from ..components import PreviewImage
 from ..db import session_scope
 
 log = logging.getLogger(__name__)
@@ -2559,32 +2561,14 @@ async def _upsert_status_checklist(
     """
     content = replies.status_checklist(snap, ready=ready, source_domain=source_domain)
     try:
-        if submission.status_message_id is not None and await _edit_status_message(
-            destination, submission.status_message_id, content, None
+        if submission.status_message_id is not None and await destination.edit_or_none(
+            submission.status_message_id, content
         ):
             return
         msg = await destination.send(content)
         submission.status_message_id = msg.id
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.warning("could not upsert status checklist for submission %s: %s", submission.id, exc)
-
-
-async def _edit_status_message(destination, message_id: int, content: str, view) -> bool:
-    """Edit the checklist message in place via the channel's partial-message API.
-
-    Returns True if the message was handled (edited, or a transient edit error that
-    shouldn't respawn it), False if the destination can't edit (caller sends fresh).
-    """
-    getter = getattr(destination, "get_partial_message", None)
-    if getter is None:
-        return False
-    try:
-        await getter(message_id).edit(content=content, view=view)
-    except discord.NotFound:
-        return False  # message was deleted - let the caller repost it
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.warning("could not edit status message %s: %s", message_id, exc)
-    return True
 
 
 async def _has_open_request(session: AsyncSession, model, submission_id: int, **extra) -> bool:
@@ -2859,12 +2843,25 @@ def _queue_action(old_state: str, evaluated: SubmissionState) -> str:
     return "fresh"
 
 
+def _ensure_surface(destination) -> Surface:
+    """Normalize a recompute/handler ``destination`` to a Surface.
+
+    A raw Discord channel/thread is wrapped in a DiscordSurface; anything that is
+    already a Surface (DiscordSurface, NullSurface, or a test fake) is passed through.
+    Lets callers keep handing recompute a live channel during the migration while the
+    core only ever talks to the port.
+    """
+    if isinstance(destination, discord.abc.Messageable):
+        return DiscordSurface(destination)
+    return destination
+
+
 async def recompute_and_request(
     session: AsyncSession,
     submission: Submission,
     *,
     settings: Settings,
-    destination: Notifier,
+    destination: Surface,
     yt_client=None,
     bot_id: int | None = None,
     from_reply: bool = False,
@@ -2873,6 +2870,7 @@ async def recompute_and_request(
 
     All procedural messages go into ``destination`` (the submission's thread).
     """
+    destination = _ensure_surface(destination)
     old_state = submission.state
     snap, atts, links = await _snapshot(session, submission)
     new_state = evaluate_state(snap)
@@ -2890,7 +2888,7 @@ async def recompute_and_request(
         try:
             msg = await destination.send(
                 replies.cancel_request(),
-                view=views.make_cancel_view(submission.id),
+                components=prompts.cancel_components(submission.id),
             )
             session.add(CancellationRequest(
                 submission_id=submission.id,
@@ -2950,7 +2948,7 @@ async def recompute_and_request(
         try:
             msg = await destination.send(
                 replies.metadata_request(url),
-                view=views.make_metadata_confirm_view(submission.id),
+                components=prompts.metadata_confirm_components(submission.id),
             )
             session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
         except (discord.Forbidden, discord.HTTPException) as exc:
@@ -2979,8 +2977,10 @@ async def recompute_and_request(
             try:
                 if att.local_path and att.is_image:
                     try:
-                        file = _discord_file_for_attachment(att.local_path, att.filename)
-                        msg = await destination.send(replies.alt_text_request(att.filename), file=file)
+                        msg = await destination.send(
+                            replies.alt_text_request(att.filename),
+                            preview=PreviewImage(local_path=att.local_path, filename=att.filename),
+                        )
                     except Exception as exc:
                         log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
                         msg = await destination.send(
@@ -3007,7 +3007,7 @@ async def recompute_and_request(
         try:
             msg = await destination.send(
                 replies.graphic_request(),
-                view=views.make_graphic_view(submission.id),
+                components=prompts.graphic_components(submission.id),
             )
             session.add(
                 ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
@@ -3037,15 +3037,11 @@ async def recompute_and_request(
             )
         )
         if stale_conf is not None:
-            fetch_message = getattr(destination, "fetch_message", None)
-            if fetch_message is not None:
-                try:
-                    conf_msg = await fetch_message(stale_conf.bot_message_id)
-                    await conf_msg.edit(view=views.make_disabled_view("Not ready - see checklist"))
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    # NotFound (deleted message) is a subclass of HTTPException; either way the
-                    # button is gone/unreachable and dropping the DB row below is enough.
-                    log.debug("could not tombstone stale confirmation for submission %s: %s", submission.id, exc)
+            # Best-effort tombstone; NotFound/errors are swallowed by the adapter, and
+            # dropping the DB row below is enough regardless.
+            await destination.disable_components(
+                stale_conf.bot_message_id, "Not ready - see checklist"
+            )
             await session.delete(stale_conf)
             await session.flush()
 
@@ -3076,22 +3072,16 @@ async def recompute_and_request(
                 await session.flush()
                 has_conf = False
             else:
-                # Otherwise verify the Discord message still exists; if it was deleted,
-                # clean up the stale row so the confirmation gets reposted below.
-                fetch_message = getattr(destination, "fetch_message", None)
-                if fetch_message is not None:
-                    try:
-                        await fetch_message(existing_conf.bot_message_id)
-                    except discord.NotFound:
-                        log.warning(
-                            "confirmation message %s for submission %s was deleted; reposting",
-                            existing_conf.bot_message_id, submission.id,
-                        )
-                        await session.delete(existing_conf)
-                        await session.flush()
-                        has_conf = False
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass  # cannot verify; assume it exists
+                # Otherwise verify the message still exists; if it was deleted, clean up
+                # the stale row so the confirmation gets reposted below.
+                if not await destination.message_exists(existing_conf.bot_message_id):
+                    log.warning(
+                        "confirmation message %s for submission %s was deleted; reposting",
+                        existing_conf.bot_message_id, submission.id,
+                    )
+                    await session.delete(existing_conf)
+                    await session.flush()
+                    has_conf = False
 
         if not has_conf:
             try:
@@ -3110,7 +3100,7 @@ async def recompute_and_request(
                         bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
                         youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
                     ),
-                    view=views.make_confirm_view(submission.id, media_count=media_count),
+                    components=prompts.confirm_components(submission.id, media_count=media_count),
                 )
                 session.add(ConfirmationRequest(
                     submission_id=submission.id,
