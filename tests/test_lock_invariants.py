@@ -176,12 +176,10 @@ def _recording_http(violations: list[str]) -> AsyncMock:
     return client
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="handle_reaction resolves links and creates the thread under the DB "
-           "lock today; flips to pass once refactored per docs/db-lock-io-refactor.md",
-)
-async def test_handle_reaction_does_no_io_under_db_lock(lock_probe):
+async def _run_handle_reaction_under_probe() -> list[str]:
+    """Drive a real handle_reaction against the instrumented lock, returning the
+    list of I/O boundaries that were crossed while the DB lock was held. Called
+    WITHOUT an outer session_scope - handle_reaction is self-managing now."""
     async with db.session_scope() as s:
         s.add(Board(name="robots", discord_guild_id=1, discord_channel_id=100))
 
@@ -191,16 +189,39 @@ async def test_handle_reaction_does_no_io_under_db_lock(lock_probe):
     http = _recording_http(violations)
     settings = make_test_settings(dashboard_url=None)
 
-    async with db.session_scope() as session:
-        await handle_reaction(
-            session,
-            settings=settings,
-            message=msg,
-            http_client=http,
-            skip_auth=True,
-            bot_id=123,
-        )
+    await handle_reaction(
+        settings=settings, message=msg, http_client=http, skip_auth=True, bot_id=123,
+    )
+    return violations
 
+
+async def test_handle_reaction_thread_creation_not_under_db_lock(lock_probe):
+    # Slice A (docs/db-lock-io-refactor.md): thread creation - the rate-limited,
+    # up-to-15s call that dominates storm-time lock contention - now runs with the
+    # lock released. (recompute's sends are Slice C, covered by the broad xfail below.)
+    violations = await _run_handle_reaction_under_probe()
+    assert "create_thread" not in violations, f"create_thread ran under the DB lock: {violations}"
+
+
+async def test_handle_reaction_ingest_http_not_under_db_lock(lock_probe):
+    # Slice B: link-metadata resolution and thumbnail/attachment/video downloads
+    # now run in the lockless ingest gather phase.
+    violations = await _run_handle_reaction_under_probe()
+    assert "http.get" not in violations, f"ingest HTTP ran under the DB lock: {violations}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ACCEPTED EXCEPTION (docs/db-lock-io-refactor.md): thread creation (Slice A) "
+           "and ingest HTTP/downloads (Slice B) are off the lock - the storm-time holds "
+           "that caused the responsiveness bug. recompute_and_request's Discord sends still "
+           "run under the lock, but they are fast and human-paced (one interaction at a "
+           "time), so de-locking them was deliberately deferred to a future Notifier "
+           "extraction rather than rewriting every interaction handler for ~zero runtime "
+           "gain. This test documents that remaining I/O; flip it if that work is done.",
+)
+async def test_handle_reaction_does_no_io_under_db_lock(lock_probe):
+    violations = await _run_handle_reaction_under_probe()
     assert violations == [], f"I/O performed under DB lock: {violations}"
 
 # NOTE: a probabilistic "concurrent recompute double-post" guard was prototyped

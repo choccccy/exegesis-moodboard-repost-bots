@@ -308,12 +308,11 @@ class RepostBot(discord.Client):
             if message is None:
                 return
             try:
-                async with session_scope() as session:
-                    await service.handle_reaction(
-                        session, settings=self.settings, message=message, http_client=self.httpx_client,
-                        member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
-                        bot_id=getattr(self.user, "id", None),
-                    )
+                await service.handle_reaction(
+                    settings=self.settings, message=message, http_client=self.httpx_client,
+                    member=payload.member, user_id=payload.user_id, yt_client=self._yt_client,
+                    bot_id=getattr(self.user, "id", None),
+                )
             except Exception:
                 log.exception("handle_reaction failed for message %s in channel %s", payload.message_id, payload.channel_id)
             return
@@ -614,14 +613,19 @@ class RepostBot(discord.Client):
                 if submission is None:
                     await interaction.followup.send("Submission no longer exists.", ephemeral=True)
                     return
-                await service.reingest_submission(
-                    session, submission, message=message,
-                    settings=self.settings, http_client=self.httpx_client,
-                )
-                await service.recompute_and_request(
-                    session, submission, settings=self.settings, destination=channel,
-                    yt_client=self._yt_client, bot_id=getattr(self.user, "id", None),
-                )
+                submission_id = submission.id
+            # reingest is self-managing (HTTP off the lock); call it outside the scope.
+            await service.reingest_submission(
+                submission_id, message=message,
+                settings=self.settings, http_client=self.httpx_client,
+            )
+            async with session_scope() as session:
+                submission = await session.get(Submission, submission_id)
+                if submission is not None:
+                    await service.recompute_and_request(
+                        session, submission, settings=self.settings, destination=channel,
+                        yt_client=self._yt_client, bot_id=getattr(self.user, "id", None),
+                    )
         await interaction.followup.send(
             "Reingested - links, media, and caption refreshed from the source message. "
             "Alt text and source/graphic decisions were preserved.", ephemeral=True
@@ -701,15 +705,13 @@ class RepostBot(discord.Client):
                         continue
                     delay = _CATCHUP_INTER_MESSAGE_DELAY
                     try:
-                        async with session_scope() as session:
-                            new_thread = await service.handle_reaction(
-                                session,
-                                settings=self.settings,
-                                message=message,
-                                http_client=self.httpx_client,
-                                skip_auth=True,
-                                bot_id=getattr(self.user, "id", None),
-                            )
+                        new_thread = await service.handle_reaction(
+                            settings=self.settings,
+                            message=message,
+                            http_client=self.httpx_client,
+                            skip_auth=True,
+                            bot_id=getattr(self.user, "id", None),
+                        )
                         processed += 1
                         delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
                     except Exception as exc:
@@ -810,15 +812,13 @@ class RepostBot(discord.Client):
                             continue
                         delay = _CATCHUP_INTER_MESSAGE_DELAY
                         try:
-                            async with session_scope() as session:
-                                new_thread = await service.handle_reaction(
-                                    session,
-                                    settings=self.settings,
-                                    message=message,
-                                    http_client=self.httpx_client,
-                                    skip_auth=True,
-                                    bot_id=getattr(self.user, "id", None),
-                                )
+                            new_thread = await service.handle_reaction(
+                                settings=self.settings,
+                                message=message,
+                                http_client=self.httpx_client,
+                                skip_auth=True,
+                                bot_id=getattr(self.user, "id", None),
+                            )
                             total += 1
                             channel_total += 1
                             delay = _CATCHUP_NEW_THREAD_DELAY if new_thread else _CATCHUP_INTER_MESSAGE_DELAY
@@ -1145,16 +1145,23 @@ class RepostBot(discord.Client):
                     if message is None:
                         log.warning("threadless retry: source message %s not found for submission %s", sub.source_discord_message_id, sub.id)
                         continue
+                    # Skip if the submission became terminal since the scan.
                     async with session_scope() as session:
                         fresh = await session.get(Submission, sub.id)
                         if fresh is None or fresh.state in _TERMINAL_STATES:
                             continue
-                        thread, _ = await service._ensure_thread(session, self.settings, message, fresh, post_anchor=True, bot_id=getattr(self.user, "id", None))
-                        if thread is not None:
-                            await service.recompute_and_request(session, fresh, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None))
-                            log.info("threadless retry: created thread for submission %s", fresh.id)
-                        else:
-                            log.warning("threadless retry: thread creation still failing for submission %s (will retry)", fresh.id)
+                    # Thread creation runs with the DB lock released (self-managing).
+                    thread, _ = await service.ensure_thread_persisted(
+                        self.settings, message, sub.id, post_anchor=True, bot_id=getattr(self.user, "id", None),
+                    )
+                    if thread is not None:
+                        async with session_scope() as session:
+                            fresh = await session.get(Submission, sub.id)
+                            if fresh is not None:
+                                await service.recompute_and_request(session, fresh, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None))
+                        log.info("threadless retry: created thread for submission %s", sub.id)
+                    else:
+                        log.warning("threadless retry: thread creation still failing for submission %s (will retry)", sub.id)
                     await asyncio.sleep(_THREAD_DELAY)
             except Exception:
                 log.exception("threadless retry loop encountered an error")

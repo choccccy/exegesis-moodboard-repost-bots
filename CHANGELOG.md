@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Responsiveness under load: the bot no longer stalls (acknowledging interactions but actioning them seconds later) while creating many threads during a butterfly storm. Network and Discord I/O that used to run while holding the global SQLite write lock now runs with the lock released. Specifically: thread creation + anchor posting, link-metadata resolution, thumbnail/attachment/video downloads, and the entire Bluesky publish conversation are all lifted out of the DB lock. `handle_reaction`, `publish_queued_submission`, `reingest_submission`, and the scheduler/threadless-retry paths are now self-managing (they open short DB transactions around lockless I/O). Behaviour is otherwise unchanged; see `docs/db-lock-io-refactor.md`. (Remaining under-lock I/O in the interaction handlers is fast and human-paced; de-locking it was deliberately deferred.)
+
 ### Added
 - DID pinning for Bluesky sources: the source post's permanent DID is resolved and stored (`source_at_uri` on `submission_links`) at ingest, while the handle is still live, so a later handle rename or deactivation can no longer break the repost
 - `bot.admin.backfill_bsky_did` one-shot to pin DIDs onto submissions ingested before the change

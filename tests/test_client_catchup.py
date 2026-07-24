@@ -758,7 +758,7 @@ async def test_threadless_retry_creates_missing_thread(repost_bot, session, boar
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
         patch(
-            "bot.discord_ingest.client.service._ensure_thread",
+            "bot.discord_ingest.client.service.ensure_thread_persisted",
             new_callable=AsyncMock, return_value=(thread, False),
         ) as ensure,
         patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
@@ -778,7 +778,7 @@ async def test_threadless_retry_source_message_gone(repost_bot, session, board):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
-        patch("bot.discord_ingest.client.service._ensure_thread", new_callable=AsyncMock) as ensure,
+        patch("bot.discord_ingest.client.service.ensure_thread_persisted", new_callable=AsyncMock) as ensure,
     ):
         with pytest.raises(_StopLoop):
             await repost_bot._run_threadless_retry_loop()
@@ -789,7 +789,7 @@ async def test_threadless_retry_nothing_pending(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
-        patch("bot.discord_ingest.client.service._ensure_thread", new_callable=AsyncMock) as ensure,
+        patch("bot.discord_ingest.client.service.ensure_thread_persisted", new_callable=AsyncMock) as ensure,
     ):
         with pytest.raises(_StopLoop):
             await repost_bot._run_threadless_retry_loop()
@@ -805,7 +805,7 @@ async def test_threadless_retry_thread_creation_still_failing(repost_bot, sessio
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
         patch(
-            "bot.discord_ingest.client.service._ensure_thread",
+            "bot.discord_ingest.client.service.ensure_thread_persisted",
             new_callable=AsyncMock, return_value=(None, False),
         ),
         patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
@@ -826,7 +826,7 @@ async def test_threadless_retry_skips_submission_gone_by_retry_time(repost_bot, 
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
         patch.object(session, "get", new=AsyncMock(return_value=None)),
-        patch("bot.discord_ingest.client.service._ensure_thread", new_callable=AsyncMock) as ensure,
+        patch("bot.discord_ingest.client.service.ensure_thread_persisted", new_callable=AsyncMock) as ensure,
     ):
         with pytest.raises(_StopLoop):
             await repost_bot._run_threadless_retry_loop()

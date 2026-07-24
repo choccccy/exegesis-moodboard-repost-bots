@@ -180,20 +180,14 @@ async def test_amain_dry_run_writes_nothing(global_engine, caplog):
 async def test_amain_attaches_video(global_engine, caplog):
     await _seed_candidate(global_engine)
 
-    async def fake_ingest(session, sub, link, meta, settings, client):
-        session.add(Attachment(
-            submission_id=sub.id, discord_attachment_id=0, filename="linkvid_1.mp4",
-            discord_url=meta.video_url, is_image=False, is_video=True,
-            alt_text_status=AltTextStatus.NEEDED.value,
-        ))
-        await session.flush()
-
     meta = ResolvedMetadata(video_url="https://video.twimg.com/clip.mp4")
     p_settings, p_init, p_dispose, p_sleep = _amain_patches()
+    # Download is stubbed (lockless gather); _attach_resolved_video runs for real
+    # and creates the row.
     with p_settings, p_init, p_dispose, p_sleep, \
             patch("bot.admin.backfill_videos.resolve", new=AsyncMock(return_value=meta)), \
-            patch("bot.admin.backfill_videos._ingest_resolved_video",
-                  new=AsyncMock(side_effect=fake_ingest)), \
+            patch("bot.admin.backfill_videos._download_resolved_video",
+                  new=AsyncMock(return_value="/vol/linkvid_1.mp4")), \
             caplog.at_level(logging.INFO):
         await amain(dry_run=False, limit=1)
 
@@ -229,14 +223,14 @@ async def test_amain_resolve_failure_counts_failed(global_engine, caplog):
 
 
 async def test_amain_silent_ingest_degrade_counts_failed(global_engine, caplog):
-    """_ingest_resolved_video can degrade silently; no attachment row = failed."""
+    """Video download can degrade silently (download error, oversize) -> failed."""
     await _seed_candidate(global_engine)
 
     meta = ResolvedMetadata(video_url="https://video.twimg.com/clip.mp4")
     p_settings, p_init, p_dispose, p_sleep = _amain_patches()
     with p_settings, p_init, p_dispose, p_sleep, \
             patch("bot.admin.backfill_videos.resolve", new=AsyncMock(return_value=meta)), \
-            patch("bot.admin.backfill_videos._ingest_resolved_video", new=AsyncMock()), \
+            patch("bot.admin.backfill_videos._download_resolved_video", new=AsyncMock(return_value=None)), \
             caplog.at_level(logging.INFO):
         await amain(dry_run=False, limit=None)
 
@@ -251,7 +245,7 @@ async def test_amain_ingest_exception_counts_failed(global_engine, caplog):
     p_settings, p_init, p_dispose, p_sleep = _amain_patches()
     with p_settings, p_init, p_dispose, p_sleep, \
             patch("bot.admin.backfill_videos.resolve", new=AsyncMock(return_value=meta)), \
-            patch("bot.admin.backfill_videos._ingest_resolved_video",
+            patch("bot.admin.backfill_videos._download_resolved_video",
                   new=AsyncMock(side_effect=OSError("disk full"))), \
             caplog.at_level(logging.INFO):
         await amain(dry_run=False, limit=None)

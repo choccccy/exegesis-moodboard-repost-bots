@@ -187,7 +187,7 @@ def bound_session_scope(session):
 
 
 @pytest.fixture
-def bind_publish_scopes(session):
+def bind_db_scopes(session):
     """Bind the self-managing publish path's internal `session_scope()` to the test
     `session`, for tests that use the in-memory `session` fixture.
 

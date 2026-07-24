@@ -148,12 +148,13 @@ def _confirm_interaction(user_id=999):
     return interaction
 
 
-async def _ingest(session, settings, msg, resolve_side_effect=None):
-    """Run handle_reaction with link resolution stubbed."""
-    resolver = AsyncMock(side_effect=resolve_side_effect)
-    with patch("bot.discord_ingest.service._resolve_links", resolver):
+async def _ingest(session, settings, msg):
+    """Run handle_reaction with link metadata resolution stubbed to empty."""
+    from bot.resolve import ResolvedMetadata
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
+         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None):
         await handle_reaction(
-            session, settings=settings, message=msg,
+            settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
     return await session.scalar(
@@ -174,7 +175,7 @@ def _write_resolved(link, *, title="Cool Robot", via="opengraph"):
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_prompt_answer_metadata_to_queue(session, board):
+async def test_e2e_prompt_answer_metadata_to_queue(session, board, bind_db_scopes):
     settings = _settings(board)
     msg, thread = _source_message(board, content="https://example.com/unresolvable")
 
@@ -211,7 +212,7 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board):
     reply.add_reaction = AsyncMock()
     reply.reply = AsyncMock()
 
-    with patch("bot.discord_ingest.service._resolve_links", AsyncMock(side_effect=_resolve_ok)):
+    with patch("bot.discord_ingest.service._resolve_links_in_session", AsyncMock(side_effect=_resolve_ok)):
         handled = await handle_reply(
             session, settings=settings, message=reply, http_client=AsyncMock(),
         )
@@ -231,7 +232,7 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board):
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session, board, bind_publish_scopes):
+async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session, board, bind_db_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=SubmissionState.QUEUED.value,
                           source_discord_message_id=next(_ids))
@@ -276,7 +277,7 @@ async def test_e2e_scheduler_tick_publishes_through_real_publish_module(session,
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_bot, bind_publish_scopes):
+async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_bot, bind_db_scopes):
     from conftest import bound_session_scope, make_interaction
 
     settings = _settings(board)
@@ -327,7 +328,7 @@ async def test_e2e_button_confirm_full_cycle_via_client(session, board, repost_b
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path, bind_publish_scopes):
+async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path, bind_db_scopes):
     settings = _settings(board)
     sub = make_submission(board, state=SubmissionState.QUEUED.value,
                           source_discord_message_id=next(_ids))
@@ -402,7 +403,7 @@ async def test_e2e_reply_chain_multi_video_and_images(session, board, tmp_path, 
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_parent_reply_deferral_then_reply_publish(session, board, bind_publish_scopes):
+async def test_e2e_parent_reply_deferral_then_reply_publish(session, board, bind_db_scopes):
     settings = _settings(board)
     parent_msg_id = next(_ids)
 
@@ -460,7 +461,7 @@ async def test_e2e_parent_reply_deferral_then_reply_publish(session, board, bind
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_confirm_triggers_playlist_add(session, board):
+async def test_e2e_confirm_triggers_playlist_add(session, board, bind_db_scopes):
     settings = _settings(board, youtube_playlist_id="PLtest123")
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value,
                           source_discord_message_id=next(_ids))

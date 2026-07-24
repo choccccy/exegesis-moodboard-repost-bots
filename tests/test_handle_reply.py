@@ -177,7 +177,7 @@ async def test_handle_reply_op_is_always_authorized(session, board):
     msg = _make_message(reply_to_id=req.bot_message_id, author_id=100, content="https://example.com/post")
     settings = _mock_settings(curator_role_ids=[], curator_user_ids=[])
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()):
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
     assert result is True
@@ -199,7 +199,7 @@ async def test_handle_reply_curator_by_role_is_authorized(session, board):
     )
     settings = _mock_settings(curator_role_ids=[555], curator_user_ids=[])
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()):
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
     assert result is True
@@ -390,7 +390,7 @@ async def test_handle_reply_source_url_creates_link(session, board):
     )
     settings = _mock_settings()
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()), \
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()), \
          patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
@@ -462,7 +462,7 @@ async def test_handle_reply_supplemental_image_ingests_images(session, board):
     )
     settings = _mock_settings()
 
-    with patch("bot.discord_ingest.service._ingest_attachment", new=AsyncMock()) as mock_ingest, \
+    with patch("bot.discord_ingest.service._ingest_attachment_in_session", new=AsyncMock()) as mock_ingest, \
          patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
@@ -601,7 +601,7 @@ async def test_handle_reply_metadata_url_replaces_primary_link(session, board):
     )
     settings = _mock_settings()
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()) as mock_resolve, \
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
          patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
@@ -662,7 +662,7 @@ async def test_handle_reply_supplemental_link_appends_link(session, board):
     )
     settings = _mock_settings()
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()) as mock_resolve, \
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
          patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 
@@ -717,7 +717,7 @@ async def test_handle_reply_supplemental_link_without_existing_links_starts_at_o
     )
     settings = _mock_settings()
 
-    with patch("bot.discord_ingest.service._resolve_links", new=AsyncMock()), \
+    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()), \
          patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
         result = await handle_reply(session, settings=settings, message=msg, http_client=MagicMock())
 

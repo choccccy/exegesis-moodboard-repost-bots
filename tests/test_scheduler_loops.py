@@ -472,7 +472,7 @@ async def test_queue_dispatcher_stop_during_wait_breaks_before_tick():
 # ---------------------------------------------------------------------------
 
 
-async def test_fire_board_hits_skip_limit_on_endless_duplicates(session, board, caplog, bind_publish_scopes):
+async def test_fire_board_hits_skip_limit_on_endless_duplicates(session, board, caplog, bind_db_scopes):
     from datetime import datetime, timedelta, timezone
 
     from bot.scheduler import _fire_board

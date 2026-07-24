@@ -1,8 +1,34 @@
 # Move network & Discord I/O out of the global DB lock
 
 **Type:** Refactor / responsiveness
-**Status:** In progress - Step 1 test harness landed; refactor not yet started
+**Status:** Done for the responsiveness goal (Slices A + B shipped). Slice C
+(de-locking the interaction handlers) deliberately deferred - see "Outcome".
 **Risk:** Medium (touches every ingest hot path; correctness rests on a test net)
+
+## Outcome
+
+The responsiveness bug is fixed. The two lock holds that actually starved the bot
+during butterfly storms are gone:
+- **Slice A** lifted the rate-limited, up-to-15s `create_thread` out of the lock.
+- **Slice B** lifted link resolution + thumbnail/attachment/video downloads out.
+
+Publishing was also made self-managing (its whole Bluesky network conversation
+runs lockless). Three invariant tests enforce this and pass; the broad
+`handle_reaction` invariant remains a documented `xfail`.
+
+**Slice C was investigated and deliberately not done.** Reading the handler
+internals showed the interaction handlers (`handle_confirm_button`,
+`handle_cancel_button`, the reaction/reply handlers, ...) thoroughly interleave DB
+writes with Discord I/O under the lock - message edits, channel sends, thread
+archival, the YouTube playlist API, and `recompute_and_request`'s ~10 send→insert
+blocks. De-locking them means rewriting ~10 handlers into read→I/O→write beats.
+Their runtime value is ~zero: they fire on individual human clicks (not storms),
+holding the lock for tens of ms of fast Discord calls. The remaining benefit is
+purely architectural (a surface-agnostic core for future Matrix support), which is
+better served by a dedicated Notifier/handler-extraction effort if/when Matrix is
+actually built - not by mechanically de-locking ten handlers now for no runtime
+gain at real regression risk. The broad `handle_reaction` invariant is kept as a
+strict `xfail` documenting exactly this remaining I/O.
 
 ## Progress
 
@@ -35,9 +61,37 @@
   (`bot.fetch_channel`) with the lock released too. `_attempt_publish` was folded
   in and removed. The publish invariant test now passes (xfail removed). Behavior
   preserved: full suite green.
-- [ ] **Refactor: reaction path** - per-submission lock across all
-  `recompute_and_request` callers, `_ensure_thread`, `handle_reaction` ingest.
-- [ ] Flip the `handle_reaction` invariant test once that lands.
+- [x] **Refactor: reaction path, Slice A - thread creation out of the lock** (done).
+  `handle_reaction` is now self-managing (client.py's reaction + both catchup call
+  sites, and the threadless-retry loop, no longer wrap it in a `session_scope`).
+  `_ensure_thread` was split into pure-I/O `_ensure_thread_io` + DB-only
+  `_persist_thread_mapping`, and a self-managing `ensure_thread_persisted`
+  (read title/mapping -> create/anchor with lock released -> persist) is now shared
+  by `handle_reaction` and the threadless-retry loop. The duplicate-close path was
+  extracted to `_close_if_duplicate`. New granular invariant
+  `test_handle_reaction_thread_creation_not_under_db_lock` passes; the broad
+  `handle_reaction` invariant stays xfail for Slices B/C. Full suite green.
+- [x] **Slice B - ingest out of the lock** (done). The ingest pipeline was
+  restructured into skeleton-persist (DB) -> gather (lockless downloads/resolve)
+  -> persist-results (DB): `_persist_ingest_skeletons`, `_gather_ingest`
+  (+ `_download_attachment_file` / `_download_thumb` / `_download_resolved_video`),
+  `_persist_ingest_outcome`, orchestrated by the self-managing
+  `ingest_message_content`. `_ingest_content` / `_resolve_links` /
+  `_ingest_attachment` / `_ingest_resolved_video` were removed; DB-assigned
+  filenames (`thumb_{id}`, `{id}_{name}`, `linkvid_{id}`) are preserved by
+  persisting skeleton rows before download. `reingest_submission` is now
+  self-managing and the video backfill admin script uses the shared
+  `_download_resolved_video` + `_attach_resolved_video`. The supplemental-content
+  reply handlers still resolve under the lock via `_resolve_links_in_session` /
+  `_ingest_attachment_in_session` (they reuse the new primitives; their lockless
+  migration is part of Slice C). New invariant
+  `test_handle_reaction_ingest_http_not_under_db_lock` passes; ~6 ingest test
+  files were reworked around the split. Full suite green.
+- [~] **Slice C - deferred (see Outcome above).** Would make `recompute_and_request`
+  self-managing, add a per-submission lock, rewrite the ~10 interaction handlers into
+  read→I/O→write beats, and retire `_resolve_links_in_session` /
+  `_ingest_attachment_in_session`. Deferred: ~zero runtime value, purely architectural,
+  best done as a Notifier-extraction effort alongside real Matrix support.
 
 ## Problem
 

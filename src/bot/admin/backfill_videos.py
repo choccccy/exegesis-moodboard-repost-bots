@@ -32,9 +32,10 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..asset_store import submission_dir
 from ..config import get_settings
 from ..db import dispose_engine, init_engine, session_scope
-from ..discord_ingest.service import _ingest_resolved_video
+from ..discord_ingest.service import _LinkPlan, _attach_resolved_video, _download_resolved_video
 from ..models import Attachment, Submission, SubmissionLink
 from ..resolve import resolve
 from ..state import SubmissionState
@@ -132,26 +133,35 @@ async def amain(dry_run: bool, limit: int | None) -> None:
                     no_video += 1
                     continue
                 try:
+                    # Read the board id (short scope), then download with the lock
+                    # released and persist the attachment (short scope) - mirrors the
+                    # ingest beats (docs/db-lock-io-refactor.md).
                     async with session_scope() as session:
                         sub = await session.get(Submission, sub_id)
-                        link = await session.get(SubmissionLink, link_id)
-                        if sub is None or link is None:
+                        if sub is None:
                             continue
-                        await _ingest_resolved_video(session, sub, link, meta, settings, client)
-                        # _ingest_resolved_video degrades silently (download error,
-                        # oversize); verify a row actually appeared before counting it.
-                        got_video = (await session.scalar(
-                            select(Attachment.id).where(
-                                Attachment.submission_id == sub_id,
-                                Attachment.is_video.is_(True),
-                            )
-                        )) is not None
-                    if got_video:
+                        board_id = sub.board_id
+                    dest = submission_dir(settings.attachments_dir, board_id, sub_id)
+                    link_plan = _LinkPlan(
+                        link_id=link_id, canonical_url=url, domain_family=family, is_primary=True
+                    )
+                    video_path = await _download_resolved_video(link_plan, meta, dest, settings, client)
+                    if video_path is None:
+                        failed += 1
+                        log.info("submission %s: video download/size check failed, thumbnail kept", sub_id)
+                        continue
+                    async with session_scope() as session:
+                        created = await _attach_resolved_video(
+                            session, sub_id, link_id,
+                            video_url=meta.video_url, video_width=meta.video_width,
+                            video_height=meta.video_height, video_path=video_path,
+                        )
+                    if created:
                         attached += 1
                         log.info("submission %s: video attached", sub_id)
                     else:
-                        failed += 1
-                        log.info("submission %s: video download/size check failed, thumbnail kept", sub_id)
+                        no_video += 1
+                        log.info("submission %s: already had a video, skipped", sub_id)
                 except Exception as exc:
                     log.warning("video ingest failed for submission %s: %s", sub_id, exc)
                     failed += 1

@@ -23,16 +23,21 @@ from bot.discord_ingest import replies
 from bot.discord_ingest.service import (
     _apply_answer,
     _build_post_preview,
+    _AttachmentPlan,
+    _IngestPlan,
+    _LinkPlan,
+    _attach_resolved_video,
+    _download_attachment_file,
+    _download_resolved_video,
     _find_publish_time_duplicate,
     _curator_authorized,
     _determine_kind,
     _discord_file_for_attachment,
-    _ingest_attachment,
-    _ingest_content,
-    _ingest_resolved_video,
+    _gather_ingest,
     _is_authorized,
+    _persist_ingest_outcome,
+    _persist_ingest_skeletons,
     _post_thread_anchor,
-    _resolve_links,
     _resolve_parent_ref,
     _resolve_thread,
     handle_cancel_button,
@@ -181,20 +186,20 @@ async def _add_link(session, submission_id, url, **kw):
 # ---------------------------------------------------------------------------
 
 
-async def test_handle_reaction_ignores_unwatched_channel(session, board):
+async def test_handle_reaction_ignores_unwatched_channel(session, board, bind_db_scopes):
     msg = _message(channel_id=555_555)  # no Board row for this channel
     result = await handle_reaction(
-        session, settings=MagicMock(), message=msg, http_client=AsyncMock(), skip_auth=True
+        settings=MagicMock(), message=msg, http_client=AsyncMock(), skip_auth=True
     )
     assert result is False
     msg.channel.create_thread.assert_not_called()
 
 
-async def test_handle_reaction_rejects_non_curator(session, board):
+async def test_handle_reaction_rejects_non_curator(session, board, bind_db_scopes):
     msg = _message(channel_id=board.discord_channel_id)
     settings = _svc_settings(board)  # empty curator lists
     result = await handle_reaction(
-        session, settings=settings, message=msg, http_client=AsyncMock(),
+        settings=settings, message=msg, http_client=AsyncMock(),
         member=None, user_id=12345, skip_auth=False,
     )
     assert result is False
@@ -202,7 +207,7 @@ async def test_handle_reaction_rejects_non_curator(session, board):
     assert sub is None
 
 
-async def test_handle_reaction_duplicate_of_published_closes_thread(session, board):
+async def test_handle_reaction_duplicate_of_published_closes_thread(session, board, bind_db_scopes):
     dup_url = "https://example.com/already-posted"
     prior = make_submission(board, state=PUBLISHED, source_discord_message_id=777)
     session.add(prior)
@@ -219,12 +224,12 @@ async def test_handle_reaction_duplicate_of_published_closes_thread(session, boa
     new_thread = _thread(thread_id=800)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
          patch("bot.discord_ingest.service.remove_submission_dir"), \
          patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock), \
          patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:
         result = await handle_reaction(
-            session, settings=_svc_settings(board), message=msg,
+            settings=_svc_settings(board), message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
 
@@ -717,11 +722,11 @@ async def test_playlist_skip_button_naive_queued_at_schedules_archive(session, b
 
 
 # ---------------------------------------------------------------------------
-# _ingest_content: embed and snapshot URL fallbacks
+# _persist_ingest_skeletons: embed and snapshot URL fallbacks
 # ---------------------------------------------------------------------------
 
 
-async def test_ingest_content_skips_urlless_and_duplicate_embeds(session, board):
+async def test_skeletons_skip_urlless_and_duplicate_embeds(session, board):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
@@ -731,7 +736,7 @@ async def test_ingest_content_skips_urlless_and_duplicate_embeds(session, board)
         InboundEmbed(url="https://example.com/e1"),  # duplicate: skipped
     ])
 
-    await _ingest_content(session, sub, msg, MagicMock(), AsyncMock())
+    await _persist_ingest_skeletons(session, sub, msg)
 
     links = list(await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
@@ -739,7 +744,7 @@ async def test_ingest_content_skips_urlless_and_duplicate_embeds(session, board)
     assert [link.raw_url for link in links] == ["https://example.com/e1"]
 
 
-async def test_ingest_content_snapshot_embed_url_fallback(session, board):
+async def test_skeletons_snapshot_embed_url_fallback(session, board):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
@@ -750,7 +755,7 @@ async def test_ingest_content_snapshot_embed_url_fallback(session, board):
         ]),
     ])
 
-    await _ingest_content(session, sub, msg, MagicMock(), AsyncMock())
+    await _persist_ingest_skeletons(session, sub, msg)
 
     links = list(await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
@@ -759,56 +764,66 @@ async def test_ingest_content_snapshot_embed_url_fallback(session, board):
 
 
 # ---------------------------------------------------------------------------
-# _resolve_links / _ingest_resolved_video / _ingest_attachment edges
+# gather / video-download / attachment-download edges
 # ---------------------------------------------------------------------------
 
 
-async def test_resolve_links_no_image_url_skips_download(session, board):
+async def test_gather_no_image_url_skips_download(session, board):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
     link = await _add_link(session, sub.id, "https://example.com/textonly")
     meta = ResolvedMetadata(title="Cool", via="oembed")  # no image_url, no video_url
+    plan = _IngestPlan(
+        submission_id=sub.id, board_id=sub.board_id,
+        link_plans=[_LinkPlan(link_id=link.id, canonical_url=link.canonical_url,
+                              domain_family=link.domain_family, is_primary=True)],
+        att_plans=[], embed_title=None, embed_description=None, embed_thumb_url=None,
+        thumb_proxy_url=None, has_existing_video=False,
+    )
 
     with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=meta):
-        await _resolve_links(session, sub, MagicMock(), AsyncMock())
+        outcome = await _gather_ingest(plan, _svc_settings(board), AsyncMock())
+    await _persist_ingest_outcome(session, outcome, sub.id)
 
     assert link.resolved_title == "Cool"
     assert link.resolved_image_path is None
 
 
-async def test_ingest_resolved_video_missing_file_size_zero(session, board, tmp_path):
+async def test_resolved_video_missing_file_size_zero(session, board, tmp_path):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
     link = await _add_link(session, sub.id, "https://example.com/vid")
     meta = ResolvedMetadata(video_url="https://cdn.example.com/src.mp4", video_width=10, video_height=10)
     ghost = str(tmp_path / "never-created.mp4")
+    lp = _LinkPlan(link_id=link.id, canonical_url=link.canonical_url, domain_family="other", is_primary=True)
 
     with patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=ghost), \
          patch("bot.discord_ingest.service._transcode_video", new_callable=AsyncMock, return_value=ghost):
-        await _ingest_resolved_video(
-            session, sub, link, meta, _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock()
-        )
+        path = await _download_resolved_video(lp, meta, str(tmp_path), _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock())
 
+    # getsize OSError on the never-created file degrades to size 0 -> under limit -> kept.
+    assert path == ghost
+    created = await _attach_resolved_video(
+        session, sub.id, link.id, video_url=meta.video_url,
+        video_width=10, video_height=10, video_path=path,
+    )
+    assert created
     att = await session.scalar(select(Attachment).where(Attachment.submission_id == sub.id))
-    assert att is not None and att.is_video  # getsize OSError degrades to size 0, still attached
+    assert att is not None and att.is_video
 
 
-async def test_ingest_attachment_storage_full_leaves_undownloaded(session, board, tmp_path):
-    sub = make_submission(board)
-    session.add(sub)
-    await session.flush()
-    att = InboundAttachment(id=5, url="https://cdn/img.png", filename="img.png", content_type="image/png")
+async def test_download_attachment_storage_full_returns_none(session, board, tmp_path):
+    plan = _AttachmentPlan(row_id=5, url="https://cdn/img.png", filename="img.png", is_video=False)
 
     with patch(
         "bot.discord_ingest.service.download_attachment",
         new_callable=AsyncMock, side_effect=StorageFullError("disk full"),
     ):
-        row = await _ingest_attachment(session, sub, att, _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock())
+        path = await _download_attachment_file(plan, str(tmp_path), _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock())
 
-    assert row.local_path is None
-    assert row.downloaded_at is None
+    assert path is None
 
 
 # ---------------------------------------------------------------------------
@@ -1022,7 +1037,7 @@ async def test_recompute_from_reply_updated_notice_failure_still_archives(sessio
 # ---------------------------------------------------------------------------
 
 
-async def test_attempt_publish_no_board_handle_fails(session, board, bind_publish_scopes):
+async def test_attempt_publish_no_board_handle_fails(session, board, bind_db_scopes):
     settings = MagicMock()
     settings.board_for_channel.return_value = None
     sub = make_submission(board, state=QUEUED)
@@ -1037,7 +1052,7 @@ async def test_attempt_publish_no_board_handle_fails(session, board, bind_publis
     assert "no Bluesky handle" in attempt.error
 
 
-async def test_attempt_publish_no_password_notice_failure_swallowed(session, board, bind_publish_scopes):
+async def test_attempt_publish_no_password_notice_failure_swallowed(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
     await session.flush()

@@ -1,4 +1,6 @@
-"""Tests for _ensure_thread: SubmissionThread DB persistence logic.
+"""Tests for the per-submission thread logic, split (docs/db-lock-io-refactor.md)
+into I/O (`_ensure_thread_io` - create/resolve/anchor, no DB) and DB persistence
+(`_persist_thread_mapping` - the SubmissionThread mapping upsert).
 
 This is the platform-agnostic core - creating, reusing, and updating the
 per-submission thread mapping - that will move to the new ingest layer during
@@ -13,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select
 
-from bot.discord_ingest.service import _ensure_thread
+from bot.discord_ingest.service import _ensure_thread_io, _persist_thread_mapping
 from bot.models import SubmissionThread
 from bot.state import SubmissionState
 
@@ -22,7 +24,6 @@ from conftest import make_submission
 
 PATCH_ANCHOR = "bot.discord_ingest.service._post_thread_anchor"
 PATCH_UNARCHIVE = "bot.discord_ingest.service._unarchive_thread"
-PATCH_TITLE = "bot.discord_ingest.service._derive_thread_title"
 PATCH_RESOLVE = "bot.discord_ingest.service._resolve_thread"
 
 
@@ -56,7 +57,7 @@ def _thread(thread_id: int) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# New thread creation
+# New thread creation (_ensure_thread_io) + persistence (_persist_thread_mapping)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -69,14 +70,17 @@ async def test_ensure_thread_creates_new_thread(session, board):
     msg = _message(channel_id=board.discord_channel_id, msg_id=42)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch(PATCH_ANCHOR, new_callable=AsyncMock), \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Cool Title"):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub, post_anchor=True)
+    with patch(PATCH_ANCHOR, new_callable=AsyncMock):
+        result, is_new = await _ensure_thread_io(
+            _settings(), msg, sub, content_title="Cool Title", anchor_title="Cool Title",
+            mapping_thread_id=None, post_anchor=True,
+        )
 
     assert is_new is True
     assert result is new_thread
-    assert sub.thread_id == 500
 
+    await _persist_thread_mapping(session, sub, result.id)
+    assert sub.thread_id == 500
     mapping = await session.scalar(
         select(SubmissionThread).where(
             SubmissionThread.source_discord_message_id == 42
@@ -97,9 +101,11 @@ async def test_ensure_thread_new_passes_title_to_create_thread(session, board):
     msg = _message(channel_id=board.discord_channel_id, msg_id=142)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch(PATCH_ANCHOR, new_callable=AsyncMock), \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="My Thread Title"):
-        await _ensure_thread(session, _settings(), msg, sub)
+    with patch(PATCH_ANCHOR, new_callable=AsyncMock):
+        await _ensure_thread_io(
+            _settings(), msg, sub, content_title="My Thread Title", anchor_title="My Thread Title",
+            mapping_thread_id=None, post_anchor=True,
+        )
 
     msg.channel.create_thread.assert_awaited_once()
     assert msg.channel.create_thread.call_args.kwargs.get("name") == "My Thread Title"
@@ -127,15 +133,19 @@ async def test_ensure_thread_reuses_existing_mapping(session, board):
 
     with patch(PATCH_ANCHOR, new_callable=AsyncMock) as mock_anchor, \
          patch(PATCH_UNARCHIVE, new_callable=AsyncMock), \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"), \
          patch(PATCH_RESOLVE, new_callable=AsyncMock, return_value=existing):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub, post_anchor=True)
+        result, is_new = await _ensure_thread_io(
+            _settings(), msg, sub, content_title="Title", anchor_title="Title",
+            mapping_thread_id=600, post_anchor=True,
+        )
 
     assert is_new is False
     assert result is existing
-    assert sub.thread_id == 600
     msg.channel.create_thread.assert_not_called()
     mock_anchor.assert_awaited_once()
+
+    await _persist_thread_mapping(session, sub, result.id)
+    assert sub.thread_id == 600
 
 
 @pytest.mark.asyncio
@@ -146,20 +156,15 @@ async def test_ensure_thread_no_anchor_on_rescan(session, board):
     await session.flush()
 
     existing = _thread(700)
-    session.add(SubmissionThread(
-        board_id=board.id,
-        source_discord_message_id=44,
-        thread_id=700,
-    ))
-    await session.flush()
-
     msg = _message(channel_id=board.discord_channel_id, msg_id=44)
 
     with patch(PATCH_ANCHOR, new_callable=AsyncMock) as mock_anchor, \
          patch(PATCH_UNARCHIVE, new_callable=AsyncMock) as mock_unarchive, \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"), \
          patch(PATCH_RESOLVE, new_callable=AsyncMock, return_value=existing):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub, post_anchor=False)
+        result, is_new = await _ensure_thread_io(
+            _settings(), msg, sub, content_title="Title", anchor_title="Title",
+            mapping_thread_id=700, post_anchor=False,
+        )
 
     assert is_new is False
     mock_anchor.assert_not_awaited()
@@ -190,12 +195,16 @@ async def test_ensure_thread_stale_mapping_creates_new_and_updates(session, boar
     msg.channel.create_thread.return_value = new_thread
 
     with patch(PATCH_ANCHOR, new_callable=AsyncMock), \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"), \
          patch(PATCH_RESOLVE, new_callable=AsyncMock, return_value=None):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub, post_anchor=True)
+        result, is_new = await _ensure_thread_io(
+            _settings(), msg, sub, content_title="Title", anchor_title="Title",
+            mapping_thread_id=800, post_anchor=True,
+        )
 
     assert is_new is True
     assert result is new_thread
+
+    await _persist_thread_mapping(session, sub, result.id)
     assert stale.thread_id == 801  # in-place update, not a second row
 
 
@@ -210,12 +219,16 @@ async def test_ensure_thread_stale_does_not_create_duplicate_mapping(session, bo
     await session.flush()
 
     msg = _message(channel_id=board.discord_channel_id, msg_id=46)
-    msg.channel.create_thread.return_value = _thread(901)
+    new_thread = _thread(901)
+    msg.channel.create_thread.return_value = new_thread
 
     with patch(PATCH_ANCHOR, new_callable=AsyncMock), \
-         patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"), \
          patch(PATCH_RESOLVE, new_callable=AsyncMock, return_value=None):
-        await _ensure_thread(session, _settings(), msg, sub)
+        result, _ = await _ensure_thread_io(
+            _settings(), msg, sub, content_title="Title", anchor_title="Title",
+            mapping_thread_id=900, post_anchor=True,
+        )
+    await _persist_thread_mapping(session, sub, result.id)
 
     rows = list(await session.scalars(
         select(SubmissionThread).where(SubmissionThread.source_discord_message_id == 46)
@@ -236,8 +249,10 @@ async def test_ensure_thread_timeout_returns_none(session, board):
     msg = _message(channel_id=board.discord_channel_id, msg_id=47)
     msg.channel.create_thread.side_effect = TimeoutError
 
-    with patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub)
+    result, is_new = await _ensure_thread_io(
+        _settings(), msg, sub, content_title="Title", anchor_title="Title",
+        mapping_thread_id=None, post_anchor=True,
+    )
 
     assert result is None
     assert is_new is False
@@ -252,8 +267,10 @@ async def test_ensure_thread_http_exception_returns_none(session, board):
     msg = _message(channel_id=board.discord_channel_id, msg_id=48)
     msg.channel.create_thread.side_effect = discord.HTTPException(MagicMock(), "rate limited")
 
-    with patch(PATCH_TITLE, new_callable=AsyncMock, return_value="Title"):
-        result, is_new = await _ensure_thread(session, _settings(), msg, sub)
+    result, is_new = await _ensure_thread_io(
+        _settings(), msg, sub, content_title="Title", anchor_title="Title",
+        mapping_thread_id=None, post_anchor=True,
+    )
 
     assert result is None
     assert is_new is False

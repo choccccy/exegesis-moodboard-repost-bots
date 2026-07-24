@@ -1,7 +1,9 @@
-"""Tests for _capture_embed, _ingest_content, and _ingest_attachment.
+"""Tests for _capture_embed, _persist_ingest_skeletons, and _download_attachment_file.
 
-These cover the zero-tested core of the ingestion pipeline so that the
-platform-agnostic refactor can be validated against unchanged behaviour.
+These cover the core of the ingestion pipeline, now split (docs/db-lock-io-refactor.md)
+into a DB skeleton-persist phase (_persist_ingest_skeletons) and a lockless download
+phase (_download_attachment_file), so the platform-agnostic refactor is validated
+against unchanged behaviour.
 """
 
 from __future__ import annotations
@@ -12,9 +14,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select
 
 from bot.discord_ingest.service import (
+    _AttachmentPlan,
     _capture_embed,
-    _ingest_attachment,
-    _ingest_content,
+    _download_attachment_file,
+    _persist_ingest_skeletons,
 )
 from bot.ingest.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Attachment, SubmissionLink
@@ -158,36 +161,40 @@ def test_capture_embed_reads_message_snapshots(session, board):
 
 
 # ---------------------------------------------------------------------------
-# _ingest_content
+# _persist_ingest_skeletons (link rows + embed + attachment skeleton rows, no HTTP)
 # ---------------------------------------------------------------------------
 
+async def _skeletons(session, sub, msg):
+    return await _persist_ingest_skeletons(session, sub, msg)
+
+
 @pytest.mark.asyncio
-async def test_ingest_content_url_from_text(session, board):
+async def test_skeletons_url_from_text(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
     msg = _message(content="check https://example.com/post out")
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock):
-        await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    plan = await _skeletons(session, sub, msg)
 
     links = (await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
     )).all()
     assert len(links) == 1
     assert links[0].canonical_url == "https://example.com/post"
+    assert len(plan.link_plans) == 1
+    assert plan.link_plans[0].is_primary is True
 
 
 @pytest.mark.asyncio
-async def test_ingest_content_embed_url_fallback(session, board):
+async def test_skeletons_embed_url_fallback(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
     embed = _embed(url="https://example.com/embed-url")
     msg = _message(content="", embeds=[embed])
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock):
-        await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    await _skeletons(session, sub, msg)
 
     links = (await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
@@ -197,15 +204,14 @@ async def test_ingest_content_embed_url_fallback(session, board):
 
 
 @pytest.mark.asyncio
-async def test_ingest_content_deduplicates_urls(session, board):
+async def test_skeletons_deduplicates_urls(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
     embed = _embed(url="https://example.com/post")
     msg = _message(content="https://example.com/post", embeds=[embed])
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock):
-        await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    await _skeletons(session, sub, msg)
 
     links = (await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
@@ -214,30 +220,36 @@ async def test_ingest_content_deduplicates_urls(session, board):
 
 
 @pytest.mark.asyncio
-async def test_ingest_content_calls_ingest_attachment(session, board):
+async def test_skeletons_creates_attachment_row_and_plan(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
-    att = _attachment()
+    att = _attachment(att_id=123, filename="photo.jpg", content_type="image/jpeg")
     msg = _message(content="https://example.com", attachments=[att])
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock) as mock_ingest:
-        await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    plan = await _skeletons(session, sub, msg)
 
-    mock_ingest.assert_awaited_once()
-    assert mock_ingest.call_args.args[2] is att
+    rows = (await session.scalars(
+        select(Attachment).where(Attachment.submission_id == sub.id)
+    )).all()
+    assert len(rows) == 1
+    assert rows[0].discord_attachment_id == 123
+    assert rows[0].is_image is True
+    assert rows[0].local_path is None  # skeleton only - download is the gather phase
+    assert len(plan.att_plans) == 1
+    assert plan.att_plans[0].url == att.url
+    assert plan.att_plans[0].is_video is False
 
 
 @pytest.mark.asyncio
-async def test_ingest_content_forwarded_message_snapshot(session, board):
+async def test_skeletons_forwarded_message_snapshot(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
     snap = InboundSnapshot(content="https://example.com/forwarded")
     msg = _message(content="", snapshots=[snap])
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock):
-        await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    await _skeletons(session, sub, msg)
 
     links = (await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == sub.id)
@@ -247,131 +259,70 @@ async def test_ingest_content_forwarded_message_snapshot(session, board):
 
 
 @pytest.mark.asyncio
-async def test_ingest_content_returns_proxy_url(session, board):
+async def test_skeletons_captures_embed_proxy_url_into_plan(session, board):
     sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
     session.add(sub)
     await session.flush()
 
     embed = _embed(url="https://example.com", title="T", thumb_proxy="https://proxy.example.com/t.jpg")
     msg = _message(content="https://example.com", embeds=[embed])
-    with patch("bot.discord_ingest.service._ingest_attachment", new_callable=AsyncMock):
-        result = await _ingest_content(session, sub, msg, _settings(), AsyncMock())
+    plan = await _skeletons(session, sub, msg)
 
-    assert result == "https://proxy.example.com/t.jpg"
+    assert plan.thumb_proxy_url == "https://proxy.example.com/t.jpg"
+    assert plan.embed_title == "T"
+
+
+@pytest.mark.asyncio
+async def test_skeletons_has_existing_video_flag(session, board):
+    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
+    session.add(sub)
+    await session.flush()
+
+    vid = _attachment(content_type="video/mp4", filename="clip.mp4")
+    plan = await _skeletons(session, sub, _message(attachments=[vid]))
+    assert plan.has_existing_video is True
+
+    sub2 = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value, source_discord_message_id=2)
+    session.add(sub2)
+    await session.flush()
+    plan2 = await _skeletons(session, sub2, _message(attachments=[_attachment()]))
+    assert plan2.has_existing_video is False
 
 
 # ---------------------------------------------------------------------------
-# _ingest_attachment
+# _download_attachment_file (HTTP only, lockless gather phase)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_ingest_attachment_creates_row(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment(att_id=123, filename="photo.jpg", content_type="image/jpeg")
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_photo.jpg"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row.discord_attachment_id == 123
-    assert row.filename == "photo.jpg"
-    assert row.mime == "image/jpeg"
-    assert row.submission_id == sub.id
-
-
-def test_ingest_attachment_image_flag(session, board):
-    pass  # tested via creates_row + is_image assertions below
+def _att_plan(row_id=1, url="https://cdn.discord.com/att.jpg", filename="att.jpg", is_video=False):
+    return _AttachmentPlan(row_id=row_id, url=url, filename=filename, is_video=is_video)
 
 
 @pytest.mark.asyncio
-async def test_ingest_attachment_is_image(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment(content_type="image/png", filename="img.png")
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_img.png"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row.is_image is True
-    assert row.is_video is False
+async def test_download_attachment_file_returns_path():
+    with patch("bot.discord_ingest.service.download_attachment",
+               new_callable=AsyncMock, return_value="/tmp/dest/1_att.jpg") as dl:
+        path = await _download_attachment_file(_att_plan(), "/tmp/dest", _settings(), AsyncMock())
+    assert path == "/tmp/dest/1_att.jpg"
+    assert dl.call_args.kwargs["filename"] == "1_att.jpg"
 
 
 @pytest.mark.asyncio
-async def test_ingest_attachment_is_video(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment(content_type="video/mp4", filename="clip.mp4")
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_clip.mp4"), \
-         patch("bot.discord_ingest.service._transcode_video", new_callable=AsyncMock, return_value="/tmp/dest/1_clip_transcoded.mp4"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row.is_video is True
-    assert row.is_image is False
+async def test_download_attachment_file_transcodes_video():
+    with patch("bot.discord_ingest.service.download_attachment",
+               new_callable=AsyncMock, return_value="/tmp/dest/1_clip.mp4"), \
+         patch("bot.discord_ingest.service._transcode_video",
+               new_callable=AsyncMock, return_value="/tmp/dest/1_clip_t.mp4") as tc:
+        path = await _download_attachment_file(
+            _att_plan(filename="clip.mp4", is_video=True), "/tmp/dest", _settings(), AsyncMock()
+        )
+    assert path == "/tmp/dest/1_clip_t.mp4"
+    tc.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_ingest_attachment_description_stored(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment(description="A nice photo of a robot")
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_att.jpg"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row.alt_text_body == "A nice photo of a robot"
-
-
-@pytest.mark.asyncio
-async def test_ingest_attachment_no_description(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment(description=None)
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_att.jpg"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert not row.alt_text_body
-
-
-@pytest.mark.asyncio
-async def test_ingest_attachment_local_path_set(session, board):
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment()
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/tmp/dest/1_att.jpg"):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row.local_path == "/tmp/dest/1_att.jpg"
-
-
-@pytest.mark.asyncio
-async def test_ingest_attachment_download_failure_doesnt_raise(session, board):
-    """Network errors are caught and logged; row is still returned."""
+async def test_download_attachment_file_failure_returns_none():
     import httpx
-    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value)
-    session.add(sub)
-    await session.flush()
-
-    att = _attachment()
-    with patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/dest"), \
-         patch("bot.discord_ingest.service.download_attachment",
-               new_callable=AsyncMock,
-               side_effect=httpx.HTTPError("network failure")):
-        row = await _ingest_attachment(session, sub, att, _settings(), AsyncMock())
-
-    assert row is not None
-    assert row.local_path is None
+    with patch("bot.discord_ingest.service.download_attachment",
+               new_callable=AsyncMock, side_effect=httpx.HTTPError("network failure")):
+        path = await _download_attachment_file(_att_plan(), "/tmp/dest", _settings(), AsyncMock())
+    assert path is None

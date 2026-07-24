@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from bot.discord_ingest.service import handle_reaction
 from bot.models import Submission, SubmissionLink, SubmissionThread
+from bot.resolve import ResolvedMetadata
 from bot.state import SubmissionState
 
 from conftest import make_submission
@@ -88,7 +89,7 @@ def _http() -> AsyncMock:
 # thread creation timeout
 # ---------------------------------------------------------------------------
 
-async def test_thread_creation_timeout_returns_false(session, board):
+async def test_thread_creation_timeout_returns_false(session, board, bind_db_scopes):
     """TimeoutError from create_thread → handle_reaction returns False, no crash.
 
     This is the rate-limit path: the 15s asyncio.timeout fires during
@@ -98,7 +99,6 @@ async def test_thread_creation_timeout_returns_false(session, board):
     msg.channel.create_thread.side_effect = TimeoutError
 
     result = await handle_reaction(
-        session,
         settings=_settings(),
         message=msg,
         http_client=_http(),
@@ -113,7 +113,7 @@ async def test_thread_creation_timeout_returns_false(session, board):
 # existing-thread path never calls create_thread
 # ---------------------------------------------------------------------------
 
-async def test_existing_thread_skips_create_thread(session, board):
+async def test_existing_thread_skips_create_thread(session, board, bind_db_scopes):
     """When a SubmissionThread mapping already exists, create_thread is never
     called - so a thread-creation rate limit on a different submission does
     not affect this one at all.
@@ -136,7 +136,6 @@ async def test_existing_thread_skips_create_thread(session, board):
     msg.guild.get_thread.return_value = existing
 
     await handle_reaction(
-        session,
         settings=_settings(),
         message=msg,
         http_client=_http(),
@@ -150,7 +149,7 @@ async def test_existing_thread_skips_create_thread(session, board):
 # new thread success: recompute runs (sends into the thread)
 # ---------------------------------------------------------------------------
 
-async def test_new_thread_runs_recompute(session, board):
+async def test_new_thread_runs_recompute(session, board, bind_db_scopes):
     """Successful thread creation → recompute_and_request runs and sends into
     the new thread (cancel button at minimum).
     """
@@ -159,7 +158,6 @@ async def test_new_thread_runs_recompute(session, board):
     msg.channel.create_thread.return_value = new_thread
 
     await handle_reaction(
-        session,
         settings=_settings(),
         message=msg,
         http_client=_http(),
@@ -175,7 +173,7 @@ async def test_new_thread_runs_recompute(session, board):
 # Ingestion path: URL in message creates SubmissionLink
 # ---------------------------------------------------------------------------
 
-async def test_handle_reaction_ingests_url(session, board):
+async def test_handle_reaction_ingests_url(session, board, bind_db_scopes):
     """A message URL must flow all the way through to a SubmissionLink row.
 
     This guards the adapter boundary: if Discord's message.content is ever
@@ -186,9 +184,8 @@ async def test_handle_reaction_ingests_url(session, board):
     new_thread = _thread(thread_id=700)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock):
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
         await handle_reaction(
-            session,
             settings=_settings(),
             message=msg,
             http_client=_http(),
@@ -203,7 +200,7 @@ async def test_handle_reaction_ingests_url(session, board):
     assert len(links) == 1
 
 
-async def test_handle_reaction_embed_url_ingested_when_no_text(session, board):
+async def test_handle_reaction_embed_url_ingested_when_no_text(session, board, bind_db_scopes):
     """When message.content is empty, embed URL falls back to SubmissionLink.
 
     Guards the embed → InboundEmbed adapter boundary.
@@ -221,9 +218,8 @@ async def test_handle_reaction_embed_url_ingested_when_no_text(session, board):
     new_thread = _thread(thread_id=701)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock):
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
         await handle_reaction(
-            session,
             settings=_settings(),
             message=msg,
             http_client=_http(),
@@ -274,12 +270,11 @@ async def _run_duplicate_reaction(session, board, *, existing_state, existing_th
     new_thread = _thread(thread_id=800)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
          patch("bot.discord_ingest.service.remove_submission_dir"), \
          patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock), \
          patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:
         result = await handle_reaction(
-            session,
             settings=_settings(),
             message=msg,
             http_client=_http(),
@@ -295,7 +290,7 @@ def _sent_texts(thread) -> list[str]:
     ]
 
 
-async def test_duplicate_of_queued_posts_notice_with_thread_url(session, board):
+async def test_duplicate_of_queued_posts_notice_with_thread_url(session, board, bind_db_scopes):
     """Second submission of a QUEUED URL gets the duplicate_queued notice
     (with a link to the original thread), and the new submission is deleted.
     """
@@ -317,7 +312,7 @@ async def test_duplicate_of_queued_posts_notice_with_thread_url(session, board):
     mock_archive.assert_called_once()
 
 
-async def test_duplicate_of_pending_posts_notice_with_thread_url(session, board):
+async def test_duplicate_of_pending_posts_notice_with_thread_url(session, board, bind_db_scopes):
     """A non-queued active (pending) duplicate gets the duplicate_pending notice."""
     result, new_thread, msg_id, _ = await _run_duplicate_reaction(
         session, board,
@@ -331,7 +326,7 @@ async def test_duplicate_of_pending_posts_notice_with_thread_url(session, board)
     assert "https://discord.com/channels/1/888" in notices[0]
 
 
-async def test_duplicate_of_queued_without_thread_omits_url(session, board):
+async def test_duplicate_of_queued_without_thread_omits_url(session, board, bind_db_scopes):
     """When the original submission has no thread, the notice has no link."""
     result, new_thread, _, _ = await _run_duplicate_reaction(
         session, board,
@@ -345,7 +340,7 @@ async def test_duplicate_of_queued_without_thread_omits_url(session, board):
     assert "discord.com/channels" not in notices[0]
 
 
-async def test_duplicate_of_pending_without_thread_omits_url(session, board):
+async def test_duplicate_of_pending_without_thread_omits_url(session, board, bind_db_scopes):
     result, new_thread, _, _ = await _run_duplicate_reaction(
         session, board,
         existing_state=SubmissionState.INTENT_SUBMITTED.value,

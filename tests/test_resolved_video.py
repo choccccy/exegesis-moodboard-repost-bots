@@ -1,9 +1,13 @@
-"""Tests for _ingest_resolved_video: resolver-sourced video attachments.
+"""Tests for resolver-sourced video attachments.
 
 Feature: link-only submissions whose source is a video/GIF post (twitter,
 tiktok, reddit GIFs) get the actual video downloaded and attached, so publish
 posts native video instead of a thumbnail card. Failures must degrade to the
 old thumbnail behavior - never a broken video attachment.
+
+The download now happens in the lockless gather phase (_gather_ingest ->
+_download_resolved_video) and the attachment row in the persist phase
+(_persist_ingest_outcome); these tests drive that pair (docs/db-lock-io-refactor.md).
 """
 
 from __future__ import annotations
@@ -13,7 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from bot.discord_ingest.service import _ingest_resolved_video, _resolve_links
+from bot.discord_ingest.service import (
+    _IngestPlan,
+    _LinkPlan,
+    _gather_ingest,
+    _persist_ingest_outcome,
+)
 from bot.models import Attachment, SubmissionLink
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, SubmissionState
@@ -46,11 +55,28 @@ async def _submission_with_link(session, board, url="https://twitter.com/u/statu
     return sub, link
 
 
-def _video_meta(url="https://video.twimg.com/clip.mp4", width=640, height=480):
+def _video_meta(url="https://video.twimg.com/clip.mp4", width=640, height=480, image_url=None):
+    # image_url defaults to None here so the video-download assertions aren't muddied
+    # by an incidental thumbnail download (also via download_attachment).
     return ResolvedMetadata(
-        title="a tweet", description="Author", image_url="https://pbs.twimg.com/still.jpg",
+        title="a tweet", description="Author", image_url=image_url,
         video_url=url, video_width=width, video_height=height, via="fxtwitter_api",
     )
+
+
+async def _run_link_ingest(session, sub, link, meta, settings, *, has_existing_video=False):
+    """Resolve + download one primary link (gather, lockless) and write the results
+    (persist), mirroring what ingest_message_content does for a single link."""
+    plan = _IngestPlan(
+        submission_id=sub.id, board_id=sub.board_id,
+        link_plans=[_LinkPlan(link_id=link.id, canonical_url=link.canonical_url,
+                              domain_family=link.domain_family, is_primary=True)],
+        att_plans=[], embed_title=None, embed_description=None, embed_thumb_url=None,
+        thumb_proxy_url=None, has_existing_video=has_existing_video,
+    )
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=meta):
+        outcome = await _gather_ingest(plan, settings, AsyncMock())
+    await _persist_ingest_outcome(session, outcome, sub.id)
 
 
 async def _video_attachments(session, submission_id):
@@ -69,7 +95,7 @@ async def test_creates_video_attachment_on_success(session, board, tmp_path):
     with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=str(video_file)) as mock_dl, \
          patch("bot.discord_ingest.service._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
-        await _ingest_resolved_video(session, sub, link, _video_meta(), _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
     assert len(atts) == 1
@@ -90,7 +116,7 @@ async def test_download_failure_creates_no_row(session, board, tmp_path):
     with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock,
                side_effect=httpx.ConnectError("cdn unreachable")):
-        await _ingest_resolved_video(session, sub, link, _video_meta(), _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
     assert atts == [], "failed download must fall back to thumbnail, not create a broken attachment"
@@ -106,7 +132,9 @@ async def test_skips_when_video_attachment_already_exists(session, board, tmp_pa
     await session.flush()
 
     with patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock) as mock_dl:
-        await _ingest_resolved_video(session, sub, link, _video_meta(), _settings(), AsyncMock())
+        # has_existing_video=True is what _persist_ingest_skeletons computes when a
+        # video attachment is already present (Discord-uploaded or preserved video).
+        await _run_link_ingest(session, sub, link, _video_meta(), _settings(), has_existing_video=True)
 
     mock_dl.assert_not_awaited()
     atts = await _video_attachments(session, sub.id)
@@ -122,36 +150,34 @@ async def test_oversize_video_skipped(session, board, tmp_path):
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
          patch("bot.discord_ingest.service._transcode_video", new_callable=AsyncMock, return_value=str(video_file)), \
          patch("bot.discord_ingest.service._MAX_RESOLVED_VIDEO_BYTES", 32):
-        await _ingest_resolved_video(session, sub, link, _video_meta(), _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
     assert atts == [], "oversize video must fall back to thumbnail (it can never upload)"
 
 
-async def test_resolve_links_ingests_video_for_primary_link(session, board, tmp_path):
+async def test_ingest_video_for_primary_link(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board)
     video_file = tmp_path / "clip.mp4"
     video_file.write_bytes(b"fake-mp4-bytes")
 
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=_video_meta()), \
-         patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
+    with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
          patch("bot.discord_ingest.service._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
-        await _resolve_links(session, sub, _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
     assert len(atts) == 1
     assert atts[0].local_path == str(video_file)
 
 
-async def test_resolve_links_no_video_url_no_attachment(session, board, tmp_path):
+async def test_no_video_url_no_attachment(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board)
     meta = ResolvedMetadata(title="pic", image_url="https://pbs.twimg.com/photo.jpg", via="fxtwitter_api")
 
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=meta), \
-         patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
+    with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=str(tmp_path / "thumb")):
-        await _resolve_links(session, sub, _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, meta, _settings())
 
     atts = await _video_attachments(session, sub.id)
     assert atts == []
@@ -160,9 +186,9 @@ async def test_resolve_links_no_video_url_no_attachment(session, board, tmp_path
 # --- stream (reddit) videos: ffmpeg fetches + muxes video+audio --------------
 
 
-def _stream_meta(url="https://v.redd.it/abc/HLSPlaylist.m3u8"):
+def _stream_meta(url="https://v.redd.it/abc/HLSPlaylist.m3u8", image_url=None):
     return ResolvedMetadata(
-        title="reddit vid", description="r/x", image_url="https://preview.redd.it/s.jpg",
+        title="reddit vid", description="r/x", image_url=image_url,
         video_url=url, video_width=1920, video_height=1080,
         video_is_stream=True, via="reddit_api",
     )
@@ -177,10 +203,10 @@ async def test_stream_video_muxed_and_attached(session, board, tmp_path):
          patch("bot.discord_ingest.service._fetch_stream_video",
                new_callable=AsyncMock, return_value=str(out)) as mock_mux, \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock) as mock_dl:
-        await _ingest_resolved_video(session, sub, link, _stream_meta(), _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _stream_meta(), _settings())
 
     mock_mux.assert_awaited_once()  # went through the ffmpeg mux path
-    mock_dl.assert_not_awaited()    # not the direct-download path
+    mock_dl.assert_not_awaited()    # not the direct-download path (and no thumbnail)
     atts = await _video_attachments(session, sub.id)
     assert len(atts) == 1 and atts[0].local_path == str(out)
 
@@ -189,7 +215,7 @@ async def test_stream_video_mux_failure_falls_back(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board, url="https://www.reddit.com/r/x/comments/1/t/")
     with patch("bot.discord_ingest.service.submission_dir", return_value=str(tmp_path)), \
          patch("bot.discord_ingest.service._fetch_stream_video", new_callable=AsyncMock, return_value=None):
-        await _ingest_resolved_video(session, sub, link, _stream_meta(), _settings(), AsyncMock())
+        await _run_link_ingest(session, sub, link, _stream_meta(), _settings())
     assert await _video_attachments(session, sub.id) == []  # no broken attachment
 
 

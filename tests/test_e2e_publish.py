@@ -26,6 +26,7 @@ from bot.config import BoardConfig
 from bot.discord_ingest.service import handle_reaction, publish_queued_submission
 from bot.models import Attachment, PublishAttempt, Submission, SubmissionLink
 from bot.publish import PublishResult
+from bot.resolve import ResolvedMetadata
 from bot.state import PublishOutcome, SubmissionState
 
 from conftest import MockDest, make_submission
@@ -154,17 +155,17 @@ _FAIL_RESULT = PublishResult(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_external_link_published(session, board, bind_publish_scopes):
+async def test_e2e_external_link_published(session, board, bind_db_scopes):
     """A Discord message with a URL flows to a successful Bluesky external post."""
     settings = _settings(board)
     msg, _ = _discord_message(board, content="https://example.com/cool-robot")
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK_RESULT) as mock_pub:
 
         # Step 1: ingest
         await handle_reaction(
-            session, settings=settings, message=msg,
+            settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
 
@@ -230,7 +231,7 @@ async def test_e2e_external_link_published(session, board, bind_publish_scopes):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_image_attachment_published(session, board, bind_publish_scopes):
+async def test_e2e_image_attachment_published(session, board, bind_db_scopes):
     """A Discord message with an image attachment flows to a Bluesky images post."""
     settings = _settings(board)
     att = _discord_attachment(att_id=77, filename="robot.jpg", description="A chrome robot")
@@ -240,14 +241,14 @@ async def test_e2e_image_attachment_published(session, board, bind_publish_scope
         discord_attachments=[att],
     )
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None), \
          patch("bot.discord_ingest.service.submission_dir", return_value="/tmp/e2e-atts"), \
          patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock,
                return_value="/tmp/e2e-atts/1_robot.jpg"), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK_RESULT) as mock_pub:
 
         await handle_reaction(
-            session, settings=settings, message=msg,
+            settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
 
@@ -288,16 +289,16 @@ async def test_e2e_image_attachment_published(session, board, bind_publish_scope
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_publish_failure_recorded(session, board, bind_publish_scopes):
+async def test_e2e_publish_failure_recorded(session, board, bind_db_scopes):
     """When Bluesky returns an error, state becomes PUBLISH_FAILED and the error is saved."""
     settings = _settings(board)
     msg, _ = _discord_message(board)
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock), \
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_FAIL_RESULT):
 
         await handle_reaction(
-            session, settings=settings, message=msg,
+            settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
 
@@ -328,7 +329,7 @@ async def test_e2e_publish_failure_recorded(session, board, bind_publish_scopes)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_embed_metadata_captured(session, board):
+async def test_e2e_embed_metadata_captured(session, board, bind_db_scopes):
     """Embed title and thumbnail from the Discord message reach submission.embed_* fields."""
     settings = _settings(board)
 
@@ -345,9 +346,9 @@ async def test_e2e_embed_metadata_captured(session, board):
     msg, _ = _discord_message(board, content="https://example.com/post")
     msg.embeds = [embed]
 
-    with patch("bot.discord_ingest.service._resolve_links", new_callable=AsyncMock):
+    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None):
         await handle_reaction(
-            session, settings=settings, message=msg,
+            settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
         )
 
@@ -363,7 +364,7 @@ async def test_e2e_embed_metadata_captured(session, board):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_e2e_duplicate_url_aborts_publish(session, board, bind_publish_scopes):
+async def test_e2e_duplicate_url_aborts_publish(session, board, bind_db_scopes):
     """If the URL was already published by another submission, publish is skipped."""
     settings = _settings(board)
 

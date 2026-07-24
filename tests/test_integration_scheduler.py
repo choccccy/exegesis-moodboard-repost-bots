@@ -55,7 +55,7 @@ def _fake_bot():
 # Core publish path
 # ---------------------------------------------------------------------------
 
-async def test_fire_board_calls_publish(session, board, bind_publish_scopes):
+async def test_fire_board_calls_publish(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=42)
     session.add(sub)
     await session.flush()
@@ -69,7 +69,7 @@ async def test_fire_board_calls_publish(session, board, bind_publish_scopes):
     assert submission_id_arg == sub.id
 
 
-async def test_fire_board_no_thread_passes_none_destination(session, board, bind_publish_scopes):
+async def test_fire_board_no_thread_passes_none_destination(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=99)
     session.add(sub)
     await session.flush()
@@ -81,7 +81,7 @@ async def test_fire_board_no_thread_passes_none_destination(session, board, bind
     assert destination is None
 
 
-async def test_fire_board_with_thread_fetches_channel(session, board, bind_publish_scopes):
+async def test_fire_board_with_thread_fetches_channel(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=55)
     session.add(sub)
     await session.flush()
@@ -107,7 +107,7 @@ async def test_fire_board_with_thread_fetches_channel(session, board, bind_publi
     assert destination._channel is fake_channel
 
 
-async def test_fire_board_thread_fetch_failure_still_publishes(session, board, bind_publish_scopes):
+async def test_fire_board_thread_fetch_failure_still_publishes(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=77)
     session.add(sub)
     await session.flush()
@@ -131,14 +131,14 @@ async def test_fire_board_thread_fetch_failure_still_publishes(session, board, b
 # Skip conditions
 # ---------------------------------------------------------------------------
 
-async def test_fire_board_nothing_queued_skips_publish(session, board, bind_publish_scopes):
+async def test_fire_board_nothing_queued_skips_publish(session, board, bind_db_scopes):
     with patch("bot.scheduler.ingest_service.publish_queued_submission", new_callable=AsyncMock) as mock_pub:
         await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
 
     mock_pub.assert_not_awaited()
 
 
-async def test_fire_board_at_daily_cap_skips_publish(session, board, bind_publish_scopes):
+async def test_fire_board_at_daily_cap_skips_publish(session, board, bind_db_scopes):
     sub = make_submission(board, state=QUEUED, source_discord_message_id=11)
     session.add(sub)
     await session.flush()
@@ -159,7 +159,7 @@ async def test_fire_board_at_daily_cap_skips_publish(session, board, bind_publis
     mock_pub.assert_not_awaited()
 
 
-async def test_fire_board_unknown_board_skips_publish(session, board, bind_publish_scopes):
+async def test_fire_board_unknown_board_skips_publish(session, board, bind_db_scopes):
     cfg = _board_cfg(board)
     cfg.discord_channel_id = 99999  # no DB row for this channel
 
@@ -217,7 +217,7 @@ async def _add_link(session, submission_id, url, canonical_url=None):
     return link
 
 
-async def test_fire_board_continues_past_duplicate_to_real_post(session, board, bind_publish_scopes):
+async def test_fire_board_continues_past_duplicate_to_real_post(session, board, bind_db_scopes):
     """Regression: duplicate cleanups must not consume the scheduler tick.
 
     When the head of the queue is a duplicate, _fire_board must continue and
@@ -267,7 +267,7 @@ async def test_fire_board_continues_past_duplicate_to_real_post(session, board, 
     mock_pub.assert_awaited_once()
 
 
-async def test_duplicate_publish_queued_submission_returns_none(session, board, bind_publish_scopes):
+async def test_duplicate_publish_queued_submission_returns_none(session, board, bind_db_scopes):
     """publish_queued_submission returns None for duplicates so _fire_board can loop past them."""
     settings = _full_settings(board)
 
@@ -288,7 +288,7 @@ async def test_duplicate_publish_queued_submission_returns_none(session, board, 
     assert result is PublishOutcome.DUPLICATE, "duplicate cleanup lets the scheduler continue to next"
 
 
-async def test_null_canonical_url_not_treated_as_duplicate(session, board, bind_publish_scopes):
+async def test_null_canonical_url_not_treated_as_duplicate(session, board, bind_db_scopes):
     """Submissions with canonical_url=None must not match each other as duplicates.
 
     NULL == NULL uses IS NULL in SQL, which would incorrectly flag completely
@@ -319,7 +319,7 @@ async def test_null_canonical_url_not_treated_as_duplicate(session, board, bind_
     mock_pub.assert_awaited_once()
 
 
-async def test_suppression_row_does_not_cascade_to_block_next_submission(session, board, bind_publish_scopes):
+async def test_suppression_row_does_not_cascade_to_block_next_submission(session, board, bind_db_scopes):
     """A duplicate-suppression row (success=True, error='duplicate:...') must not cause
     another submission with the same URL to be suppressed if no real publish exists.
 
@@ -366,7 +366,7 @@ async def test_suppression_row_does_not_cascade_to_block_next_submission(session
 # network down) can't burn the whole queue in one tick.
 
 
-async def test_fire_board_failure_falls_through_to_next_item(session, board, bind_publish_scopes):
+async def test_fire_board_failure_falls_through_to_next_item(session, board, bind_db_scopes):
     sub_a = make_submission(board, state=QUEUED, source_discord_message_id=101,
                             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     sub_b = make_submission(board, state=QUEUED, source_discord_message_id=102,
@@ -388,7 +388,7 @@ async def test_fire_board_failure_falls_through_to_next_item(session, board, bin
     assert second_sub == sub_b.id
 
 
-async def test_fire_board_gives_up_after_failure_budget(session, board, bind_publish_scopes):
+async def test_fire_board_gives_up_after_failure_budget(session, board, bind_db_scopes):
     for i in range(5):
         session.add(make_submission(
             board, state=QUEUED, source_discord_message_id=200 + i,
@@ -408,7 +408,7 @@ async def test_fire_board_gives_up_after_failure_budget(session, board, bind_pub
     )
 
 
-async def test_fire_board_publish_success_ends_tick(session, board, bind_publish_scopes):
+async def test_fire_board_publish_success_ends_tick(session, board, bind_db_scopes):
     sub_a = make_submission(board, state=QUEUED, source_discord_message_id=301,
                             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     sub_b = make_submission(board, state=QUEUED, source_discord_message_id=302,

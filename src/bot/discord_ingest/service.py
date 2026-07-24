@@ -295,7 +295,6 @@ async def _find_duplicate(
 
 
 async def handle_reaction(
-    session: AsyncSession,
     *,
     settings: Settings,
     message: discord.Message,
@@ -306,118 +305,154 @@ async def handle_reaction(
     yt_client=None,
     bot_id: int | None = None,
 ) -> bool:
-    """Entry point for a 🦋 reaction on a watched channel message."""
-    board = await _board_for_channel(session, message.channel.id)
-    if board is None:
-        return False  # not a watched channel
+    """Entry point for a 🦋 reaction on a watched channel message.
 
-    if not skip_auth:
-        board_cfg = settings.board_for_channel(message.channel.id)
-        if not _is_curator(member, user_id, board_cfg):
-            return False
-
+    Self-managing (see docs/db-lock-io-refactor.md): opens its own short DB scopes
+    so thread creation and the anchor post - the rate-limited Discord calls - happen
+    with the DB write lock released. The caller must NOT wrap this in a session_scope
+    (a nested acquire would deadlock the non-reentrant global lock). The per-message
+    lock still serializes concurrent 🦋 reactions on the same message.
+    """
     async with _message_processing_locks.setdefault(message.id, asyncio.Lock()):
-        submission = await session.scalar(
-            select(Submission).where(
-                Submission.board_id == board.id,
-                Submission.source_discord_message_id == message.id,
-            )
-        )
-        created = submission is None
-        if created:
-            cfg = settings.board_for_channel(message.channel.id)
-            submission = Submission(
-                board_id=board.id,
-                source_discord_message_id=message.id,
-                channel_id=message.channel.id,
-                author_id=message.author.id,
-                author_display=getattr(message.author, "display_name", str(message.author)),
-                state=SubmissionState.INTENT_SUBMITTED.value,
-                graphic_classification_required=(
-                    cfg.require_graphic_classification if cfg else True
-                ),
-                source_posted_at=message.created_at,
-                reply_to_discord_message_id=(
-                    message.reference.message_id if message.reference else None
-                ),
-            )
-            session.add(submission)
-            await session.flush()  # assign submission.id
-            inbound = discord_message_to_inbound(message)
-            thumb_proxy_url = await _ingest_content(session, submission, inbound, settings, http_client)
-            await _resolve_links(session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url)
-            log.info("created submission %s for message %s", submission.id, message.id)
+        # Beat 1 (DB): resolve board + authorize, load-or-create the submission and
+        # ingest its content, then read the title + existing thread mapping.
+        async with session_scope() as session:
+            board = await _board_for_channel(session, message.channel.id)
+            if board is None:
+                return False  # not a watched channel
 
-        thread, new_thread = await _ensure_thread(session, settings, message, submission, post_anchor=created, bot_id=bot_id)
-        if thread is None:
-            log.warning("could not create/resolve thread for submission %s", submission.id)
-            return False
-
-        if created:
-            guild_id = message.guild.id if message.guild else 0
-            links = list(await session.scalars(
-                select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
-            ))
-            for link in links:
-                dup = await _find_duplicate(session, link.canonical_url, submission.id, guild_id)
-                if dup is not None:
-                    kind, ref_url = dup
-                    if kind == "published":
-                        notice = replies.duplicate_posted(ref_url)
-                    elif kind == "queued":
-                        notice = replies.duplicate_queued(ref_url)
-                    else:
-                        notice = replies.duplicate_pending(ref_url)
-                    await thread.send(notice)
-                    log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
-                    # Clean up the new submission - the thread stays as a record of the notice.
-                    sub_id = submission.id
-                    board = await session.get(Board, submission.board_id)
-                    remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-                    await _delete_submission_cascade(session, sub_id)
-                    # Remove butterfly so future scans skip this post.
-                    await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
-                    # Archive immediately - the notice above already says "Closing this thread."
-                    # A fire-and-forget delay would be lost on bot restart, and the submission
-                    # row is gone so the cleanup scheduler can't recover it either.
-                    await _archive_thread(thread)
+            if not skip_auth:
+                board_cfg = settings.board_for_channel(message.channel.id)
+                if not _is_curator(member, user_id, board_cfg):
                     return False
 
-        await recompute_and_request(session, submission, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id)
-        return new_thread
+            submission = await session.scalar(
+                select(Submission).where(
+                    Submission.board_id == board.id,
+                    Submission.source_discord_message_id == message.id,
+                )
+            )
+            created = submission is None
+            if created:
+                cfg = settings.board_for_channel(message.channel.id)
+                submission = Submission(
+                    board_id=board.id,
+                    source_discord_message_id=message.id,
+                    channel_id=message.channel.id,
+                    author_id=message.author.id,
+                    author_display=getattr(message.author, "display_name", str(message.author)),
+                    state=SubmissionState.INTENT_SUBMITTED.value,
+                    graphic_classification_required=(
+                        cfg.require_graphic_classification if cfg else True
+                    ),
+                    source_posted_at=message.created_at,
+                    reply_to_discord_message_id=(
+                        message.reference.message_id if message.reference else None
+                    ),
+                )
+                session.add(submission)
+                await session.flush()  # assign submission.id
+                log.info("created submission %s for message %s", submission.id, message.id)
+
+            submission_id = submission.id
+
+        # Ingest links/media for a new submission with the lock released (HTTP +
+        # downloads run outside any session_scope; self-managing).
+        if created:
+            await ingest_message_content(settings, message, submission_id, http_client)
+
+        # Beats 2-3: create/resolve the Discord thread + anchor (lock released) and
+        # persist the mapping. Self-managing, so it runs outside the scope above.
+        thread, new_thread = await ensure_thread_persisted(
+            settings, message, submission_id, post_anchor=created, bot_id=bot_id,
+        )
+        if thread is None:
+            log.warning("could not create/resolve thread for submission %s", submission_id)
+            return False
+
+        # Beat 4 (DB): duplicate check (new submissions only) + recompute. Their
+        # Discord sends still run under this scope; lifting them out is Slice B/C.
+        async with session_scope() as session:
+            submission = await session.get(Submission, submission_id)
+            if submission is None:
+                return False
+            if created and await _close_if_duplicate(session, settings, message, submission, thread):
+                return False
+            await recompute_and_request(
+                session, submission, settings=settings, destination=thread,
+                yt_client=yt_client, bot_id=bot_id,
+            )
+            return new_thread
 
 
-async def _ensure_thread(
+async def _close_if_duplicate(
     session: AsyncSession,
     settings: Settings,
     message: discord.Message,
     submission: Submission,
-    post_anchor: bool = True,
+    thread: discord.Thread,
+) -> bool:
+    """If a new submission duplicates existing content, post the duplicate notice,
+    delete the submission, clear the 🦋, and archive the thread (which stays as a
+    record of the notice). Returns True if the submission was closed."""
+    guild_id = message.guild.id if message.guild else 0
+    links = list(await session.scalars(
+        select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
+    ))
+    for link in links:
+        dup = await _find_duplicate(session, link.canonical_url, submission.id, guild_id)
+        if dup is None:
+            continue
+        kind, ref_url = dup
+        if kind == "published":
+            notice = replies.duplicate_posted(ref_url)
+        elif kind == "queued":
+            notice = replies.duplicate_queued(ref_url)
+        else:
+            notice = replies.duplicate_pending(ref_url)
+        await thread.send(notice)
+        log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
+        sub_id = submission.id
+        board = await session.get(Board, submission.board_id)
+        remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
+        await _delete_submission_cascade(session, sub_id)
+        # Remove butterfly so future scans skip this post.
+        await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
+        # Archive immediately - the notice above already says "Closing this thread."
+        # A fire-and-forget delay would be lost on bot restart, and the submission
+        # row is gone so the cleanup scheduler can't recover it either.
+        await _archive_thread(thread)
+        return True
+    return False
+
+
+async def _ensure_thread_io(
+    settings: Settings,
+    message: discord.Message,
+    submission: Submission,
+    *,
+    content_title: str,
+    anchor_title: str | None,
+    mapping_thread_id: int | None,
+    post_anchor: bool,
     bot_id: int | None = None,
 ) -> tuple[discord.Thread | None, bool]:
-    """Get (or create) the per-submission *private* thread.
+    """Resolve the per-submission private thread or create a new one, posting the
+    anchor. **I/O only - no DB access** - so it runs with the DB lock released
+    (see docs/db-lock-io-refactor.md). The caller persists submission.thread_id
+    and the SubmissionThread mapping via _persist_thread_mapping afterward.
 
-    Reuse is keyed by a durable SubmissionThread mapping (survives 🦋 removal).
+    ``submission`` is read-only here (its already-loaded attributes feed the
+    anchor), so a detached instance is fine. ``mapping_thread_id`` is the thread
+    id from the durable SubmissionThread mapping (survives 🦋 removal), or None.
     The anchor ping is re-posted when post_anchor=True (new submission), skipped
     when False (catchup re-scan of an already-live submission).
-    """
-    # Derive the content title once - used for both the thread name and the anchor message.
-    inbound = discord_message_to_inbound(message)
-    content_title = await _derive_thread_title(session, inbound, submission)
-    # Strip fallback sentinel ("🦋 submission N") before passing to anchor - title=None
-    # tells the anchor to omit the 📌 line rather than show the generic placeholder.
-    anchor_title: str | None = content_title if not content_title.startswith("🦋 submission") else None
 
-    mapping = await session.scalar(
-        select(SubmissionThread).where(
-            SubmissionThread.board_id == submission.board_id,
-            SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
-        )
-    )
-    if mapping is not None:
-        existing = await _resolve_thread(message, mapping.thread_id)
+    Returns (thread, is_new); thread is None if creation was rate-limited/failed.
+    """
+    if mapping_thread_id is not None:
+        existing = await _resolve_thread(message, mapping_thread_id)
         if existing is not None:
-            submission.thread_id = mapping.thread_id
             if post_anchor:
                 await _unarchive_thread(existing)
                 await _post_thread_anchor(settings, message, submission, existing, content_title=anchor_title, bot_id=bot_id)
@@ -441,19 +476,85 @@ async def _ensure_thread(
         return None, False
 
     await _post_thread_anchor(settings, message, submission, thread, content_title=anchor_title, bot_id=bot_id)
+    return thread, True
 
-    submission.thread_id = thread.id
+
+async def _persist_thread_mapping(session: AsyncSession, submission: Submission, thread_id: int) -> None:
+    """Record the resolved thread id on the submission and upsert its durable
+    SubmissionThread mapping (the reuse key that survives 🦋 removal). DB only."""
+    submission.thread_id = thread_id
+    mapping = await session.scalar(
+        select(SubmissionThread).where(
+            SubmissionThread.board_id == submission.board_id,
+            SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+        )
+    )
     if mapping is None:
         session.add(
             SubmissionThread(
                 board_id=submission.board_id,
                 source_discord_message_id=submission.source_discord_message_id,
-                thread_id=thread.id,
+                thread_id=thread_id,
             )
         )
     else:
-        mapping.thread_id = thread.id  # old thread was gone; remember the new one
-    return thread, True
+        mapping.thread_id = thread_id  # old thread was gone; remember the new one
+
+
+async def ensure_thread_persisted(
+    settings: Settings,
+    message: discord.Message,
+    submission_id: int,
+    *,
+    post_anchor: bool,
+    bot_id: int | None = None,
+) -> tuple[discord.Thread | None, bool]:
+    """Ensure the submission's Discord thread exists and its mapping is stored,
+    keeping the rate-limited thread creation + anchor out of the DB lock.
+
+    Self-managing (opens its own short scopes): a DB read for the title + existing
+    mapping, then thread creation/resolution + anchor with the lock released, then
+    a DB write to persist the mapping. Callers must NOT hold a session_scope.
+    Returns (thread, is_new); thread is None if the submission vanished or thread
+    creation was rate-limited/failed.
+    """
+    # Beat 1 (DB): read the thread title and the existing mapping.
+    async with session_scope() as session:
+        submission = await session.get(Submission, submission_id)
+        if submission is None:
+            return None, False
+        inbound = discord_message_to_inbound(message)
+        content_title = await _derive_thread_title(session, inbound, submission)
+        # Strip fallback sentinel ("🦋 submission N") - title=None tells the anchor
+        # to omit the 📌 line rather than show the generic placeholder.
+        anchor_title = content_title if not content_title.startswith("🦋 submission") else None
+        mapping = await session.scalar(
+            select(SubmissionThread).where(
+                SubmissionThread.board_id == submission.board_id,
+                SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+            )
+        )
+        mapping_thread_id = mapping.thread_id if mapping is not None else None
+        # submission is detached after this scope; _ensure_thread_io only reads its
+        # already-loaded attributes for the anchor, which is safe.
+
+    # Beat 2 (I/O, lock released): create/resolve the thread and post the anchor.
+    thread, new_thread = await _ensure_thread_io(
+        settings, message, submission,
+        content_title=content_title, anchor_title=anchor_title,
+        mapping_thread_id=mapping_thread_id, post_anchor=post_anchor, bot_id=bot_id,
+    )
+    if thread is None:
+        return None, False
+
+    # Beat 3 (DB): persist the thread id + mapping.
+    async with session_scope() as session:
+        submission = await session.get(Submission, submission_id)
+        if submission is None:
+            log.warning("submission %s vanished during thread creation", submission_id)
+            return None, False
+        await _persist_thread_mapping(session, submission, thread.id)
+    return thread, new_thread
 
 
 async def _post_thread_anchor(
@@ -1739,8 +1840,7 @@ async def _resolve_thread_by_id(
 
 
 async def reingest_submission(
-    session: AsyncSession,
-    submission: Submission,
+    submission_id: int,
     *,
     message: discord.Message,
     settings: Settings,
@@ -1753,11 +1853,15 @@ async def reingest_submission(
     and re-resolves link metadata/media - the useful half of unbutterfly+rebutterfly,
     without the destructive full delete.
 
+    Self-managing (see docs/db-lock-io-refactor.md): the tear-down and re-apply run in
+    short DB scopes; the re-ingest (HTTP + downloads) goes through
+    ingest_message_content with the lock released. Callers must NOT hold a session_scope.
+
     Preserved: curator-entered alt text (matched by the stable discord_attachment_id;
     PROVIDED and SKIPPED are deliberate resolutions) and all submission-level decisions
     (source waiver/note, graphic label, playlist opt-out) which live on the Submission
     row and are never touched here. The resolver-sourced video (discord_attachment_id
-    == 0), if any, is kept as-is - its _ingest_resolved_video guard makes the re-resolve
+    == 0), if any, is kept as-is - ingest's has_existing_video guard makes the re-resolve
     a no-op, so the file and its alt survive (a changed upstream video won't refresh via
     reingest; rebutterfly for that).
 
@@ -1765,77 +1869,124 @@ async def reingest_submission(
     recompute_and_request won't re-prompt for things already answered. The caller runs
     recompute_and_request afterward.
     """
-    existing_atts = list(
-        await session.scalars(
-            select(Attachment).where(Attachment.submission_id == submission.id)
-        )
-    )
-    # discord_attachment_id -> (body, status, author) for human-resolved alt only.
-    preserved_alt = {
-        a.discord_attachment_id: (a.alt_text_body, a.alt_text_status, a.alt_text_author)
-        for a in existing_atts
-        if a.alt_text_status in (AltTextStatus.PROVIDED.value, AltTextStatus.SKIPPED.value)
-    }
-
-    # Drop Discord-sourced attachments (rebuilt from the message) plus their per-image
-    # alt-text request rows (keyed by attachment_id - they'd dangle otherwise). Keep the
-    # resolver video (id 0) and its request row.
-    removed_ids = [a.id for a in existing_atts if a.discord_attachment_id != 0]
-    if removed_ids:
-        await session.execute(
-            delete(AttachmentAltTextRequest).where(
-                AttachmentAltTextRequest.attachment_id.in_(removed_ids)
+    # Beat 1 (DB): capture preserved alt, tear down message-derived rows/embed.
+    async with session_scope() as session:
+        submission = await session.get(Submission, submission_id)
+        if submission is None:
+            return
+        existing_atts = list(
+            await session.scalars(
+                select(Attachment).where(Attachment.submission_id == submission_id)
             )
         )
-        await session.execute(delete(Attachment).where(Attachment.id.in_(removed_ids)))
+        # discord_attachment_id -> (body, status, author) for human-resolved alt only.
+        preserved_alt = {
+            a.discord_attachment_id: (a.alt_text_body, a.alt_text_status, a.alt_text_author)
+            for a in existing_atts
+            if a.alt_text_status in (AltTextStatus.PROVIDED.value, AltTextStatus.SKIPPED.value)
+        }
 
-    # Links and captured embed fields are fully derived from the message - rebuild them.
-    await session.execute(
-        delete(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
-    )
-    submission.embed_title = None
-    submission.embed_description = None
-    submission.embed_thumb_url = None
-    await session.flush()
+        # Drop Discord-sourced attachments (rebuilt from the message) plus their per-image
+        # alt-text request rows (keyed by attachment_id - they'd dangle otherwise). Keep the
+        # resolver video (id 0) and its request row.
+        removed_ids = [a.id for a in existing_atts if a.discord_attachment_id != 0]
+        if removed_ids:
+            await session.execute(
+                delete(AttachmentAltTextRequest).where(
+                    AttachmentAltTextRequest.attachment_id.in_(removed_ids)
+                )
+            )
+            await session.execute(delete(Attachment).where(Attachment.id.in_(removed_ids)))
 
-    inbound = discord_message_to_inbound(message)
-    thumb_proxy_url = await _ingest_content(session, submission, inbound, settings, http_client)
-    await _resolve_links(
-        session, submission, settings, http_client, embed_thumb_proxy_url=thumb_proxy_url
-    )
+        # Links and captured embed fields are fully derived from the message - rebuild them.
+        await session.execute(
+            delete(SubmissionLink).where(SubmissionLink.submission_id == submission_id)
+        )
+        submission.embed_title = None
+        submission.embed_description = None
+        submission.embed_thumb_url = None
 
-    # Re-apply preserved alt onto re-created attachments that still match by id.
+    # Beat 2: re-ingest with the lock released (self-managing).
+    await ingest_message_content(settings, message, submission_id, http_client)
+
+    # Beat 3 (DB): re-apply preserved alt onto re-created attachments matching by id.
     if preserved_alt:
-        for a in await session.scalars(
-            select(Attachment).where(Attachment.submission_id == submission.id)
-        ):
-            snap = preserved_alt.get(a.discord_attachment_id)
-            if snap is not None:
-                a.alt_text_body, a.alt_text_status, a.alt_text_author = snap
-        await session.flush()
+        async with session_scope() as session:
+            for a in await session.scalars(
+                select(Attachment).where(Attachment.submission_id == submission_id)
+            ):
+                snap = preserved_alt.get(a.discord_attachment_id)
+                if snap is not None:
+                    a.alt_text_body, a.alt_text_status, a.alt_text_author = snap
 
 
-async def _ingest_content(
-    session: AsyncSession,
-    submission: Submission,
-    message: InboundMessage,
-    settings: Settings,
-    http_client: httpx.AsyncClient,
-) -> str | None:
-    """One-time parse of links + embed capture + attachment download.
+@dataclass
+class _AttachmentPlan:
+    """A persisted Attachment skeleton row awaiting its downloaded file."""
+    row_id: int
+    url: str
+    filename: str
+    is_video: bool
 
-    Returns the thumbnail proxy_url (if any) for use as a download fallback
-    in _resolve_links when the original URL requires site auth.
-    """
+
+@dataclass
+class _LinkPlan:
+    """A persisted SubmissionLink skeleton row awaiting resolution."""
+    link_id: int
+    canonical_url: str
+    domain_family: str
+    is_primary: bool
+
+
+@dataclass
+class _IngestPlan:
+    """Skeleton rows + context captured under the lock, fed to the (lockless)
+    download/resolve gather phase."""
+    submission_id: int
+    board_id: int
+    link_plans: list[_LinkPlan]
+    att_plans: list[_AttachmentPlan]
+    embed_title: str | None
+    embed_description: str | None
+    embed_thumb_url: str | None
+    thumb_proxy_url: str | None
+    # A video attachment already exists (Discord-uploaded here, or a resolver
+    # video preserved across reingest) - suppresses re-downloading a resolved one.
+    has_existing_video: bool
+
+
+@dataclass
+class _LinkOutcome:
+    link_id: int
+    title: str | None
+    description: str | None
+    image_url: str | None
+    via: str | None
+    source_at_uri: str | None
+    image_path: str | None
+    video_url: str | None = None
+    video_width: int | None = None
+    video_height: int | None = None
+    video_path: str | None = None
+
+
+@dataclass
+class _IngestOutcome:
+    """Results of the gather phase, written back to the rows under the lock."""
+    link_outcomes: list[_LinkOutcome]
+    att_paths: dict[int, str]
+
+
+def _extract_raw_urls(message: InboundMessage) -> list[str]:
+    """Candidate source URLs from message text, then embed URLs (mobile share
+    sheets), then forwarded-snapshot content/embeds - first non-empty wins."""
     raw_urls = extract_urls(message.content)
-    # Mobile share sheets send an embed URL without URL text in message.content.
     if not raw_urls:
         seen: set[str] = set()
         for embed in message.embeds:
             if embed.url and embed.url not in seen:
                 seen.add(embed.url)
                 raw_urls.append(embed.url)
-    # Forwarded messages store content/embeds in snapshots.
     if not raw_urls:
         for snap in message.snapshots:
             snap_urls = extract_urls(snap.content or "")
@@ -1848,27 +1999,348 @@ async def _ingest_content(
                     break
             if raw_urls:
                 break
-    for i, raw in enumerate(raw_urls):
+    return raw_urls
+
+
+async def _persist_ingest_skeletons(
+    session: AsyncSession, submission: Submission, message: InboundMessage
+) -> _IngestPlan:
+    """Create the SubmissionLink + Attachment skeleton rows (no downloads) and
+    capture the embed. DB only, so it runs under a short lock; the returned plan
+    is what the lockless gather phase downloads/resolves against."""
+    for i, raw in enumerate(_extract_raw_urls(message)):
         res = canonicalize(raw)
-        session.add(
-            SubmissionLink(
-                submission_id=submission.id,
-                order_index=i,
-                raw_url=raw,
-                canonical_url=res.canonical_url,
-                domain_family=res.domain_family,
-            )
-        )
+        session.add(SubmissionLink(
+            submission_id=submission.id, order_index=i,
+            raw_url=raw, canonical_url=res.canonical_url, domain_family=res.domain_family,
+        ))
+    await session.flush()
+    links = list((await session.scalars(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == submission.id)
+        .order_by(SubmissionLink.order_index)
+    )).all())
+    link_plans = [
+        _LinkPlan(link_id=link.id, canonical_url=link.canonical_url,
+                  domain_family=link.domain_family, is_primary=(idx == 0))
+        for idx, link in enumerate(links)
+    ]
 
     thumb_proxy_url = _capture_embed(submission, message)
 
     all_attachments = list(message.attachments)
     for snap in message.snapshots:
         all_attachments.extend(snap.attachments)
+    created: list[tuple[Attachment, InboundAttachment, bool]] = []
     for att in all_attachments:
-        await _ingest_attachment(session, submission, att, settings, http_client)
+        is_img = is_image_attachment(att.content_type, att.filename)
+        is_vid = is_video_attachment(att.content_type, att.filename)
+        status, body = initial_alt_text(is_image=is_img, is_video=is_vid, discord_description=att.description)
+        row = Attachment(
+            submission_id=submission.id, discord_attachment_id=att.id, filename=att.filename,
+            discord_url=att.url, mime=att.content_type, width=att.width, height=att.height,
+            spoiler=att.spoiler, is_image=is_img, is_video=is_vid,
+            alt_text_status=status.value, alt_text_body=body,
+        )
+        session.add(row)
+        created.append((row, att, is_vid))
+    await session.flush()
+    att_plans = [
+        _AttachmentPlan(row_id=row.id, url=att.url, filename=att.filename, is_video=is_vid)
+        for row, att, is_vid in created
+    ]
 
-    return thumb_proxy_url
+    # Covers both a Discord video just created above and a resolver video preserved
+    # across reingest (discord_attachment_id == 0), so gather won't re-download one.
+    has_existing_video = await session.scalar(
+        select(Attachment.id).where(
+            Attachment.submission_id == submission.id, Attachment.is_video.is_(True)
+        )
+    ) is not None
+
+    return _IngestPlan(
+        submission_id=submission.id, board_id=submission.board_id,
+        link_plans=link_plans, att_plans=att_plans,
+        embed_title=submission.embed_title, embed_description=submission.embed_description,
+        embed_thumb_url=submission.embed_thumb_url, thumb_proxy_url=thumb_proxy_url,
+        has_existing_video=has_existing_video,
+    )
+
+
+async def _download_attachment_file(
+    plan: _AttachmentPlan, dest: str, settings: Settings, http_client: httpx.AsyncClient
+) -> str | None:
+    """Download one attachment's bytes (transcoding video). HTTP only; returns the
+    local path, or None on failure/storage-full."""
+    try:
+        path = await download_attachment(
+            url=plan.url, dest_dir=dest, filename=f"{plan.row_id}_{plan.filename}",
+            data_dir=settings.data_dir, min_free_mb=settings.storage_min_free_mb, client=http_client,
+        )
+    except StorageFullError:
+        log.warning("storage full: attachment row %s not downloaded", plan.row_id)
+        return None
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("failed to download attachment row %s: %s", plan.row_id, exc)
+        return None
+    if plan.is_video and path:
+        path = await _transcode_video(path)
+    return path
+
+
+async def _download_thumb(
+    plan: _IngestPlan, link: _LinkPlan, image_url: str, dest: str,
+    settings: Settings, http_client: httpx.AsyncClient,
+) -> str | None:
+    """Download a link's resolved thumbnail, falling back to the Discord proxy
+    copy for the primary link when the source CDN blocks us. HTTP only."""
+    extra_headers: dict[str, str] = {}
+    if "upload.wikimedia.org" in image_url:
+        from ..resolve.fetch import _UA as _RESOLVE_UA
+        extra_headers["Referer"] = "https://en.wikipedia.org/"
+        extra_headers["User-Agent"] = _RESOLVE_UA
+    try:
+        return await download_attachment(
+            url=image_url, dest_dir=dest, filename=f"thumb_{link.link_id}",
+            data_dir=settings.data_dir, min_free_mb=settings.storage_min_free_mb,
+            client=http_client, headers=extra_headers or None,
+        )
+    except (StorageFullError, httpx.HTTPError, OSError) as exc:
+        log.info("thumbnail download failed for link %s: %s", link.link_id, exc)
+        # If the original URL failed and we have a Discord proxy copy, try that
+        # (sites like FurAffinity whose CDN requires auth/Referer).
+        if link.is_primary and plan.thumb_proxy_url and plan.thumb_proxy_url != image_url:
+            try:
+                path = await download_attachment(
+                    url=plan.thumb_proxy_url, dest_dir=dest, filename=f"thumb_{link.link_id}",
+                    data_dir=settings.data_dir, min_free_mb=settings.storage_min_free_mb, client=http_client,
+                )
+                log.info("thumbnail downloaded via Discord proxy for link %s", link.link_id)
+                return path
+            except (StorageFullError, httpx.HTTPError, OSError) as exc2:
+                log.info("Discord proxy thumbnail also failed for link %s: %s", link.link_id, exc2)
+        return None
+
+
+async def _download_resolved_video(
+    link: _LinkPlan, meta: ResolvedMetadata, dest: str, settings: Settings, http_client: httpx.AsyncClient
+) -> str | None:
+    """Download (and transcode) a resolver-provided video for a link. HTTP only;
+    returns the local path, or None on failure/oversize so ingest degrades to the
+    thumbnail card."""
+    filename = f"linkvid_{link.link_id}.mp4"
+    if meta.video_is_stream:
+        # Stream manifest (e.g. reddit): ffmpeg fetches and muxes video + audio.
+        path = await _fetch_stream_video(meta.video_url, dest, filename, settings)
+        if path is None:
+            log.info("resolved stream video failed for link %s - falling back to thumbnail", link.link_id)
+            return None
+    else:
+        try:
+            path = await download_attachment(
+                url=meta.video_url, dest_dir=dest, filename=filename,
+                data_dir=settings.data_dir, min_free_mb=settings.storage_min_free_mb, client=http_client,
+            )
+        except (StorageFullError, httpx.HTTPError, OSError) as exc:
+            log.info("resolved video download failed for link %s: %s - falling back to thumbnail", link.link_id, exc)
+            return None
+        path = await _transcode_video(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size > _MAX_RESOLVED_VIDEO_BYTES:
+        log.info("resolved video for link %s is %d bytes (over %d limit) - falling back to thumbnail",
+                 link.link_id, size, _MAX_RESOLVED_VIDEO_BYTES)
+        return None
+    return path
+
+
+async def _gather_ingest(
+    plan: _IngestPlan, settings: Settings, http_client: httpx.AsyncClient
+) -> _IngestOutcome:
+    """Download attachments and resolve link metadata/media. **No DB access** - runs
+    with the lock released (see docs/db-lock-io-refactor.md)."""
+    dest = submission_dir(settings.attachments_dir, plan.board_id, plan.submission_id)
+
+    att_paths: dict[int, str] = {}
+    for ap in plan.att_plans:
+        path = await _download_attachment_file(ap, dest, settings, http_client)
+        if path is not None:
+            att_paths[ap.row_id] = path
+
+    link_outcomes: list[_LinkOutcome] = []
+    for lp in plan.link_plans:
+        meta = await resolve(
+            lp.canonical_url, lp.domain_family, client=http_client,
+            fallback_title=plan.embed_title if lp.is_primary else None,
+            fallback_description=plan.embed_description if lp.is_primary else None,
+            fallback_image_url=plan.embed_thumb_url if lp.is_primary else None,
+            youtube_api_key=settings.youtube_api_key,
+        )
+        # Pin the permanent DID now, while the source handle still resolves.
+        source_at_uri = (
+            await resolve_bluesky_at_uri(lp.canonical_url, http_client)
+            if lp.domain_family == "bluesky" else None
+        )
+        image_path = (
+            await _download_thumb(plan, lp, meta.image_url, dest, settings, http_client)
+            if meta.image_url else None
+        )
+        outcome = _LinkOutcome(
+            link_id=lp.link_id, title=meta.title, description=meta.description,
+            image_url=meta.image_url, via=meta.via, source_at_uri=source_at_uri, image_path=image_path,
+        )
+        if lp.is_primary and meta.video_url and not plan.has_existing_video:
+            video_path = await _download_resolved_video(lp, meta, dest, settings, http_client)
+            if video_path is not None:
+                outcome.video_url = meta.video_url
+                outcome.video_width = meta.video_width
+                outcome.video_height = meta.video_height
+                outcome.video_path = video_path
+        link_outcomes.append(outcome)
+    return _IngestOutcome(link_outcomes=link_outcomes, att_paths=att_paths)
+
+
+async def _attach_resolved_video(
+    session: AsyncSession, submission_id: int, link_id: int, *,
+    video_url: str | None, video_width: int | None, video_height: int | None, video_path: str,
+) -> bool:
+    """Create the resolver-sourced video Attachment row, unless the submission
+    already has a video (Discord-uploaded or a prior resolve). Returns True if a
+    row was created. Shared by ingest and the video backfill admin script."""
+    existing = await session.scalar(
+        select(Attachment.id).where(
+            Attachment.submission_id == submission_id, Attachment.is_video.is_(True)
+        )
+    )
+    if existing is not None:
+        return False
+    status, body = initial_alt_text(is_image=False, is_video=True, discord_description=None)
+    session.add(Attachment(
+        submission_id=submission_id, discord_attachment_id=0,
+        filename=f"linkvid_{link_id}.mp4", discord_url=video_url, mime="video/mp4",
+        width=video_width, height=video_height, is_image=False, is_video=True,
+        alt_text_status=status.value, alt_text_body=body,
+        local_path=video_path, downloaded_at=_now(),
+    ))
+    log.info("resolved video attached for submission %s (link %s)", submission_id, link_id)
+    return True
+
+
+async def _persist_ingest_outcome(
+    session: AsyncSession, outcome: _IngestOutcome, submission_id: int
+) -> None:
+    """Write gathered download paths + resolved metadata back onto the skeleton
+    rows, attaching any resolved video. DB only."""
+    for row_id, path in outcome.att_paths.items():
+        att = await session.get(Attachment, row_id)
+        if att is not None:
+            att.local_path = path
+            att.downloaded_at = _now()
+    for lo in outcome.link_outcomes:
+        link = await session.get(SubmissionLink, lo.link_id)
+        if link is None:
+            continue
+        link.resolved_title = lo.title
+        link.resolved_description = lo.description
+        link.resolved_image_url = lo.image_url
+        link.resolved_via = lo.via
+        # Cleared for non-bluesky links so a re-resolve after an edit can't leave
+        # a stale URI behind.
+        link.source_at_uri = lo.source_at_uri
+        link.resolved_image_path = lo.image_path
+        if lo.video_path is not None:
+            await _attach_resolved_video(
+                session, submission_id, lo.link_id,
+                video_url=lo.video_url, video_width=lo.video_width,
+                video_height=lo.video_height, video_path=lo.video_path,
+            )
+
+
+async def ingest_message_content(
+    settings: Settings, message: discord.Message, submission_id: int, http_client: httpx.AsyncClient
+) -> None:
+    """Ingest a submission's links, embed, attachments, and resolved media,
+    keeping all HTTP (metadata resolution and thumbnail/attachment/video
+    downloads) out of the DB lock (see docs/db-lock-io-refactor.md).
+
+    Self-managing: a short DB scope persists the skeleton rows, a lockless gather
+    phase does the downloads/resolution, then a short DB scope writes the results.
+    Callers must NOT hold a session_scope.
+    """
+    inbound = discord_message_to_inbound(message)
+    async with session_scope() as session:
+        submission = await session.get(Submission, submission_id)
+        if submission is None:
+            return
+        plan = await _persist_ingest_skeletons(session, submission, inbound)
+    outcome = await _gather_ingest(plan, settings, http_client)
+    async with session_scope() as session:
+        await _persist_ingest_outcome(session, outcome, submission_id)
+
+
+async def _ingest_attachment_in_session(
+    session: AsyncSession, submission: Submission, att: InboundAttachment,
+    settings: Settings, http_client: httpx.AsyncClient,
+) -> None:
+    """Create one Attachment row and download its file, in the caller's session.
+
+    Used by the supplemental-content reply handlers, which still hold the DB lock
+    during this download; their lockless migration is part of the handler-cascade
+    slice (docs/db-lock-io-refactor.md)."""
+    is_img = is_image_attachment(att.content_type, att.filename)
+    is_vid = is_video_attachment(att.content_type, att.filename)
+    status, body = initial_alt_text(is_image=is_img, is_video=is_vid, discord_description=att.description)
+    row = Attachment(
+        submission_id=submission.id, discord_attachment_id=att.id, filename=att.filename,
+        discord_url=att.url, mime=att.content_type, width=att.width, height=att.height,
+        spoiler=att.spoiler, is_image=is_img, is_video=is_vid,
+        alt_text_status=status.value, alt_text_body=body,
+    )
+    session.add(row)
+    await session.flush()  # assign row.id
+    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
+    path = await _download_attachment_file(
+        _AttachmentPlan(row_id=row.id, url=att.url, filename=att.filename, is_video=is_vid),
+        dest, settings, http_client,
+    )
+    if path is not None:
+        row.local_path = path
+        row.downloaded_at = _now()
+
+
+async def _resolve_links_in_session(
+    session: AsyncSession, submission: Submission, settings: Settings, http_client: httpx.AsyncClient,
+) -> None:
+    """Re-resolve a submission's existing links in the caller's session (still under
+    the DB lock). Used by the supplemental-content reply handlers; migrating them to
+    the lockless path is part of the handler-cascade slice (docs/db-lock-io-refactor.md)."""
+    links = list((await session.scalars(
+        select(SubmissionLink)
+        .where(SubmissionLink.submission_id == submission.id)
+        .order_by(SubmissionLink.order_index)
+    )).all())
+    if not links:
+        return
+    has_existing_video = await session.scalar(
+        select(Attachment.id).where(
+            Attachment.submission_id == submission.id, Attachment.is_video.is_(True)
+        )
+    ) is not None
+    plan = _IngestPlan(
+        submission_id=submission.id, board_id=submission.board_id,
+        link_plans=[
+            _LinkPlan(link_id=link.id, canonical_url=link.canonical_url,
+                      domain_family=link.domain_family, is_primary=(idx == 0))
+            for idx, link in enumerate(links)
+        ],
+        att_plans=[], embed_title=submission.embed_title,
+        embed_description=submission.embed_description, embed_thumb_url=submission.embed_thumb_url,
+        thumb_proxy_url=None, has_existing_video=has_existing_video,
+    )
+    outcome = await _gather_ingest(plan, settings, http_client)
+    await _persist_ingest_outcome(session, outcome, submission.id)
 
 
 def _capture_embed(submission: Submission, message: InboundMessage) -> str | None:
@@ -1894,232 +2366,10 @@ def _capture_embed(submission: Submission, message: InboundMessage) -> str | Non
     return None
 
 
-async def _resolve_links(
-    session: AsyncSession,
-    submission: Submission,
-    settings: Settings,
-    http_client: httpx.AsyncClient,
-    embed_thumb_proxy_url: str | None = None,
-) -> None:
-    """Resolve per-link metadata and download each thumbnail to the volume.
-
-    The primary (first) link falls back to the Discord-captured embed when our
-    own fetch comes up empty. embed_thumb_proxy_url is Discord's CDN copy of
-    the thumbnail - used as a download fallback when the source site's CDN
-    blocks unauthenticated requests (e.g. FurAffinity).
-    """
-    links = list(
-        (
-            await session.scalars(
-                select(SubmissionLink)
-                .where(SubmissionLink.submission_id == submission.id)
-                .order_by(SubmissionLink.order_index)
-            )
-        ).all()
-    )
-    for idx, link in enumerate(links):
-        is_primary = idx == 0
-        meta = await resolve(
-            link.canonical_url,
-            link.domain_family,
-            client=http_client,
-            fallback_title=submission.embed_title if is_primary else None,
-            fallback_description=submission.embed_description if is_primary else None,
-            fallback_image_url=submission.embed_thumb_url if is_primary else None,
-            youtube_api_key=settings.youtube_api_key,
-        )
-        link.resolved_title = meta.title
-        link.resolved_description = meta.description
-        link.resolved_image_url = meta.image_url
-        link.resolved_via = meta.via
-        # Pin the permanent DID now, while the source handle still resolves, so a
-        # later handle rename/deactivation can't break the repost at publish time.
-        # Cleared for non-bluesky links so a re-resolve after an edit can't leave a
-        # stale URI behind.
-        link.source_at_uri = (
-            await resolve_bluesky_at_uri(link.canonical_url, http_client)
-            if link.domain_family == "bluesky"
-            else None
-        )
-        if meta.image_url:
-            dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
-            extra_headers: dict[str, str] = {}
-            if "upload.wikimedia.org" in meta.image_url:
-                from ..resolve.fetch import _UA as _RESOLVE_UA
-                extra_headers["Referer"] = "https://en.wikipedia.org/"
-                extra_headers["User-Agent"] = _RESOLVE_UA
-            try:
-                link.resolved_image_path = await download_attachment(
-                    url=meta.image_url,
-                    dest_dir=dest,
-                    filename=f"thumb_{link.id}",
-                    data_dir=settings.data_dir,
-                    min_free_mb=settings.storage_min_free_mb,
-                    client=http_client,
-                    headers=extra_headers or None,
-                )
-            except (StorageFullError, httpx.HTTPError, OSError) as exc:
-                log.info("thumbnail download failed for link %s: %s", link.id, exc)
-                # If the original URL failed and we have a Discord proxy copy, try that.
-                # Handles sites (e.g. FurAffinity) whose CDN requires auth or Referer.
-                if (
-                    is_primary
-                    and embed_thumb_proxy_url
-                    and embed_thumb_proxy_url != meta.image_url
-                ):
-                    try:
-                        link.resolved_image_path = await download_attachment(
-                            url=embed_thumb_proxy_url,
-                            dest_dir=dest,
-                            filename=f"thumb_{link.id}",
-                            data_dir=settings.data_dir,
-                            min_free_mb=settings.storage_min_free_mb,
-                            client=http_client,
-                        )
-                        log.info("thumbnail downloaded via Discord proxy for link %s", link.id)
-                    except (StorageFullError, httpx.HTTPError, OSError) as exc2:
-                        log.info("Discord proxy thumbnail also failed for link %s: %s", link.id, exc2)
-        if is_primary and meta.video_url:
-            await _ingest_resolved_video(session, submission, link, meta, settings, http_client)
-
-
 # Matches the publish-side Bluesky video limit (95 MB headroom under 100 MB).
 # Oversize resolved videos are dropped here so the submission falls back to the
 # thumbnail card instead of queueing a video that can never upload.
 _MAX_RESOLVED_VIDEO_BYTES = 95 * 1024 * 1024
-
-
-async def _ingest_resolved_video(
-    session: AsyncSession,
-    submission: Submission,
-    link: SubmissionLink,
-    meta: ResolvedMetadata,
-    settings: Settings,
-    http_client: httpx.AsyncClient,
-) -> None:
-    """Download a resolver-provided video and attach it to the submission.
-
-    Gives link-only submissions (twitter GIFs/videos, TikToks, reddit GIFs) a
-    real video attachment so publish posts native video instead of a thumbnail
-    card. The Attachment row is only created after a successful download, so
-    any failure here degrades to the existing thumbnail behavior rather than
-    queueing a video post that can never upload.
-
-    Idempotent: skips when the submission already has a video attachment
-    (Discord-uploaded or from a previous resolve pass).
-    """
-    existing = await session.scalar(
-        select(Attachment).where(
-            Attachment.submission_id == submission.id,
-            Attachment.is_video.is_(True),
-        )
-    )
-    if existing is not None:
-        return
-
-    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
-    filename = f"linkvid_{link.id}.mp4"
-    if meta.video_is_stream:
-        # Stream manifest (e.g. reddit): ffmpeg fetches and muxes video + separate audio.
-        path = await _fetch_stream_video(meta.video_url, dest, filename, settings)
-        if path is None:
-            log.info("resolved stream video failed for link %s - falling back to thumbnail", link.id)
-            return
-    else:
-        try:
-            path = await download_attachment(
-                url=meta.video_url,
-                dest_dir=dest,
-                filename=filename,
-                data_dir=settings.data_dir,
-                min_free_mb=settings.storage_min_free_mb,
-                client=http_client,
-            )
-        except (StorageFullError, httpx.HTTPError, OSError) as exc:
-            log.info("resolved video download failed for link %s: %s - falling back to thumbnail", link.id, exc)
-            return
-        path = await _transcode_video(path)
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    if size > _MAX_RESOLVED_VIDEO_BYTES:
-        log.info(
-            "resolved video for link %s is %d bytes (over %d limit) - falling back to thumbnail",
-            link.id, size, _MAX_RESOLVED_VIDEO_BYTES,
-        )
-        return
-
-    status, body = initial_alt_text(is_image=False, is_video=True, discord_description=None)
-    row = Attachment(
-        submission_id=submission.id,
-        discord_attachment_id=0,  # not from Discord: sourced by the link resolver
-        filename=f"linkvid_{link.id}.mp4",
-        discord_url=meta.video_url,  # original source URL, kept for provenance
-        mime="video/mp4",
-        width=meta.video_width,
-        height=meta.video_height,
-        is_image=False,
-        is_video=True,
-        alt_text_status=status.value,
-        alt_text_body=body,
-        local_path=path,
-        downloaded_at=_now(),
-    )
-    session.add(row)
-    await session.flush()
-    log.info("resolved video attached for submission %s (link %s, %d bytes)", submission.id, link.id, size)
-
-
-async def _ingest_attachment(
-    session: AsyncSession,
-    submission: Submission,
-    att: InboundAttachment,
-    settings: Settings,
-    http_client: httpx.AsyncClient,
-) -> Attachment:
-    """Persist one attachment row and download its bytes to the volume."""
-    is_img = is_image_attachment(att.content_type, att.filename)
-    is_vid = is_video_attachment(att.content_type, att.filename)
-    status, body = initial_alt_text(is_image=is_img, is_video=is_vid, discord_description=att.description)
-    row = Attachment(
-        submission_id=submission.id,
-        discord_attachment_id=att.id,
-        filename=att.filename,
-        discord_url=att.url,
-        mime=att.content_type,
-        width=att.width,
-        height=att.height,
-        spoiler=att.spoiler,
-        is_image=is_img,
-        is_video=is_vid,
-        alt_text_status=status.value,
-        alt_text_body=body,
-    )
-    session.add(row)
-    await session.flush()  # assign row.id
-    dest = submission_dir(settings.attachments_dir, submission.board_id, submission.id)
-    try:
-        path = await download_attachment(
-            url=att.url,
-            dest_dir=dest,
-            filename=f"{row.id}_{att.filename}",
-            data_dir=settings.data_dir,
-            min_free_mb=settings.storage_min_free_mb,
-            client=http_client,
-        )
-        row.local_path = path
-        row.downloaded_at = _now()
-        if is_vid and row.local_path:
-            row.local_path = await _transcode_video(row.local_path)
-    except StorageFullError:
-        log.warning(
-            "storage full: attachment %s for submission %s not downloaded",
-            att.id, submission.id,
-        )
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("failed to download attachment %s: %s", att.id, exc)
-    return row
 
 
 _STREAM_MUX_TIMEOUT = 180  # seconds; ffmpeg fetch+mux of a remote HLS/DASH stream
@@ -3220,7 +3470,7 @@ async def _apply_answer(
             await message.reply(replies.media_not_found(), mention_author=False)
             return False
         for att in image_atts:
-            await _ingest_attachment(session, submission, discord_attachment_to_inbound(att), settings, http_client)
+            await _ingest_attachment_in_session(session, submission, discord_attachment_to_inbound(att), settings, http_client)
 
     elif isinstance(req, SourceRequest):
         urls = extract_urls(message.content)
@@ -3258,7 +3508,7 @@ async def _apply_answer(
                 )
             )
         await session.flush()  # assign link IDs before resolving
-        await _resolve_links(session, submission, settings, http_client)
+        await _resolve_links_in_session(session, submission, settings, http_client)
 
     elif isinstance(req, SupplementalLinkRequest):
         urls = extract_urls(message.content)
@@ -3283,7 +3533,7 @@ async def _apply_answer(
                 )
             )
         await session.flush()
-        await _resolve_links(session, submission, settings, http_client)
+        await _resolve_links_in_session(session, submission, settings, http_client)
 
     elif isinstance(req, AttachmentAltTextRequest):
         body = (message.content or "").strip()
@@ -3329,7 +3579,7 @@ async def _apply_answer(
             primary.resolved_image_path = None
             primary.resolved_via = None
         await message.reply(replies.metadata_link_updated(canon.canonical_url), mention_author=False)
-        await _resolve_links(session, submission, settings, http_client)
+        await _resolve_links_in_session(session, submission, settings, http_client)
 
     req.answer = message.content
     req.answered_by = message.author.id

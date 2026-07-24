@@ -823,20 +823,17 @@ async def test_resolve_reddit_regular_video_without_manifest_is_skipped():
     assert result.image_url == "https://preview.redd.it/still.jpg"
 
 
-# --- service._resolve_links thumbnail download (wikimedia headers + discord proxy fallback) ---
+# --- service._download_thumb (wikimedia headers + discord proxy fallback) ---
 #
-# These live here for topic proximity (they exercise how resolved metadata is
-# turned into a downloaded thumbnail) but the code under test is
-# bot.discord_ingest.service._resolve_links. resolve() and download_attachment
-# are patched at the service module level.
+# These live here for topic proximity (how a resolved image_url becomes a
+# downloaded thumbnail). The code under test is the lockless
+# bot.discord_ingest.service._download_thumb; download_attachment is patched at
+# the service module level. It returns the local path (no DB writes).
 
 import httpx
 
-from bot.discord_ingest.service import _resolve_links
-from bot.models import SubmissionLink
-from bot.resolve.fetch import ResolvedMetadata, _UA
-
-from conftest import make_submission
+from bot.discord_ingest.service import _IngestPlan, _LinkPlan, _download_thumb
+from bot.resolve.fetch import _UA
 
 
 def _link_settings(tmp_path) -> MagicMock:
@@ -848,116 +845,85 @@ def _link_settings(tmp_path) -> MagicMock:
     return s
 
 
-async def _seed_link(session, board, url: str, family: str = "other"):
-    """Create a submission holding a single unresolved link; returns (submission, link)."""
-    sub = make_submission(board)
-    session.add(sub)
-    await session.flush()
-    link = SubmissionLink(
-        submission_id=sub.id,
-        order_index=0,
-        raw_url=url,
-        canonical_url=url,
-        domain_family=family,
+def _plan(thumb_proxy_url=None) -> _IngestPlan:
+    return _IngestPlan(
+        submission_id=1, board_id=1, link_plans=[], att_plans=[],
+        embed_title=None, embed_description=None, embed_thumb_url=None,
+        thumb_proxy_url=thumb_proxy_url, has_existing_video=False,
     )
-    session.add(link)
-    await session.flush()
-    return sub, link
+
+
+def _lp(is_primary=True) -> _LinkPlan:
+    return _LinkPlan(link_id=1, canonical_url="https://x", domain_family="other", is_primary=is_primary)
 
 
 @pytest.mark.asyncio
-async def test_resolve_links_wikimedia_image_gets_referer_and_ua(session, board, tmp_path):
+async def test_download_thumb_wikimedia_image_gets_referer_and_ua(tmp_path):
     """upload.wikimedia.org thumbnails are fetched with a Referer + resolver UA
     (their CDN 403s bare requests).
     """
-    submission, link = await _seed_link(session, board, "https://en.wikipedia.org/wiki/Oshkosh_NGDV", "wikipedia")
-    meta = ResolvedMetadata(
-        title="Oshkosh NGDV",
-        image_url="https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg",
-        via="wikipedia_api",
-    )
-
-    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
-         patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_1")) as dl:
-        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+    image_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg"
+    with patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_1")) as dl:
+        path = await _download_thumb(_plan(), _lp(), image_url, str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     dl.assert_called_once()
     headers = dl.call_args.kwargs["headers"]
     assert headers["Referer"] == "https://en.wikipedia.org/"
     assert headers["User-Agent"] == _UA
-    assert link.resolved_image_path == "/vol/thumb_1"
+    assert path == "/vol/thumb_1"
 
 
 @pytest.mark.asyncio
-async def test_resolve_links_non_wikimedia_image_gets_no_extra_headers(session, board, tmp_path):
-    submission, link = await _seed_link(session, board, "https://example.com/post")
-    meta = ResolvedMetadata(title="Post", image_url="https://cdn.example.com/img.jpg", via="opengraph")
-
-    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
-         patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_2")) as dl:
-        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+async def test_download_thumb_non_wikimedia_image_gets_no_extra_headers(tmp_path):
+    with patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_2")) as dl:
+        path = await _download_thumb(_plan(), _lp(), "https://cdn.example.com/img.jpg", str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     dl.assert_called_once()
     assert dl.call_args.kwargs["headers"] is None
+    assert path == "/vol/thumb_2"
 
 
 @pytest.mark.asyncio
-async def test_resolve_links_falls_back_to_discord_proxy(session, board, tmp_path):
+async def test_download_thumb_falls_back_to_discord_proxy(tmp_path):
     """Primary thumbnail download fails: the Discord CDN proxy copy is tried
-    and its path recorded.
+    and its path returned.
     """
-    submission, link = await _seed_link(session, board, "https://www.furaffinity.net/view/123/")
-    meta = ResolvedMetadata(title="Art", image_url="https://d.furaffinity.net/art/x.png", via="opengraph")
+    image_url = "https://d.furaffinity.net/art/x.png"
     proxy = "https://media.discordapp.net/external/proxy.png"
 
     dl = AsyncMock(side_effect=[httpx.HTTPError("403 blocked"), "/vol/thumb_proxy"])
-    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
-         patch("bot.discord_ingest.service.download_attachment", new=dl):
-        await _resolve_links(
-            session, submission, _link_settings(tmp_path), MagicMock(),
-            embed_thumb_proxy_url=proxy,
-        )
+    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+        path = await _download_thumb(_plan(thumb_proxy_url=proxy), _lp(), image_url, str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     assert dl.call_count == 2
-    assert dl.call_args_list[0].kwargs["url"] == meta.image_url
+    assert dl.call_args_list[0].kwargs["url"] == image_url
     assert dl.call_args_list[1].kwargs["url"] == proxy
-    assert link.resolved_image_path == "/vol/thumb_proxy"
+    assert path == "/vol/thumb_proxy"
 
 
 @pytest.mark.asyncio
-async def test_resolve_links_proxy_failure_swallowed(session, board, tmp_path):
-    """Both the source CDN and the Discord proxy failing is non-fatal:
-    metadata is kept, resolved_image_path just stays unset.
-    """
-    submission, link = await _seed_link(session, board, "https://www.furaffinity.net/view/456/")
-    meta = ResolvedMetadata(title="Art", image_url="https://d.furaffinity.net/art/y.png", via="opengraph")
-
+async def test_download_thumb_proxy_failure_swallowed(tmp_path):
+    """Both the source CDN and the Discord proxy failing is non-fatal: returns None."""
     dl = AsyncMock(side_effect=[httpx.HTTPError("403"), httpx.HTTPError("404")])
-    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
-         patch("bot.discord_ingest.service.download_attachment", new=dl):
-        await _resolve_links(
-            session, submission, _link_settings(tmp_path), MagicMock(),
-            embed_thumb_proxy_url="https://media.discordapp.net/external/other.png",
+    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+        path = await _download_thumb(
+            _plan(thumb_proxy_url="https://media.discordapp.net/external/other.png"),
+            _lp(), "https://d.furaffinity.net/art/y.png", str(tmp_path), _link_settings(tmp_path), MagicMock(),
         )
 
     assert dl.call_count == 2
-    assert link.resolved_image_path is None
-    assert link.resolved_title == "Art"
+    assert path is None
 
 
 @pytest.mark.asyncio
-async def test_resolve_links_no_proxy_url_single_attempt(session, board, tmp_path):
+async def test_download_thumb_no_proxy_url_single_attempt(tmp_path):
     """Download failure with no Discord proxy available: exactly one attempt."""
-    submission, link = await _seed_link(session, board, "https://example.com/no-proxy")
-    meta = ResolvedMetadata(title="Post", image_url="https://cdn.example.com/z.jpg", via="opengraph")
-
     dl = AsyncMock(side_effect=httpx.HTTPError("boom"))
-    with patch("bot.discord_ingest.service.resolve", new=AsyncMock(return_value=meta)), \
-         patch("bot.discord_ingest.service.download_attachment", new=dl):
-        await _resolve_links(session, submission, _link_settings(tmp_path), MagicMock())
+    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+        path = await _download_thumb(_plan(), _lp(), "https://cdn.example.com/z.jpg", str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     assert dl.call_count == 1
-    assert link.resolved_image_path is None
+    assert path is None
 
 
 # ---------------------------------------------------------------------------

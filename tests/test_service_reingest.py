@@ -2,7 +2,9 @@
 submission in place, preserving curator-entered data.
 
 The submission's source message is re-read (patched via discord_message_to_inbound)
-and re-run through _ingest_content + _resolve_links (with resolve/download mocked).
+and re-run through the self-managing ingest_message_content (with resolve/download
+mocked). reingest opens its own DB scopes, so session_scope is bound to the test
+session (docs/db-lock-io-refactor.md).
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from bot.models import Attachment, SubmissionLink
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, GraphicStatus, SubmissionState
 
-from conftest import make_submission
+from conftest import bound_session_scope, make_submission
 
 _ids = itertools.count(90_000)
 
@@ -57,9 +59,10 @@ async def _reingest(session, sub, inbound, meta=None):
         patch("bot.discord_ingest.service.discord_message_to_inbound", return_value=inbound),
         patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=meta or _meta()),
         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/fake/f.jpg"),
+        patch("bot.discord_ingest.service.session_scope", bound_session_scope(session)),
     ):
         await service.reingest_submission(
-            session, sub, message=MagicMock(), settings=_settings(), http_client=MagicMock()
+            sub.id, message=MagicMock(), settings=_settings(), http_client=MagicMock()
         )
 
 
