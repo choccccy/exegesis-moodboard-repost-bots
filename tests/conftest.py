@@ -128,24 +128,67 @@ class _MockPartial:
 
 
 class MockDest:
-    """Captures messages sent to a Discord channel/thread."""
+    """In-memory fake Surface: captures outbound curation ops for assertions.
+
+    `.sent` (message contents) and `.edits` keep their historical shape so existing
+    characterization assertions are unchanged; component descriptors, previews, and
+    lifecycle ops are recorded alongside. Set `missing_message_ids` to simulate a
+    message having been deleted (edit_or_none/message_exists report it gone).
+    """
 
     def __init__(self):
         self.sent: list[str] = []
         self.edits: list[tuple[int, str]] = []  # (message_id, content) per in-place edit
+        self.components: list = []               # component descriptors per send
+        self.previews: list = []                 # PreviewImage per send (or None)
+        self.disabled: list[tuple[int, str]] = []  # (message_id, label) tombstones
+        self.archived: list[str | None] = []
+        self.unarchived: int = 0
+        self.cleared_triggers: list[tuple[int, int]] = []  # (channel_id, message_id)
+        self.missing_message_ids: set[int] = set()
 
-    async def send(self, content=None, **kwargs):
+    async def send(self, content=None, *, components=None, preview=None, **kwargs):
         self.sent.append(content or "")
+        self.components.append(list(components) if components else [])
+        self.previews.append(preview)
         msg = MagicMock()
         msg.id = next(_msg_id)
         msg.add_reaction = AsyncMock()
         return msg
 
+    async def edit(self, message_id, *, content=None, components=None) -> bool:
+        self.edits.append((message_id, content or ""))
+        return message_id not in self.missing_message_ids
+
+    async def disable_components(self, message_id, label) -> bool:
+        self.disabled.append((message_id, label))
+        return message_id not in self.missing_message_ids
+
+    async def edit_or_none(self, message_id, content, components=None) -> bool:
+        if message_id in self.missing_message_ids:
+            return False
+        self.edits.append((message_id, content or ""))
+        return True
+
+    async def message_exists(self, message_id) -> bool:
+        return message_id not in self.missing_message_ids
+
     def get_partial_message(self, message_id: int) -> "_MockPartial":
         return _MockPartial(self, message_id)
 
-    async def archive(self, notice: str) -> None:
+    async def archive(self, notice: str | None = None) -> None:
         self.sent.append(f"[archive] {notice}")
+        self.archived.append(notice)
+
+    def archive_after_delay(self, notice: str | None = None) -> None:
+        self.sent.append(f"[archive] {notice}")
+        self.archived.append(notice)
+
+    async def unarchive(self) -> None:
+        self.unarchived += 1
+
+    async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
+        self.cleared_triggers.append((source_channel_id, source_message_id))
 
 
 # ---------------------------------------------------------------------------
