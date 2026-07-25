@@ -1,4 +1,4 @@
-"""Coverage for small glue modules: DiscordNotifier, views, and stray branches.
+"""Coverage for small glue modules: DiscordNotifier, prompts/render, and stray branches.
 
 These are thin but load-bearing: DiscordNotifier is the bridge between the
 service layer and Discord threads, and the view factories carry the custom_id
@@ -14,7 +14,7 @@ import discord
 
 from bot.accessibility import AltTextStatus, initial_alt_text
 from bot.discord_ingest.discord_notifier import DiscordNotifier
-from bot.discord_ingest import views
+from bot.discord_ingest import prompts, render
 
 from conftest import bound_session_scope
 
@@ -56,23 +56,25 @@ async def test_notifier_archive_noop_for_plain_channel():
 
 
 # ---------------------------------------------------------------------------
-# views: modal submit and button factories
+# prompts + render: descriptor factories carry the routing custom_ids
 # ---------------------------------------------------------------------------
 
 
 def test_view_factories_carry_routing_custom_ids():
-    # The custom_id prefixes are the routing contract for on_interaction.
+    # The custom_id prefixes are the routing contract for on_interaction; they must
+    # survive the descriptor -> discord.ui render step byte-for-byte.
     cases = [
-        (views.make_metadata_confirm_view, "meta_ok:9"),
-        (views.make_graphic_view, "graphic:9"),
-        (views.make_playlist_skip_view, "pl_skip:9"),
+        (prompts.metadata_confirm_components, "meta_ok:9"),
+        (prompts.graphic_components, "graphic:9"),
+        (prompts.playlist_skip_components, "pl_skip:9"),
     ]
     for factory, expected_id in cases:
-        view = factory(9)
+        view = render.render_components(factory(9))
         buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
         assert len(buttons) == 1
         assert buttons[0].custom_id == expected_id
-    assert views.PostEditModal(submission_id=9, current_title=None).custom_id == "edit_post:9"
+    modal = render.render_modal(prompts.post_edit_modal(submission_id=9, current_title=None))
+    assert modal.custom_id == "edit_post:9"
 
 
 # ---------------------------------------------------------------------------

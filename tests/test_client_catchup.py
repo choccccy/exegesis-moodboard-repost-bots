@@ -833,6 +833,33 @@ async def test_threadless_retry_skips_submission_gone_by_retry_time(repost_bot, 
     ensure.assert_not_awaited()
 
 
+async def test_threadless_retry_skips_when_thread_created_by_racing_path(repost_bot, session, board):
+    # Regression (issue #52, the double post): if a thread mapping appears between
+    # the scan and our re-check - handle_reaction finished creating the thread while
+    # we waited on the per-message lock - we must NOT create a second thread + anchor.
+    sub = make_submission(board, source_discord_message_id=5)
+    session.add(sub)
+    await session.flush()
+
+    async def _fetch_and_race(*a, **k):
+        # Stand in for the racing path persisting the thread mapping before our re-check.
+        session.add(SubmissionThread(
+            board_id=board.id, source_discord_message_id=5, thread_id=999,
+        ))
+        await session.flush()
+        return MagicMock()
+
+    repost_bot._fetch_message = AsyncMock(side_effect=_fetch_and_race)
+    with (
+        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
+        patch("bot.discord_ingest.client.asyncio.sleep", make_retry_sleep()),
+        patch("bot.discord_ingest.client.service.ensure_thread_persisted", new_callable=AsyncMock) as ensure,
+    ):
+        with pytest.raises(_StopLoop):
+            await repost_bot._run_threadless_retry_loop()
+    ensure.assert_not_awaited()
+
+
 async def test_threadless_retry_survives_iteration_errors(repost_bot):
     with (
         patch(

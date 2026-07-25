@@ -400,6 +400,11 @@ async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tupl
     parsed = urlparse(canonical_url)
     # path: /profile/{handle_or_did}/post/{rkey}
     parts = parsed.path.strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "profile" or parts[2] != "post":
+        # A bare profile link or otherwise malformed bsky URL - not a repostable
+        # post. Raise a clear error instead of an IndexError so the publish-failure
+        # report is legible (was: "list index out of range").
+        raise ValueError(f"not a Bluesky post URL: {canonical_url}")
     handle_or_did = parts[1]
     rkey = parts[3]
 

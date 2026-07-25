@@ -6,7 +6,7 @@ adapter renders these to native widgets (Discord: see `discord_ingest/render.py`
 
 `action_id` is the stable routing key. For Discord it is copied verbatim into a
 button/select `custom_id`, so the existing `{prefix}:{id}` scheme (see the docstring in
-`discord_ingest/views.py`) and every persisted button keep working unchanged.
+`discord_ingest/prompts.py`) and every persisted button keep working unchanged.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ class TextField:
     label: str
     action_id: str
     default: str = ""
+    placeholder: str = ""
     required: bool = False
     max_length: int = 2000
     multiline: bool = True

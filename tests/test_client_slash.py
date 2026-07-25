@@ -449,11 +449,14 @@ async def test_reingest_slash_happy_path(repost_bot, session, board):
         patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
     ):
         await repost_bot._handle_reingest_slash(interaction)
-    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    # Public, not ephemeral (issue #55): the refresh confirmation stays visible in
+    # the thread so curators can see the submission was reingested.
+    interaction.response.defer.assert_awaited_once_with()
     reingest.assert_awaited_once()
     assert reingest.await_args.kwargs["message"] is repost_bot._fetch_message.return_value
     recompute.assert_awaited_once()
     assert "Reingested" in interaction.followup.send.await_args.args[0]
+    assert "ephemeral" not in interaction.followup.send.await_args.kwargs
 
 
 async def test_reingest_slash_not_in_thread(repost_bot, session, board):

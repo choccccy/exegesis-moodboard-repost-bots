@@ -67,10 +67,10 @@ from ..state import (
 )
 from ..notifier import NullNotifier, Notifier, Surface
 from ..ingest.types import InboundAttachment, InboundMessage
-from . import prompts, replies, views
+from . import prompts, render, replies
 from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
 from .discord_notifier import DiscordSurface
-from .urls import extract_urls
+from .urls import extract_urls, is_discord_internal_url
 from ..components import PreviewImage
 from ..db import session_scope
 
@@ -656,7 +656,7 @@ async def _post_thread_anchor(
         try:
             opt_msg = await thread.send(
                 replies.playlist_opt_out_prompt(),
-                view=views.make_playlist_skip_view(submission.id),
+                view=render.render_components(prompts.playlist_skip_components(submission.id)),
             )
             submission.playlist_opt_out_message_id = opt_msg.id
         except (discord.Forbidden, discord.HTTPException) as exc:
@@ -1294,7 +1294,7 @@ async def handle_cancel_button(
     log.info("deleted submission %s after button cancel by user %s", sub_id, user.id)
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Submission cancelled"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Submission cancelled")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone cancel button for submission %s: %s", sub_id, exc)
 
@@ -1371,7 +1371,7 @@ async def handle_confirm_button(
 
     # The Queue button lives on the status/confirmation message; disable it in place.
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Queued ✅"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Queued ✅")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone confirm button for submission %s: %s", submission_id, exc)
 
@@ -1430,7 +1430,7 @@ async def handle_metadata_confirm_button(
     req.answered_at = _now()
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Link confirmed 🔗"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Link confirmed 🔗")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone metadata confirm button for submission %s: %s", submission_id, exc)
 
@@ -1476,7 +1476,7 @@ async def handle_graphic_button(
     req.answered_at = _now()
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Marked as graphic 🩸"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Marked as graphic 🩸")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone graphic button for submission %s: %s", submission_id, exc)
 
@@ -1604,7 +1604,7 @@ async def handle_source_note_confirm(
         req.answered_at = _now()
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Source noted 📄"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Source noted 📄")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
 
@@ -1636,7 +1636,7 @@ async def handle_source_note_reject(
     submission.source_note = None
     submission.source_note_confirmed = False
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Discarded 🗑️"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Discarded 🗑️")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
 
@@ -1677,7 +1677,7 @@ async def handle_playlist_skip_button(
     log.info("submission %s playlist opted out via button by user %s", submission.id, user.id)
 
     try:
-        await interaction.message.edit(view=views.make_disabled_view("Playlist skipped ⏹️"))
+        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Playlist skipped ⏹️")))
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.debug("could not tombstone playlist skip button for submission %s: %s", submission_id, exc)
 
@@ -1735,11 +1735,11 @@ async def handle_edit_button(
         .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
     )
     media = await _media_attachments(session, submission_id)
-    modal = views.PostEditModal(
+    modal = render.render_modal(prompts.post_edit_modal(
         submission_id=submission_id,
         current_title=primary.resolved_title if primary else None,
         media=[(a.id, a.filename, a.alt_text_body) for a in media[:4]],
-    )
+    ))
     await interaction.response.send_modal(modal)
 
 
@@ -1771,7 +1771,7 @@ async def handle_alt_edit_button(
         log.warning("submission %s has %d media; alt picker shows the first 25", submission_id, len(media))
     await interaction.response.send_message(
         "Pick an image to edit its alt text:",
-        view=views.make_alt_picker_view(submission_id, [(a.id, a.filename) for a in media]),
+        view=render.render_components(prompts.alt_picker_components(submission_id, [(a.id, a.filename) for a in media])),
         ephemeral=True,
     )
 
@@ -1802,7 +1802,7 @@ async def handle_alt_pick(
         await interaction.response.send_message("Image not found.", ephemeral=True)
         return
     await interaction.response.send_modal(
-        views.AltEditModal(attachment_id, att.filename, att.alt_text_body)
+        render.render_modal(prompts.alt_edit_modal(attachment_id, att.filename, att.alt_text_body))
     )
 
 
@@ -2023,21 +2023,26 @@ class _IngestOutcome:
 def _extract_raw_urls(message: InboundMessage) -> list[str]:
     """Candidate source URLs from message text, then embed URLs (mobile share
     sheets), then forwarded-snapshot content/embeds - first non-empty wins."""
-    raw_urls = extract_urls(message.content)
+    # Drop Discord navigation links (jump/message/channel/invite) at every stage:
+    # they show up when a message quotes or forwards another Discord message, and
+    # are never the actual source. Filtering per-stage (not just at the end) lets a
+    # message whose text is ONLY a jump link fall through to the forwarded snapshot
+    # that carries the real source URL.
+    raw_urls = [u for u in extract_urls(message.content) if not is_discord_internal_url(u)]
     if not raw_urls:
         seen: set[str] = set()
         for embed in message.embeds:
-            if embed.url and embed.url not in seen:
+            if embed.url and embed.url not in seen and not is_discord_internal_url(embed.url):
                 seen.add(embed.url)
                 raw_urls.append(embed.url)
     if not raw_urls:
         for snap in message.snapshots:
-            snap_urls = extract_urls(snap.content or "")
+            snap_urls = [u for u in extract_urls(snap.content or "") if not is_discord_internal_url(u)]
             if snap_urls:
                 raw_urls.extend(snap_urls)
                 break
             for embed in snap.embeds:
-                if embed.url:
+                if embed.url and not is_discord_internal_url(embed.url):
                     raw_urls.append(embed.url)
                     break
             if raw_urls:
@@ -3509,7 +3514,7 @@ async def _apply_answer(
             submission.source_note_confirmed = False
             await message.reply(
                 replies.source_note_confirm(submission.source_note),
-                view=views.make_source_note_confirm_view(submission.id),
+                view=render.render_components(prompts.source_note_confirm_components(submission.id)),
                 mention_author=False,
             )
             return False

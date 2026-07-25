@@ -581,9 +581,10 @@ async def test_reply_post_raises_when_no_uri_returned():
 # ---------------------------------------------------------------------------
 
 async def test_resolve_bluesky_post_at_uri_input_raises():
-    # An at:// URI is not a bsky.app URL; path splitting comes up short.
+    # An at:// URI is not a bsky.app post URL; it now raises a clear ValueError
+    # instead of the old illegible IndexError (issue #56).
     client = _fake_client()
-    with pytest.raises(IndexError):
+    with pytest.raises(ValueError, match="not a Bluesky post URL"):
         await _resolve_bluesky_post(
             client, "at://did:plc:targetdid000/app.bsky.feed.post/xyz789"
         )

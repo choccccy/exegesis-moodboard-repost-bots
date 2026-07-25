@@ -71,7 +71,8 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "pixiv":   ["pixiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
     "tumblr":  ["tumblr.com"],
-    "tiktok":      ["tiktok.com", "vm.tiktok.com", "m.tiktok.com", "kktiktok.com"],
+    "tiktok":      ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com",
+                    "kktiktok.com", "tnktok.com", "vxtiktok.com"],
     "furaffinity": ["furaffinity.net"],
     "substack": ["substack.com"],
 }

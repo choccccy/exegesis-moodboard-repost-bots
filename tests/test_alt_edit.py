@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from bot.config import BoardConfig
-from bot.discord_ingest import service, views
+from bot.discord_ingest import prompts, render, service
 from bot.discord_ingest.service import (
     apply_post_edits,
     apply_single_alt,
@@ -123,10 +123,10 @@ async def test_apply_single_alt(session, board):
 
 
 def test_post_edit_modal_builds_caption_and_alt_fields():
-    modal = views.PostEditModal(
+    modal = render.render_modal(prompts.post_edit_modal(
         submission_id=7, current_title="Title",
         media=[(1, "a.jpg", "alt one"), (2, "b.jpg", None)],
-    )
+    ))
     inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
     assert inputs[0].custom_id == "caption" and inputs[0].default == "Title"
     alt_ids = {c.custom_id for c in inputs if c.custom_id.startswith("alt:")}
@@ -136,27 +136,38 @@ def test_post_edit_modal_builds_caption_and_alt_fields():
 
 def test_post_edit_modal_caps_alt_fields_at_four():
     media = [(i, f"{i}.jpg", None) for i in range(1, 7)]  # 6 images
-    modal = views.PostEditModal(submission_id=7, current_title=None, media=media)
+    modal = render.render_modal(prompts.post_edit_modal(submission_id=7, current_title=None, media=media))
     alt_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput) and c.custom_id.startswith("alt:")]
     assert len(alt_inputs) == 4  # caption + 4 = Discord's 5-input limit
 
 
 async def test_post_edit_modal_on_submit_applies(session, board):
+    # The modal's on_submit collects its field values by action_id and hands them to
+    # render._dispatch_modal_submit, which routes to service.apply_post_edits.
     from conftest import bound_session_scope
-    modal = views.PostEditModal(submission_id=7, current_title="T", media=[(1, "a.jpg", None)])
-    modal._caption = MagicMock(value="New")
-    modal._alt_inputs = [(1, MagicMock(value="the alt"))]
     inter = _interaction()
     with (
         patch("bot.db.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.service.apply_post_edits", new_callable=AsyncMock) as apply,
     ):
-        await modal.on_submit(inter)
+        await render._dispatch_modal_submit(
+            "edit_post:7", {"caption": "New", "alt:1": "the alt"}, inter
+        )
     apply.assert_awaited_once()
     assert apply.await_args.kwargs["new_title"] == "New"
     assert apply.await_args.kwargs["alt_updates"] == {1: "the alt"}
     assert apply.await_args.kwargs["edited_by"] == 999
     inter.response.send_message.assert_awaited_once()
+
+
+async def test_descriptor_modal_on_submit_collects_field_values():
+    # on_submit reads the live input values by action_id before dispatching.
+    modal = render.render_modal(prompts.alt_edit_modal(5, "a.jpg", "old"))
+    modal._inputs = {"alt": MagicMock(value="new alt")}
+    inter = _interaction()
+    with patch("bot.discord_ingest.render._dispatch_modal_submit", new_callable=AsyncMock) as disp:
+        await modal.on_submit(inter)
+    disp.assert_awaited_once_with("edit_alt:5", {"alt": "new alt"}, inter)
 
 
 # --- handle_edit_button passes media ----------------------------------------
@@ -174,11 +185,11 @@ async def test_handle_edit_button_passes_first_four_media(session, board):
         await _img(session, sub, filename=f"{i}.jpg")
     inter = _interaction(999)
 
-    with patch("bot.discord_ingest.service.views.PostEditModal") as Modal:
-        await handle_edit_button(session, inter, sub.id, _settings())
-    media_arg = Modal.call_args.kwargs["media"]
-    assert len(media_arg) == 4  # capped at 4
+    await handle_edit_button(session, inter, sub.id, _settings())
     inter.response.send_modal.assert_awaited_once()
+    modal = inter.response.send_modal.await_args.args[0]
+    alt_inputs = [c for c in modal.children if (c.custom_id or "").startswith("alt:")]
+    assert len(alt_inputs) == 4  # capped at 4
 
 
 # --- make_confirm_view alt button gating ------------------------------------
@@ -190,8 +201,8 @@ def test_confirm_view_alt_button_only_when_over_four():
             isinstance(c, discord.ui.Button) and (c.custom_id or "").startswith("alt_edit:")
             for c in view.children
         )
-    assert not alt_button_present(views.make_confirm_view(1, media_count=4))
-    assert alt_button_present(views.make_confirm_view(1, media_count=5))
+    assert not alt_button_present(render.render_components(prompts.confirm_components(1, media_count=4)))
+    assert alt_button_present(render.render_components(prompts.confirm_components(1, media_count=5)))
 
 
 # --- picker flow ------------------------------------------------------------
@@ -270,7 +281,7 @@ async def test_alt_pick_opens_modal(session, board):
     await handle_alt_pick(session, inter, sub.id, _settings())
     inter.response.send_modal.assert_awaited_once()
     modal = inter.response.send_modal.await_args.args[0]
-    assert modal.attachment_id == att.id
+    assert modal.custom_id == f"edit_alt:{att.id}"
 
 
 async def test_alt_pick_no_values_noop(session, board):
@@ -307,14 +318,12 @@ async def test_alt_pick_unauthorized(session, board):
 
 async def test_alt_edit_modal_on_submit_applies(session, board):
     from conftest import bound_session_scope
-    modal = views.AltEditModal(attachment_id=5, filename="a.jpg", current_alt="old")
-    modal._alt = MagicMock(value="brand new alt")
     inter = _interaction()
     with (
         patch("bot.db.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.service.apply_single_alt", new_callable=AsyncMock) as apply,
     ):
-        await modal.on_submit(inter)
+        await render._dispatch_modal_submit("edit_alt:5", {"alt": "brand new alt"}, inter)
     apply.assert_awaited_once()
     assert apply.await_args.kwargs["attachment_id"] == 5
     assert apply.await_args.kwargs["value"] == "brand new alt"

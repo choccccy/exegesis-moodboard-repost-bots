@@ -269,3 +269,18 @@ def test_tiktok_family():
 
 def test_tiktok_vm_short_link_family():
     assert fam("https://vm.tiktok.com/ZMAbcDef/") == "tiktok"
+
+
+def test_tiktok_tnktok_mirror_canonicalized():
+    # Regression (issue #53): tnktok.com is a TikTok embed-fixer mirror. It was
+    # unrecognized and ingested as a generic link ("a mess"); it now maps to the
+    # tiktok family and canonicalizes to the real www.tiktok.com video URL.
+    assert fam("https://www.tnktok.com/@ap.studio974/video/7665786490651266326") == "tiktok"
+    assert c("https://www.tnktok.com/@ap.studio974/video/7665786490651266326") == (
+        "https://www.tiktok.com/@ap.studio974/video/7665786490651266326"
+    )
+
+
+def test_tiktok_other_mirror_families():
+    assert fam("https://vxtiktok.com/@user/video/123456") == "tiktok"
+    assert fam("https://vt.tiktok.com/ZMAbcDef/") == "tiktok"

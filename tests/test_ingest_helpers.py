@@ -13,10 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from bot.config import BoardConfig
 from bot.discord_ingest.service import (
     _derive_thread_title,
+    _extract_raw_urls,
     _is_curator,
     _post_thread_anchor,
 )
-from bot.ingest.types import InboundEmbed, InboundMessage
+from bot.ingest.types import InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Submission, SubmissionLink
 from bot.state import SubmissionState, GraphicStatus
 
@@ -280,3 +281,41 @@ async def test_post_thread_anchor_forward_fallback(session, board):
     assert thread.send.await_count >= 2
     jump_call_text = thread.send.call_args_list[-1].args[0]
     assert "discord.com/channels" in jump_call_text
+
+
+# ---------------------------------------------------------------------------
+# _extract_raw_urls - Discord navigation links are never a source (issue #51)
+# ---------------------------------------------------------------------------
+
+def test_extract_raw_urls_drops_discord_nav_keeps_real_source():
+    # A quoted/forwarded message whose text carries both a Discord jump link and the
+    # actual bsky post: only the bsky link survives.
+    msg = InboundMessage(
+        content=(
+            "https://discord.com/channels/1/2/3 "
+            "https://bsky.app/profile/a.bsky.social/post/abc"
+        )
+    )
+    assert _extract_raw_urls(msg) == ["https://bsky.app/profile/a.bsky.social/post/abc"]
+
+
+def test_extract_raw_urls_falls_through_to_snapshot_when_only_nav_link():
+    # Content is ONLY a Discord jump link, so it filters to empty and we fall through
+    # to the forwarded snapshot that carries the real URL.
+    msg = InboundMessage(
+        content="https://discord.com/channels/1/2/3",
+        snapshots=[InboundSnapshot(content="see https://example.com/thing")],
+    )
+    assert _extract_raw_urls(msg) == ["https://example.com/thing"]
+
+
+def test_extract_raw_urls_drops_discord_nav_from_embed():
+    msg = InboundMessage(embeds=[InboundEmbed(url="https://discord.com/channels/1/2/3")])
+    assert _extract_raw_urls(msg) == []
+
+
+def test_extract_raw_urls_drops_discord_nav_from_snapshot_embed():
+    msg = InboundMessage(
+        snapshots=[InboundSnapshot(embeds=[InboundEmbed(url="https://discord.gg/abcdef")])]
+    )
+    assert _extract_raw_urls(msg) == []

@@ -580,7 +580,9 @@ class RepostBot(discord.Client):
 
     async def _handle_reingest_slash(self, interaction: discord.Interaction) -> None:
         """Handle /reingest - re-read the source message and refresh this submission."""
-        await interaction.response.defer(ephemeral=True)
+        # Public (not ephemeral): the refresh confirmation should be visible in the
+        # thread so curators can see the submission was reingested (issue #55).
+        await interaction.response.defer()
         channel = interaction.channel
         async with session_scope() as session:
             submission = await self._submission_for_thread(session, channel)
@@ -629,7 +631,7 @@ class RepostBot(discord.Client):
                     )
         await interaction.followup.send(
             "Reingested - links, media, and caption refreshed from the source message. "
-            "Alt text and source/graphic decisions were preserved.", ephemeral=True
+            "Alt text and source/graphic decisions were preserved."
         )
 
     async def _handle_nosource_slash(self, interaction: discord.Interaction) -> None:
@@ -1147,23 +1149,42 @@ class RepostBot(discord.Client):
                     if message is None:
                         log.warning("threadless retry: source message %s not found for submission %s", sub.source_discord_message_id, sub.id)
                         continue
-                    # Skip if the submission became terminal since the scan.
-                    async with session_scope() as session:
-                        fresh = await session.get(Submission, sub.id)
-                        if fresh is None or fresh.state in _TERMINAL_STATES:
-                            continue
-                    # Thread creation runs with the DB lock released (self-managing).
-                    thread, _ = await service.ensure_thread_persisted(
-                        self.settings, message, sub.id, post_anchor=True, bot_id=getattr(self.user, "id", None),
-                    )
-                    if thread is not None:
+                    # Serialize against handle_reaction (and any concurrent retry) on
+                    # the same source message. Without this, a submission whose thread
+                    # handle_reaction is still creating - rate-limited, so its mapping
+                    # isn't persisted yet - reads as "threadless" here, and we'd create
+                    # a SECOND thread + anchor (issue #52, the double post). During a
+                    # butterfly storm that window is minutes long, so it happened a lot.
+                    async with service._message_processing_locks.setdefault(
+                        sub.source_discord_message_id, asyncio.Lock()
+                    ):
+                        # Re-check under the lock: the racing path may have finished
+                        # threading (and marking terminal) while we waited to acquire it.
                         async with session_scope() as session:
                             fresh = await session.get(Submission, sub.id)
-                            if fresh is not None:
-                                await service.recompute_and_request(fresh.id, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None), ambient_session=session)
-                        log.info("threadless retry: created thread for submission %s", sub.id)
-                    else:
-                        log.warning("threadless retry: thread creation still failing for submission %s (will retry)", sub.id)
+                            if fresh is None or fresh.state in _TERMINAL_STATES:
+                                continue
+                            mapping = await session.scalar(
+                                select(SubmissionThread).where(
+                                    SubmissionThread.board_id == fresh.board_id,
+                                    SubmissionThread.source_discord_message_id == fresh.source_discord_message_id,
+                                )
+                            )
+                            if mapping is not None and mapping.thread_id is not None:
+                                # Another path already created the thread - don't re-anchor.
+                                continue
+                        # Thread creation runs with the DB lock released (self-managing).
+                        thread, _ = await service.ensure_thread_persisted(
+                            self.settings, message, sub.id, post_anchor=True, bot_id=getattr(self.user, "id", None),
+                        )
+                        if thread is not None:
+                            async with session_scope() as session:
+                                fresh = await session.get(Submission, sub.id)
+                                if fresh is not None:
+                                    await service.recompute_and_request(fresh.id, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None), ambient_session=session)
+                            log.info("threadless retry: created thread for submission %s", sub.id)
+                        else:
+                            log.warning("threadless retry: thread creation still failing for submission %s (will retry)", sub.id)
                     await asyncio.sleep(_THREAD_DELAY)
             except Exception:
                 log.exception("threadless retry loop encountered an error")

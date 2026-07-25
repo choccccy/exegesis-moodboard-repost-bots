@@ -1,4 +1,6 @@
-from bot.discord_ingest.urls import extract_urls
+import pytest
+
+from bot.discord_ingest.urls import extract_urls, is_discord_internal_url
 
 
 def test_plain_url():
@@ -50,3 +52,32 @@ def test_trailing_underscore_and_tilde_preserved():
     # `_` and `~` can be part of a real URL path - do not strip them.
     assert extract_urls("https://example.com/foo_") == ["https://example.com/foo_"]
     assert extract_urls("https://example.com/~user") == ["https://example.com/~user"]
+
+
+# is_discord_internal_url (issue #51): Discord navigation links are never a source.
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://discord.com/channels/123/456/789",           # jump-to-message
+        "https://ptb.discord.com/channels/123/456/789",       # PTB subdomain
+        "https://canary.discord.com/channels/1/2/3",          # canary subdomain
+        "https://discordapp.com/channels/1/2/3",              # legacy host
+        "https://discord.gg/abcdef",                          # invite
+    ],
+)
+def test_discord_nav_links_flagged(url):
+    assert is_discord_internal_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://cdn.discordapp.com/attachments/1/2/pic.png",  # media - keep
+        "https://media.discordapp.net/attachments/1/2/x.jpg",  # media - keep
+        "https://bsky.app/profile/a.bsky.social/post/abc",     # real source
+        "https://example.com/thing",
+    ],
+)
+def test_non_nav_links_not_flagged(url):
+    assert is_discord_internal_url(url) is False

@@ -737,6 +737,25 @@ async def test_resolve_bluesky_post_with_handle_calls_resolve_handle():
     assert cid == "bafyreitarget000"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://bsky.app/profile/someone.bsky.social",  # bare profile, no /post/
+        "https://bsky.app/profile/someone.bsky.social/feed/xyz",  # not a post
+        "https://bsky.app/",  # nothing
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolve_bluesky_post_raises_on_non_post_url(url):
+    # Regression (issue #56): a bare profile or otherwise malformed bsky URL used to
+    # raise IndexError ("list index out of range"), producing an illegible publish
+    # report. It now raises a clear ValueError that names the URL.
+    client = _mock_client()
+    with pytest.raises(ValueError, match="not a Bluesky post URL"):
+        await _resolve_bluesky_post(client, url)
+    client.resolve_handle.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_resolve_bluesky_post_raises_when_not_found():
     client = _mock_client()
