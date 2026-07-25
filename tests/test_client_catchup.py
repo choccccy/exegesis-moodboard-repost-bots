@@ -338,7 +338,7 @@ async def test_thread_catchup_replays_reactions_and_replies(repost_bot, session,
     reply.assert_awaited_once()
     assert reply.await_args.kwargs["message"] is human_reply
     recompute.assert_awaited_once()
-    assert recompute.await_args.args[1].id == sub.id
+    assert recompute.await_args.args[0] == sub.id  # recompute(submission_id, ...)
     assert len(fired) == 1  # queued-thread archival scan scheduled at the end
 
 
@@ -564,7 +564,7 @@ async def test_thread_catchup_includes_only_collapsed_ready_to_queue(repost_bot,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
-    processed_ids = {c.args[1].id for c in recompute.await_args_list}
+    processed_ids = {c.args[0] for c in recompute.await_args_list}
     assert collapsed.id in processed_ids  # repaired
     assert healthy.id not in processed_ids  # left alone
 
@@ -586,7 +586,7 @@ async def test_thread_catchup_processes_newest_submissions_first(repost_bot, ses
         patch(
             "bot.discord_ingest.client.service.recompute_and_request",
             new_callable=AsyncMock,
-            side_effect=lambda s, sub, **kw: order.append(sub.id),
+            side_effect=lambda sub_id, **kw: order.append(sub_id),
         ),
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):

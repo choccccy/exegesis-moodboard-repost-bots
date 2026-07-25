@@ -623,8 +623,9 @@ class RepostBot(discord.Client):
                 submission = await session.get(Submission, submission_id)
                 if submission is not None:
                     await service.recompute_and_request(
-                        session, submission, settings=self.settings, destination=channel,
+                        submission.id, settings=self.settings, destination=channel,
                         yt_client=self._yt_client, bot_id=getattr(self.user, "id", None),
+                        ambient_session=session,
                     )
         await interaction.followup.send(
             "Reingested - links, media, and caption refreshed from the source message. "
@@ -988,8 +989,9 @@ class RepostBot(discord.Client):
                     submission = await session.get(Submission, submission_id)
                     if submission is not None:
                         await service.recompute_and_request(
-                            session, submission, settings=self.settings, destination=thread,
+                            submission.id, settings=self.settings, destination=thread,
                             bot_id=getattr(self.user, "id", None),
+                            ambient_session=session,
                         )
             except Exception:
                 log.exception("recompute_and_request failed for submission %s in thread %s", submission_id, thread_id)
@@ -1158,7 +1160,7 @@ class RepostBot(discord.Client):
                         async with session_scope() as session:
                             fresh = await session.get(Submission, sub.id)
                             if fresh is not None:
-                                await service.recompute_and_request(session, fresh, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None))
+                                await service.recompute_and_request(fresh.id, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None), ambient_session=session)
                         log.info("threadless retry: created thread for submission %s", sub.id)
                     else:
                         log.warning("threadless retry: thread creation still failing for submission %s (will retry)", sub.id)

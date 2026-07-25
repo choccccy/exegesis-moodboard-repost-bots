@@ -17,6 +17,7 @@ is removed. That is the intended signal that the refactor of that path is done.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -210,19 +211,38 @@ async def test_handle_reaction_ingest_http_not_under_db_lock(lock_probe):
     assert "http.get" not in violations, f"ingest HTTP ran under the DB lock: {violations}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ACCEPTED EXCEPTION (docs/db-lock-io-refactor.md): thread creation (Slice A) "
-           "and ingest HTTP/downloads (Slice B) are off the lock - the storm-time holds "
-           "that caused the responsiveness bug. recompute_and_request's Discord sends still "
-           "run under the lock, but they are fast and human-paced (one interaction at a "
-           "time), so de-locking them was deliberately deferred to a future Notifier "
-           "extraction rather than rewriting every interaction handler for ~zero runtime "
-           "gain. This test documents that remaining I/O; flip it if that work is done.",
-)
 async def test_handle_reaction_does_no_io_under_db_lock(lock_probe):
+    # The headline invariant, now GREEN (surface-agnostic #50): no Discord/network I/O
+    # runs while the global DB lock is held. Thread creation (Slice A) and ingest HTTP
+    # (Slice B) were lifted out earlier; recompute_and_request is now self-managing so
+    # its Surface sends run lock-released too. Every send goes through the Surface port,
+    # and the core decides under a short scope, sends, then persists under another.
     violations = await _run_handle_reaction_under_probe()
     assert violations == [], f"I/O performed under DB lock: {violations}"
+
+
+async def test_submission_lock_serializes_per_submission():
+    """The per-submission lock (which now guards recompute's decide->persist window in
+    place of the global lock) blocks a second acquire for the SAME submission while
+    letting a DIFFERENT submission proceed - the deterministic mutual-exclusion guard
+    the doc's Step 2 prescribes. No flaky race repro needed."""
+    from bot.discord_ingest.service import _submission_lock
+
+    lock_x = _submission_lock(9001)
+    await lock_x.acquire()
+    second_x = asyncio.create_task(_submission_lock(9001).acquire())
+    try:
+        await asyncio.sleep(0)
+        assert not second_x.done(), "same-submission acquire must block while X is held"
+        # A different submission is unaffected.
+        await asyncio.wait_for(_submission_lock(9002).acquire(), timeout=1)
+        _submission_lock(9002).release()
+        assert not second_x.done(), "second X still blocked while X is held"
+    finally:
+        lock_x.release()
+    await asyncio.wait_for(second_x, timeout=1)  # now free -> it acquires
+    _submission_lock(9001).release()
+
 
 # NOTE: a probabilistic "concurrent recompute double-post" guard was prototyped
 # here and deliberately removed - see docs/db-lock-io-refactor.md "Step 2". It

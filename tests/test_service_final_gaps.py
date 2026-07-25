@@ -901,7 +901,7 @@ async def test_recompute_send_failures_ready_submission(session, board):
     )
 
     state = await recompute_and_request(
-        session, sub, settings=_svc_settings(board), destination=RaisingDest()
+        sub.id, settings=_svc_settings(board), destination=RaisingDest(), ambient_session=session
     )
 
     assert state == SubmissionState.READY_TO_QUEUE
@@ -915,7 +915,7 @@ async def test_recompute_send_failures_source_and_graphic(session, board):
     await session.flush()
 
     state = await recompute_and_request(
-        session, sub, settings=_svc_settings(board, require_graphic=True), destination=RaisingDest()
+        sub.id, settings=_svc_settings(board, require_graphic=True), destination=RaisingDest(), ambient_session=session
     )
 
     assert state == SubmissionState.AWAITING_SOURCE
@@ -930,7 +930,7 @@ async def test_recompute_send_failure_metadata_request(session, board):
     await _add_link(session, sub.id, "https://example.com/unresolved")  # resolved_via None
 
     state = await recompute_and_request(
-        session, sub, settings=_svc_settings(board), destination=RaisingDest()
+        sub.id, settings=_svc_settings(board), destination=RaisingDest(), ambient_session=session
     )
 
     assert state == SubmissionState.AWAITING_BETTER_LINK
@@ -948,7 +948,7 @@ async def test_recompute_send_failure_image_request(session, board):
     )
 
     state = await recompute_and_request(
-        session, sub, settings=_svc_settings(board), destination=RaisingDest()
+        sub.id, settings=_svc_settings(board), destination=RaisingDest(), ambient_session=session
     )
 
     assert state == SubmissionState.AWAITING_IMAGE
@@ -973,7 +973,7 @@ async def test_recompute_alt_text_send_failure_and_non_media_skip(session, board
     await session.flush()
 
     await recompute_and_request(
-        session, sub, settings=_svc_settings(board), destination=RaisingDest()
+        sub.id, settings=_svc_settings(board), destination=RaisingDest(), ambient_session=session
     )
 
     reqs = list(await session.scalars(
@@ -1006,7 +1006,7 @@ async def test_recompute_alt_text_preview_success_and_fallback(session, board, t
     await session.flush()
     dest = MockDest()
 
-    await recompute_and_request(session, sub, settings=_svc_settings(board), destination=dest)
+    await recompute_and_request(sub.id, settings=_svc_settings(board), destination=dest, ambient_session=session)
 
     reqs = list(await session.scalars(
         select(AttachmentAltTextRequest).where(AttachmentAltTextRequest.submission_id == sub.id)
@@ -1026,7 +1026,7 @@ async def test_recompute_from_reply_updated_notice_failure_still_archives(sessio
     dest = RaisingDest()
 
     await recompute_and_request(
-        session, sub, settings=_svc_settings(board), destination=dest, from_reply=True
+        sub.id, settings=_svc_settings(board), destination=dest, from_reply=True, ambient_session=session
     )
 
     assert dest.archived == [replies.closing_notice("updated")]

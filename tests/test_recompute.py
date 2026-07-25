@@ -122,7 +122,7 @@ async def test_recompute_no_link_posts_source_request(session, board):
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_SOURCE
     assert sub.state == AWAITING
@@ -141,7 +141,7 @@ async def test_recompute_unresolved_link_posts_metadata_request(session, board):
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_BETTER_LINK
     assert await _count(session, MetadataRequest, sub.id) == 1
@@ -157,7 +157,7 @@ async def test_recompute_resolved_link_without_image_posts_image_request(session
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_IMAGE
     assert await _count(session, ImageRequest, sub.id) == 1
@@ -173,7 +173,7 @@ async def test_recompute_unavailable_link_posts_age_restricted_image_request(ses
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_IMAGE
     assert await _count(session, ImageRequest, sub.id) == 1
@@ -198,7 +198,7 @@ async def test_recompute_needed_alt_text_posts_request(session, board):
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_ALT_TEXT
     reqs = list(await session.scalars(
@@ -231,7 +231,7 @@ async def test_recompute_retracts_stale_confirmation_on_regression(session, boar
     sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4242)
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.AWAITING_ALT_TEXT
     assert await _count(session, ConfirmationRequest, sub.id) == 0  # stale row dropped
@@ -243,7 +243,7 @@ async def test_recompute_regression_without_fetch_message_still_drops_row(sessio
     sub = await _seed_ready_with_stale_conf(session, board, bot_message_id=4243)
 
     dest = MockDest()  # no fetch_message attribute
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert await _count(session, ConfirmationRequest, sub.id) == 0
 
@@ -259,7 +259,7 @@ async def test_recompute_regression_tombstone_failure_is_swallowed(session, boar
     dest = MockDest()
     dest.fetch_message = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
 
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert await _count(session, ConfirmationRequest, sub.id) == 0
 
@@ -271,11 +271,11 @@ async def test_recompute_graphic_classification_posts_request(session, board):
     await session.flush()
 
     dest = MockDest()
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
     assert await _count(session, ContentLabelRequest, sub.id) == 1
 
     # posted once only - the notice is not repeated on the next recompute
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
     assert await _count(session, ContentLabelRequest, sub.id) == 1
 
 
@@ -295,7 +295,7 @@ async def test_recompute_ready_to_queue_posts_preview_and_confirmation(session, 
     await session.flush()
 
     dest = MockDest()
-    state = await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    state = await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     assert state == SubmissionState.READY_TO_QUEUE
     assert sub.state == READY
@@ -311,8 +311,8 @@ async def test_recompute_reentrant_does_not_duplicate_open_requests(session, boa
 
     dest = MockDest()
     settings = make_test_settings()
-    await recompute_and_request(session, sub, settings=settings, destination=dest)
-    await recompute_and_request(session, sub, settings=settings, destination=dest)
+    await recompute_and_request(sub.id, settings=settings, destination=dest, ambient_session=session)
+    await recompute_and_request(sub.id, settings=settings, destination=dest, ambient_session=session)
 
     assert await _count(session, SourceRequest, sub.id) == 1
     assert await _count(session, CancellationRequest, sub.id) == 1
@@ -337,7 +337,7 @@ async def test_recompute_from_reply_on_queued_confirms_and_archives(session, boa
 
     dest = MockDest()
     await recompute_and_request(
-        session, sub, settings=make_test_settings(), destination=dest, from_reply=True
+        sub.id, settings=make_test_settings(), destination=dest, from_reply=True, ambient_session=session
     )
 
     assert sub.state == QUEUED  # not downgraded to ready_to_queue
@@ -364,7 +364,7 @@ async def test_recompute_keeps_confirmation_when_fetch_errors(session, board):
             raise discord.HTTPException(MagicMock(), "server error")
 
     dest = _ForbiddenFetchDest()
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     # Row must survive; no new confirmation sent.
     rows = list(await session.scalars(
@@ -392,7 +392,7 @@ async def test_recompute_reposts_confirmation_when_discord_message_deleted(sessi
 
     dest = MockDest()
     dest.missing_message_ids = {99999}  # surface.message_exists reports it deleted
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     # Stale row must be replaced by a fresh one pointing to a new Discord message.
     rows = list(await session.scalars(
@@ -418,7 +418,7 @@ async def test_recompute_reposts_confirmation_when_riding_on_checklist(session, 
     await session.flush()
 
     dest = MockDest()
-    await recompute_and_request(session, sub, settings=make_test_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=make_test_settings(), destination=dest, ambient_session=session)
 
     # A fresh confirmation on its own message replaces the collapsed one.
     rows = list(await session.scalars(

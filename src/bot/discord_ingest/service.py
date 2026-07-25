@@ -9,6 +9,7 @@ client.py so the logic is easy to follow and extend toward Matrix later.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
@@ -79,6 +80,44 @@ log = logging.getLogger(__name__)
 # the same message from both seeing submission=None, both posting anchor pings,
 # and then one failing the unique constraint after the ping is already sent.
 _message_processing_locks: dict[int, asyncio.Lock] = {}
+
+# Keyed by submission ID. Serializes recompute_and_request per submission so its
+# read-decide-send-persist critical section stays atomic once it releases the global
+# DB lock around Discord sends (docs/db-lock-io-refactor.md, surface-agnostic #50).
+# Replaces the incidental mutual exclusion the global lock used to provide.
+_submission_locks: dict[int, asyncio.Lock] = {}
+
+
+def _submission_lock(submission_id: int) -> asyncio.Lock:
+    return _submission_locks.setdefault(submission_id, asyncio.Lock())
+
+
+@contextlib.asynccontextmanager
+async def _maybe_submission_lock(ambient_session, submission_id: int):
+    """Take the per-submission lock only for self-managing recomputes.
+
+    Legacy in-session callers (``ambient_session`` set) already hold the global DB
+    lock, which serializes them; taking the per-submission lock too would invert the
+    lock order versus self-managing callers (which take per-submission then global)
+    and could deadlock. So skip it for them.
+    """
+    if ambient_session is not None:
+        yield
+    else:
+        async with _submission_lock(submission_id):
+            yield
+
+
+@contextlib.asynccontextmanager
+async def _scope(ambient_session):
+    """A DB scope that reuses the caller's ambient session (legacy in-session path,
+    stays inside their transaction/lock) or opens a fresh short session_scope
+    (self-managing path, so sends between scopes run with the lock released)."""
+    if ambient_session is not None:
+        yield ambient_session
+    else:
+        async with session_scope() as s:
+            yield s
 
 
 def _now() -> datetime:
@@ -372,31 +411,41 @@ async def handle_reaction(
             log.warning("could not create/resolve thread for submission %s", submission_id)
             return False
 
-        # Beat 4 (DB): duplicate check (new submissions only) + recompute. Their
-        # Discord sends still run under this scope; lifting them out is Slice B/C.
-        async with session_scope() as session:
-            submission = await session.get(Submission, submission_id)
-            if submission is None:
-                return False
-            if created and await _close_if_duplicate(session, settings, message, submission, thread):
-                return False
-            await recompute_and_request(
-                session, submission, settings=settings, destination=thread,
-                yt_client=yt_client, bot_id=bot_id,
-            )
-            return new_thread
+        # Beat 4a (DB): is this new submission a duplicate? Detect + tear it down.
+        dup_notice = None
+        if created:
+            async with session_scope() as session:
+                submission = await session.get(Submission, submission_id)
+                if submission is None:
+                    return False
+                dup_notice = await _detect_and_teardown_duplicate(session, settings, message, submission)
+
+        if dup_notice is not None:
+            # Beat 4b (I/O, lock released): post the notice, clear the 🦋, archive.
+            try:
+                await thread.send(dup_notice)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post duplicate notice for message %s: %s", message.id, exc)
+            await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
+            await _archive_thread(thread)
+            return False
+
+        # Beat 4c (lock released): recompute is self-managing (its sends run off the lock).
+        await recompute_and_request(
+            submission_id, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id,
+        )
+        return new_thread
 
 
-async def _close_if_duplicate(
+async def _detect_and_teardown_duplicate(
     session: AsyncSession,
     settings: Settings,
     message: discord.Message,
     submission: Submission,
-    thread: discord.Thread,
-) -> bool:
-    """If a new submission duplicates existing content, post the duplicate notice,
-    delete the submission, clear the 🦋, and archive the thread (which stays as a
-    record of the notice). Returns True if the submission was closed."""
+) -> str | None:
+    """If a new submission duplicates existing content, delete it (and its files) and
+    return the duplicate notice to post; else None. DB/filesystem only - the caller
+    posts the notice, clears the 🦋, and archives the thread with the lock released."""
     guild_id = message.guild.id if message.guild else 0
     links = list(await session.scalars(
         select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
@@ -412,20 +461,12 @@ async def _close_if_duplicate(
             notice = replies.duplicate_queued(ref_url)
         else:
             notice = replies.duplicate_pending(ref_url)
-        await thread.send(notice)
         log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
-        sub_id = submission.id
         board = await session.get(Board, submission.board_id)
-        remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-        await _delete_submission_cascade(session, sub_id)
-        # Remove butterfly so future scans skip this post.
-        await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
-        # Archive immediately - the notice above already says "Closing this thread."
-        # A fire-and-forget delay would be lost on bot restart, and the submission
-        # row is gone so the cleanup scheduler can't recover it either.
-        await _archive_thread(thread)
-        return True
-    return False
+        remove_submission_dir(settings.attachments_dir, board.id if board else 0, submission.id)
+        await _delete_submission_cascade(session, submission.id)
+        return notice
+    return None
 
 
 async def _ensure_thread_io(
@@ -774,7 +815,7 @@ async def handle_label_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     # The reaction is on a message in the thread, so `channel` is the thread.
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 async def handle_metadata_reaction(
@@ -807,7 +848,7 @@ async def handle_metadata_reaction(
     req.answered_by = user_id
     req.answered_at = _now()
     await channel.send(replies.metadata_confirmed())
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 def _gap_summary(gaps) -> str:
@@ -848,7 +889,7 @@ async def handle_confirmation_reaction(
     if gaps:
         log.info("refusing to queue submission %s via ✅: gaps reopened (%s)", submission.id, _gap_summary(gaps))
         await recompute_and_request(
-            session, submission, settings=settings, destination=channel, yt_client=yt_client
+            submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session
         )
         try:
             await channel.send(replies.queue_blocked_notice(_gap_summary(gaps)))
@@ -1311,7 +1352,7 @@ async def handle_confirm_button(
         channel = interaction.channel
         if channel is not None:
             await recompute_and_request(
-                session, submission, settings=settings, destination=channel, yt_client=yt_client
+                submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session
             )
         await interaction.followup.send(
             f"Can't queue yet - still needs: {_gap_summary(gaps)}. See the checklist in this thread.",
@@ -1397,7 +1438,7 @@ async def handle_metadata_confirm_button(
     if channel is None:
         return
     await channel.send(replies.metadata_confirmed())
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 async def handle_graphic_button(
@@ -1442,7 +1483,7 @@ async def handle_graphic_button(
     channel = interaction.channel
     if channel is None:
         return
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 async def waive_source(
@@ -1473,7 +1514,7 @@ async def waive_source(
         req.answered_by = user_id
         req.answered_at = _now()
     await destination.send(replies.no_source_marked())
-    await recompute_and_request(session, submission, settings=settings, destination=destination, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=destination, yt_client=yt_client, ambient_session=session)
     return True
 
 
@@ -1517,7 +1558,7 @@ async def skip_all_alt_text(
         req.answered_by = user_id
         req.answered_at = _now()
     await destination.send(replies.alt_text_skipped_all(len(pending)))
-    await recompute_and_request(session, submission, settings=settings, destination=destination, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=destination, yt_client=yt_client, ambient_session=session)
     return len(pending)
 
 
@@ -1571,7 +1612,7 @@ async def handle_source_note_confirm(
     if channel is None:
         return
     await channel.send(replies.source_note_confirmed(submission.source_note))
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 async def handle_source_note_reject(
@@ -1603,7 +1644,7 @@ async def handle_source_note_reject(
     if channel is None:
         return
     await channel.send(replies.source_note_rejected())
-    await recompute_and_request(session, submission, settings=settings, destination=channel, yt_client=yt_client)
+    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
 
 
 async def handle_playlist_skip_button(
@@ -2544,33 +2585,6 @@ async def render_submission_status(session: AsyncSession, submission: Submission
     )
 
 
-async def _upsert_status_checklist(
-    submission: Submission,
-    destination: Notifier,
-    snap: SubmissionSnapshot,
-    *,
-    ready: bool,
-    source_domain: str | None,
-) -> None:
-    """Post the 'post status' checklist once, then edit it in place as gaps fill.
-
-    Kept for the whole life of the submission - even fully checked off it stays as a
-    record of what was required. It never carries buttons; the queue confirmation and
-    its Queue/Edit buttons are a separate message at the bottom of the thread.
-    Best-effort: a failure to post or edit must never break the ingest flow.
-    """
-    content = replies.status_checklist(snap, ready=ready, source_domain=source_domain)
-    try:
-        if submission.status_message_id is not None and await destination.edit_or_none(
-            submission.status_message_id, content
-        ):
-            return
-        msg = await destination.send(content)
-        submission.status_message_id = msg.id
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.warning("could not upsert status checklist for submission %s: %s", submission.id, exc)
-
-
 async def _has_open_request(session: AsyncSession, model, submission_id: int, **extra) -> bool:
     stmt = select(model).where(
         model.submission_id == submission_id, model.answered_at.is_(None)
@@ -2857,123 +2871,182 @@ def _ensure_surface(destination) -> Surface:
 
 
 async def recompute_and_request(
-    session: AsyncSession,
-    submission: Submission,
+    submission_id: int,
     *,
     settings: Settings,
     destination: Surface,
     yt_client=None,
     bot_id: int | None = None,
     from_reply: bool = False,
+    ambient_session: AsyncSession | None = None,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
 
-    All procedural messages go into ``destination`` (the submission's thread).
+    Self-managing (docs/db-lock-io-refactor.md, surface-agnostic #50): a short DB
+    scope reads state + open-request flags and sets the new state; then every Discord
+    send happens with the lock released; then a short DB scope persists the
+    request-tracking rows. Serialized per submission by ``_submission_lock`` so the
+    decide->persist window stays atomic once the global lock is released around I/O.
+
+    ``ambient_session`` is a transitional bridge for callers not yet de-scoped: pass
+    the caller's live session and recompute runs entirely within it (under the caller's
+    lock, sends included) instead of opening its own scopes. New/de-scoped callers pass
+    nothing and must NOT hold a session_scope. ``destination`` may be a raw channel
+    (wrapped) or an already-built Surface.
     """
     destination = _ensure_surface(destination)
-    old_state = submission.state
-    snap, atts, links = await _snapshot(session, submission)
-    new_state = evaluate_state(snap)
-    gaps = set(missing_gaps(snap))
-    # Don't overwrite state for submissions already past READY_TO_QUEUE - evaluate_state
-    # is content-based and would otherwise downgrade QUEUED/PUBLISHED back to ready_to_queue.
-    if old_state not in _QUEUE_TERMINAL:
-        submission.state = new_state.value
+    async with _maybe_submission_lock(ambient_session, submission_id):
+        # --- Decide (short DB scope): read state + open-request flags, set state. ---
+        async with _scope(ambient_session) as session:
+            submission = await session.get(Submission, submission_id)
+            if submission is None:
+                return SubmissionState.INTENT_SUBMITTED
+            old_state = submission.state
+            snap, atts, links = await _snapshot(session, submission)
+            new_state = evaluate_state(snap)
+            gaps = set(missing_gaps(snap))
+            terminal = old_state in _QUEUE_TERMINAL
+            # Don't overwrite state for submissions already past READY_TO_QUEUE -
+            # evaluate_state is content-based and would downgrade QUEUED/PUBLISHED.
+            if not terminal:
+                submission.state = new_state.value
+            status_message_id = submission.status_message_id
 
-    # Cancel button: posted once, before any other requests. OP and curators can react ❌.
-    has_cancel = await session.scalar(
-        select(CancellationRequest.id).where(CancellationRequest.submission_id == submission.id)
-    ) is not None
-    if not has_cancel:
-        try:
-            msg = await destination.send(
-                replies.cancel_request(),
-                components=prompts.cancel_components(submission.id),
-            )
-            session.add(CancellationRequest(
-                submission_id=submission.id,
-                bot_message_id=msg.id,
-                prompted_at=_now(),
-            ))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post cancel request for submission %s: %s", submission.id, exc)
+            has_cancel = await session.scalar(
+                select(CancellationRequest.id).where(CancellationRequest.submission_id == submission_id)
+            ) is not None
+            suppl_image_open = await _has_open_request(session, SupplementalImageRequest, submission_id)
+            suppl_link_open = await _has_open_request(session, SupplementalLinkRequest, submission_id)
+            source_open = await _has_open_request(session, SourceRequest, submission_id)
+            metadata_open = await _has_open_request(session, MetadataRequest, submission_id)
+            image_open = await _has_open_request(session, ImageRequest, submission_id)
+            graphic_notice = await session.scalar(
+                select(ContentLabelRequest.id).where(ContentLabelRequest.submission_id == submission_id)
+            ) is not None
 
-    # Supplemental image offer: re-posted each time it's answered so OP/curator can
-    # keep adding images in batches. Suppressed once the submission is terminal.
-    if old_state not in _QUEUE_TERMINAL and not await _has_open_request(
-        session, SupplementalImageRequest, submission.id
-    ):
-        try:
-            msg = await destination.send(replies.supplemental_image_request())
-            session.add(SupplementalImageRequest(
-                submission_id=submission.id,
-                bot_message_id=msg.id,
-                prompted_at=_now(),
-            ))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post supplemental image request for submission %s: %s", submission.id, exc)
+            needed_alt_atts = []
+            if Gap.ALT_TEXT in gaps:
+                for att in atts:
+                    if ((att.is_image or att.is_video)
+                            and att.alt_text_status == AltTextStatus.NEEDED.value
+                            and not await _has_open_request(
+                                session, AttachmentAltTextRequest, submission_id, attachment_id=att.id)):
+                        needed_alt_atts.append(att)
 
-    # Supplemental link offer: re-posted each time it's answered. Only shown once
-    # a source link exists (SOURCE gap closed), so it doesn't compete with SourceRequest.
-    if old_state not in _QUEUE_TERMINAL and snap.has_canonical_link and not await _has_open_request(
-        session, SupplementalLinkRequest, submission.id
-    ):
-        try:
-            msg = await destination.send(replies.supplemental_link_request())
-            session.add(SupplementalLinkRequest(
-                submission_id=submission.id,
-                bot_message_id=msg.id,
-                prompted_at=_now(),
-            ))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post supplemental link request for submission %s: %s", submission.id, exc)
+            ready = new_state == SubmissionState.READY_TO_QUEUE
+            source_domain = links[0].domain_family if links else None
+            checklist_content = replies.status_checklist(snap, ready=ready, source_domain=source_domain)
 
-    if Gap.SOURCE in gaps and not await _has_open_request(
-        session, SourceRequest, submission.id
-    ):
-        # Mention the /nosource waiver only when there is media to post without a link.
-        has_media = any(a.is_image or a.is_video for a in atts)
-        try:
+            stale_conf_id = stale_conf_msg_id = None
+            if not terminal and not ready:
+                stale_conf = await session.scalar(
+                    select(ConfirmationRequest).where(
+                        ConfirmationRequest.submission_id == submission_id,
+                        ConfirmationRequest.confirmed_at.is_(None),
+                    )
+                )
+                if stale_conf is not None:
+                    stale_conf_id, stale_conf_msg_id = stale_conf.id, stale_conf.bot_message_id
+
+            action = _queue_action(old_state, new_state)
+            existing_conf_id = existing_conf_msg_id = None
+            legacy_collapse = False
+            preview_pages: list[str] = []
+            confirmation_content = None
+            confirm_components = None
+            if action in ("fresh", "silent"):
+                existing_conf = await session.scalar(
+                    select(ConfirmationRequest).where(
+                        ConfirmationRequest.submission_id == submission_id,
+                        ConfirmationRequest.confirmed_at.is_(None),
+                    )
+                )
+                if existing_conf is not None:
+                    existing_conf_id = existing_conf.id
+                    existing_conf_msg_id = existing_conf.bot_message_id
+                    # Legacy: the ConfirmationRequest rode on the checklist message, whose
+                    # button is stripped on every in-place edit. Repost a standalone one.
+                    legacy_collapse = (
+                        action == "silent"
+                        and existing_conf.bot_message_id == submission.status_message_id
+                    )
+                board_cfg_conf = settings.board_for_channel(submission.channel_id)
+                media_count = sum(1 for a in atts if a.is_image or a.is_video)
+                confirmation_content = replies.confirmation_request(
+                    bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
+                    youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
+                )
+                confirm_components = prompts.confirm_components(submission_id, media_count=media_count)
+                preview = await _build_post_preview(session, submission, atts, links)
+                preview_pages = list(replies.format_post_preview(preview))
+
+            has_media = any(a.is_image or a.is_video for a in atts)
+            primary = _primary_link(links)
+            metadata_url = primary.canonical_url if primary else "?"
+            image_source_unavailable = primary is not None and primary.resolved_via == "unavailable"
+
+        # --- I/O (lock released): post in order, collecting rows / deletes / new checklist id. ---
+        to_add: list = []
+        to_delete_conf_ids: list[int] = []
+        new_status_id: int | None = None
+
+        # Cancel button: posted once, before any other requests.
+        if not has_cancel:
+            try:
+                msg = await destination.send(
+                    replies.cancel_request(), components=prompts.cancel_components(submission_id)
+                )
+                to_add.append(CancellationRequest(
+                    submission_id=submission_id, bot_message_id=msg.id, prompted_at=_now()))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post cancel request for submission %s: %s", submission_id, exc)
+
+        # Supplemental image offer (re-posted each answer, suppressed once terminal).
+        if not terminal and not suppl_image_open:
+            try:
+                msg = await destination.send(replies.supplemental_image_request())
+                to_add.append(SupplementalImageRequest(
+                    submission_id=submission_id, bot_message_id=msg.id, prompted_at=_now()))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post supplemental image request for submission %s: %s", submission_id, exc)
+
+        # Supplemental link offer (only once a source link exists).
+        if not terminal and snap.has_canonical_link and not suppl_link_open:
+            try:
+                msg = await destination.send(replies.supplemental_link_request())
+                to_add.append(SupplementalLinkRequest(
+                    submission_id=submission_id, bot_message_id=msg.id, prompted_at=_now()))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post supplemental link request for submission %s: %s", submission_id, exc)
+
+        if Gap.SOURCE in gaps and not source_open:
+            # Mention the /nosource waiver only when there is media to post without a link.
             prompt = replies.source_request_with_waiver() if has_media else replies.source_request()
-            msg = await destination.send(prompt)
-            session.add(SourceRequest(submission_id=submission.id, bot_message_id=msg.id))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post source request for submission %s: %s", submission.id, exc)
+            try:
+                msg = await destination.send(prompt)
+                to_add.append(SourceRequest(submission_id=submission_id, bot_message_id=msg.id))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post source request for submission %s: %s", submission_id, exc)
 
-    if Gap.METADATA in gaps and not await _has_open_request(
-        session, MetadataRequest, submission.id
-    ):
-        primary = _primary_link(links)
-        url = primary.canonical_url if primary else "?"
-        try:
-            msg = await destination.send(
-                replies.metadata_request(url),
-                components=prompts.metadata_confirm_components(submission.id),
-            )
-            session.add(MetadataRequest(submission_id=submission.id, bot_message_id=msg.id))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post metadata request for submission %s: %s", submission.id, exc)
+        if Gap.METADATA in gaps and not metadata_open:
+            try:
+                msg = await destination.send(
+                    replies.metadata_request(metadata_url),
+                    components=prompts.metadata_confirm_components(submission_id),
+                )
+                to_add.append(MetadataRequest(submission_id=submission_id, bot_message_id=msg.id))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post metadata request for submission %s: %s", submission_id, exc)
 
-    # IMAGE gap is suppressed while METADATA is open - a better link may provide an image.
-    if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not await _has_open_request(
-        session, ImageRequest, submission.id
-    ):
-        primary = _primary_link(links)
-        source_unavailable = primary is not None and primary.resolved_via == "unavailable"
-        try:
-            msg = await destination.send(replies.image_request(source_unavailable=source_unavailable))
-            session.add(ImageRequest(submission_id=submission.id, bot_message_id=msg.id))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post image request for submission %s: %s", submission.id, exc)
+        # IMAGE gap is suppressed while METADATA is open - a better link may provide an image.
+        if Gap.IMAGE in gaps and Gap.METADATA not in gaps and not image_open:
+            try:
+                msg = await destination.send(replies.image_request(source_unavailable=image_source_unavailable))
+                to_add.append(ImageRequest(submission_id=submission_id, bot_message_id=msg.id))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post image request for submission %s: %s", submission_id, exc)
 
-    if Gap.ALT_TEXT in gaps:
-        for att in atts:
-            if not (att.is_image or att.is_video) or att.alt_text_status != AltTextStatus.NEEDED.value:
-                continue
-            if await _has_open_request(
-                session, AttachmentAltTextRequest, submission.id, attachment_id=att.id
-            ):
-                continue
+        for att in needed_alt_atts:
             try:
                 if att.local_path and att.is_image:
                     try:
@@ -2982,7 +3055,7 @@ async def recompute_and_request(
                             preview=PreviewImage(local_path=att.local_path, filename=att.filename),
                         )
                     except Exception as exc:
-                        log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission.id, att.id, exc)
+                        log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission_id, att.id, exc)
                         msg = await destination.send(
                             replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                         )
@@ -2990,133 +3063,93 @@ async def recompute_and_request(
                     msg = await destination.send(
                         replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                     )
-                session.add(
-                    AttachmentAltTextRequest(
-                        submission_id=submission.id,
-                        attachment_id=att.id,
-                        bot_message_id=msg.id,
-                    )
-                )
+                to_add.append(AttachmentAltTextRequest(
+                    submission_id=submission_id, attachment_id=att.id, bot_message_id=msg.id))
             except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not post alt text request for submission %s, att %s: %s", submission.id, att.id, exc)
+                log.warning("could not post alt text request for submission %s, att %s: %s", submission_id, att.id, exc)
 
-    has_graphic_notice = await session.scalar(
-        select(ContentLabelRequest.id).where(ContentLabelRequest.submission_id == submission.id)
-    ) is not None
-    if snap.graphic_classification_required and not has_graphic_notice:
-        try:
-            msg = await destination.send(
-                replies.graphic_request(),
-                components=prompts.graphic_components(submission.id),
-            )
-            session.add(
-                ContentLabelRequest(submission_id=submission.id, bot_message_id=msg.id)
-            )
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post graphic request for submission %s: %s", submission.id, exc)
+        if snap.graphic_classification_required and not graphic_notice:
+            try:
+                msg = await destination.send(
+                    replies.graphic_request(), components=prompts.graphic_components(submission_id)
+                )
+                to_add.append(ContentLabelRequest(submission_id=submission_id, bot_message_id=msg.id))
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not post graphic request for submission %s: %s", submission_id, exc)
 
-    # Live status checklist: created once, edited in place each recompute. It is the
-    # glanceable source of truth for what's blocking, and carries the Queue/Edit
-    # buttons once ready. Skipped once the submission is terminal (queued/published).
-    ready = new_state == SubmissionState.READY_TO_QUEUE
-    source_domain = links[0].domain_family if links else None
-    if old_state not in _QUEUE_TERMINAL:
-        await _upsert_status_checklist(
-            submission, destination, snap, ready=ready, source_domain=source_domain
-        )
+        # Live status checklist: edit in place, or (re)post if missing. Skipped when terminal.
+        if not terminal:
+            try:
+                edited = (
+                    status_message_id is not None
+                    and await destination.edit_or_none(status_message_id, checklist_content)
+                )
+                if not edited:
+                    msg = await destination.send(checklist_content)
+                    new_status_id = msg.id
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("could not upsert status checklist for submission %s: %s", submission_id, exc)
 
-    # Regression: a submission that was ready (has an open, unconfirmed confirmation) has slipped
-    # back to a gap state because content changed under it (e.g. a late-added image needing alt
-    # text). Retract the stale Queue button so it can't be clicked into a bad queue; a fresh
-    # confirmation is reposted by the "fresh" path once the gaps close again.
-    if old_state not in _QUEUE_TERMINAL and new_state != SubmissionState.READY_TO_QUEUE:
-        stale_conf = await session.scalar(
-            select(ConfirmationRequest).where(
-                ConfirmationRequest.submission_id == submission.id,
-                ConfirmationRequest.confirmed_at.is_(None),
-            )
-        )
-        if stale_conf is not None:
-            # Best-effort tombstone; NotFound/errors are swallowed by the adapter, and
-            # dropping the DB row below is enough regardless.
-            await destination.disable_components(
-                stale_conf.bot_message_id, "Not ready - see checklist"
-            )
-            await session.delete(stale_conf)
-            await session.flush()
+        # Regression out of ready: tombstone the stale Queue button and drop its row.
+        if stale_conf_id is not None:
+            await destination.disable_components(stale_conf_msg_id, "Not ready - see checklist")
+            to_delete_conf_ids.append(stale_conf_id)
 
-    action = _queue_action(old_state, new_state)
-    if action in ("fresh", "silent"):
-        existing_conf = await session.scalar(
-            select(ConfirmationRequest).where(
-                ConfirmationRequest.submission_id == submission.id,
-                ConfirmationRequest.confirmed_at.is_(None),
-            )
-        )
-        has_conf = existing_conf is not None
-
-        # On the "silent" path (already READY_TO_QUEUE, typically a bot restart),
-        # make sure the confirmation button is actually present and clickable.
-        if has_conf and action == "silent" and existing_conf is not None:
-            # Legacy submissions recorded the ConfirmationRequest against the status
-            # checklist message (the button used to live on the checklist). The checklist
-            # is now edited in place with view=None, which strips that button on every
-            # recompute. Detect the collapse and repost a fresh standalone confirmation.
-            if existing_conf.bot_message_id == submission.status_message_id:
+        # Fresh/silent: ensure a live confirmation button (with preview) exists.
+        if action in ("fresh", "silent"):
+            has_conf = existing_conf_id is not None
+            if has_conf and legacy_collapse:
                 log.warning(
                     "confirmation for submission %s rode on the checklist message %s "
                     "(button stripped); reposting a standalone confirmation",
-                    submission.id, existing_conf.bot_message_id,
+                    submission_id, existing_conf_msg_id,
                 )
-                await session.delete(existing_conf)
-                await session.flush()
+                to_delete_conf_ids.append(existing_conf_id)
                 has_conf = False
-            else:
-                # Otherwise verify the message still exists; if it was deleted, clean up
-                # the stale row so the confirmation gets reposted below.
-                if not await destination.message_exists(existing_conf.bot_message_id):
+            elif has_conf and action == "silent":
+                if not await destination.message_exists(existing_conf_msg_id):
                     log.warning(
                         "confirmation message %s for submission %s was deleted; reposting",
-                        existing_conf.bot_message_id, submission.id,
+                        existing_conf_msg_id, submission_id,
                     )
-                    await session.delete(existing_conf)
-                    await session.flush()
+                    to_delete_conf_ids.append(existing_conf_id)
                     has_conf = False
+            if not has_conf:
+                try:
+                    for page in preview_pages:
+                        await destination.send(page)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("could not post preview for submission %s: %s", submission_id, exc)
+                # Post the confirmation (buttons) last so it sits below the preview.
+                try:
+                    msg = await destination.send(confirmation_content, components=confirm_components)
+                    to_add.append(ConfirmationRequest(submission_id=submission_id, bot_message_id=msg.id))
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("could not post confirmation request for submission %s: %s", submission_id, exc)
 
-        if not has_conf:
+        # Reply that resolved the last alt-text gap on a queued submission: confirm + archive.
+        if from_reply and terminal and Gap.ALT_TEXT not in gaps:
             try:
-                preview = await _build_post_preview(session, submission, atts, links)
-                for page in replies.format_post_preview(preview):
-                    await destination.send(page)
+                await destination.send(replies.updated_notice())
             except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not post preview for submission %s: %s", submission.id, exc)
-            # Post the queue confirmation (with the buttons) last, so it sits at the very
-            # bottom of the thread, after the preview.
-            try:
-                board_cfg_conf = settings.board_for_channel(submission.channel_id)
-                media_count = sum(1 for a in atts if a.is_image or a.is_video)
-                msg = await destination.send(
-                    replies.confirmation_request(
-                        bluesky_handle=board_cfg_conf.bluesky_handle if board_cfg_conf else None,
-                        youtube_playlist_id=board_cfg_conf.youtube_playlist_id if board_cfg_conf else None,
-                    ),
-                    components=prompts.confirm_components(submission.id, media_count=media_count),
-                )
-                session.add(ConfirmationRequest(
-                    submission_id=submission.id,
-                    bot_message_id=msg.id,
-                ))
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("could not post confirmation request for submission %s: %s", submission.id, exc)
+                log.warning("could not post updated notice for submission %s: %s", submission_id, exc)
+            await destination.archive(replies.closing_notice("updated"))
 
-    # When a reply updates an already-queued submission and all pending alt-text gaps
-    # are now resolved, confirm the update and re-schedule thread archiving.
-    if from_reply and old_state in _QUEUE_TERMINAL and Gap.ALT_TEXT not in gaps:
-        try:
-            await destination.send(replies.updated_notice())
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("could not post updated notice for submission %s: %s", submission.id, exc)
-        await destination.archive(replies.closing_notice("updated"))
+        # --- Persist (short DB scope): tracking rows + checklist id + deletions. ---
+        async with _scope(ambient_session) as session:
+            # Delete stale confirmation rows BEFORE inserting a fresh one - the
+            # confirmation_requests.submission_id unique constraint forbids two at once.
+            for cid in to_delete_conf_ids:
+                row = await session.get(ConfirmationRequest, cid)
+                if row is not None:
+                    await session.delete(row)
+            await session.flush()
+            for row in to_add:
+                session.add(row)
+            if new_status_id is not None:
+                submission = await session.get(Submission, submission_id)
+                if submission is not None:
+                    submission.status_message_id = new_status_id
 
     return new_state
 
@@ -3437,7 +3470,7 @@ async def handle_reply(
         return True  # we replied with a nudge; leave request open
 
     # Replies arrive in the submission's thread, so post follow-ups right there.
-    await recompute_and_request(session, submission, settings=settings, destination=message.channel, yt_client=yt_client, from_reply=True)
+    await recompute_and_request(submission.id, settings=settings, destination=message.channel, yt_client=yt_client, from_reply=True, ambient_session=session)
     return True
 
 

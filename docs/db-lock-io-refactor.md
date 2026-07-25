@@ -1,8 +1,10 @@
 # Move network & Discord I/O out of the global DB lock
 
 **Type:** Refactor / responsiveness
-**Status:** Done for the responsiveness goal (Slices A + B shipped). Slice C
-(de-locking the interaction handlers) deliberately deferred - see "Outcome".
+**Status:** Complete. Slices A + B shipped the responsiveness fix; the remaining
+"no I/O under the lock" invariant was then finished as part of the surface-agnostic
+core work (#50), which made `recompute_and_request` self-managing. The broad
+`handle_reaction` invariant is now a hard pass (no longer xfail).
 **Risk:** Medium (touches every ingest hot path; correctness rests on a test net)
 
 ## Outcome

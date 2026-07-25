@@ -332,7 +332,7 @@ async def test_ready_keeps_checklist_and_puts_confirmation_last(session, board):
     await session.flush()
 
     dest = MockDest()
-    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=_settings(), destination=dest, ambient_session=session)
 
     # Ready: the checklist is kept (all checked, "Ready to queue"), and the queue
     # confirmation is the LAST message so the buttons sit at the bottom, after the preview.
@@ -359,7 +359,7 @@ async def test_recompute_source_prompt_mentions_waiver_with_media(session, board
     await _img(session, sub, status=AltTextStatus.PROVIDED.value)  # media, but no link -> SOURCE gap
 
     dest = MockDest()
-    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=_settings(), destination=dest, ambient_session=session)
     assert any("/no_source" in m for m in dest.sent)  # waiver hinted only when there's media
 
 
@@ -369,7 +369,7 @@ async def test_recompute_plain_source_prompt_without_media(session, board):
     await session.flush()  # no media, no link -> SOURCE gap, no waiver hinted
 
     dest = MockDest()
-    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=_settings(), destination=dest, ambient_session=session)
     assert any("source URL" in m for m in dest.sent)
     assert not any("/no_source" in m for m in dest.sent)
 
@@ -452,5 +452,5 @@ async def test_upsert_falls_back_to_send_when_edit_unsupported(session, board):
     await session.flush()
 
     dest = _SendOnlyDest()
-    await recompute_and_request(session, sub, settings=_settings(), destination=dest)
+    await recompute_and_request(sub.id, settings=_settings(), destination=dest, ambient_session=session)
     assert any("post status" in m for m in dest.sent)

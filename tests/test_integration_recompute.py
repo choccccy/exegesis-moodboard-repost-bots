@@ -69,7 +69,7 @@ async def _add_link(session, submission: Submission, *, canonical_url: str = "ht
 
 async def _recompute(session, submission, board, settings=None):
     dest = MockDest()
-    await recompute_and_request(session, submission, settings=settings or _mock_settings(), destination=dest)
+    await recompute_and_request(submission.id, settings=settings or _mock_settings(), destination=dest, ambient_session=session)
     await session.flush()
     return dest
 
