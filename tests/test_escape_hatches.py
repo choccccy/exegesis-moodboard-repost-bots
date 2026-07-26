@@ -22,6 +22,7 @@ from bot.discord_ingest.service import (
     waive_source,
     render_submission_status,
 )
+from bot.ingest.outcomes import Ack, Noop, Tombstone
 from bot.models import Attachment, AttachmentAltTextRequest, SourceRequest, SubmissionLink
 from bot.state import AltTextStatus, SubmissionState
 
@@ -45,17 +46,9 @@ def _settings(curator_ids=None):
     return s
 
 
-def _interaction(user_id: int):
-    inter = MagicMock(spec=discord.Interaction)
-    inter.user = MagicMock()
-    inter.user.id = user_id
-    inter.user.roles = []
-    inter.channel = MockDest()  # destination for recompute: send + get_partial_message + archive
-    inter.message = MagicMock()
-    inter.message.edit = AsyncMock()
-    inter.followup = MagicMock()
-    inter.followup.send = AsyncMock()
-    return inter
+def _event(user_id: int, submission_id: int):
+    from bot.ingest.events import InteractionEvent
+    return InteractionEvent(user_id=user_id, submission_id=submission_id, member=None)
 
 
 async def _img(session, sub, *, status=AltTextStatus.NEEDED.value):
@@ -175,14 +168,15 @@ async def test_source_note_confirm_commits_note(session, board):
     session.add(SourceRequest(submission_id=sub.id, bot_message_id=next(_ids)))
     await session.flush()
 
-    inter = _interaction(999)
-    await handle_source_note_confirm(session, inter, sub.id, _settings())
+    dest = MockDest()
+    outcome = await handle_source_note_confirm(session, _event(999, sub.id), dest, _settings())
 
     await session.refresh(sub)
     assert sub.source_note_confirmed is True
     req = await session.scalar(select(SourceRequest).where(SourceRequest.submission_id == sub.id))
     assert req.answered_at is not None and req.answer == "source_note"
-    assert any("Popular Mechanics" in m for m in inter.channel.sent)
+    assert any("Popular Mechanics" in m for m in dest.sent)
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_source_note_confirm_unauthorized(session, board):
@@ -191,27 +185,24 @@ async def test_source_note_confirm_unauthorized(session, board):
     session.add(sub)
     await session.flush()
 
-    inter = _interaction(555)
-    await handle_source_note_confirm(session, inter, sub.id, _settings())
+    outcome = await handle_source_note_confirm(session, _event(555, sub.id), MockDest(), _settings())
 
     await session.refresh(sub)
     assert sub.source_note_confirmed is False
-    inter.followup.send.assert_awaited_once()
+    assert isinstance(outcome, Ack)
 
 
 async def test_source_note_confirm_without_candidate(session, board):
     sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
     session.add(sub)
     await session.flush()
-    inter = _interaction(999)
-    await handle_source_note_confirm(session, inter, sub.id, _settings())
-    inter.followup.send.assert_awaited_once()  # nothing to confirm
+    outcome = await handle_source_note_confirm(session, _event(999, sub.id), MockDest(), _settings())
+    assert isinstance(outcome, Ack)  # nothing to confirm
 
 
 async def test_source_note_confirm_missing_submission(session, board):
-    inter = _interaction(999)
-    await handle_source_note_confirm(session, inter, 999999, _settings())
-    inter.followup.send.assert_not_awaited()
+    outcome = await handle_source_note_confirm(session, _event(999, 999999), MockDest(), _settings())
+    assert isinstance(outcome, Noop)
 
 
 async def test_source_note_reject_discards(session, board):
@@ -221,13 +212,14 @@ async def test_source_note_reject_discards(session, board):
     session.add(sub)
     await session.flush()
 
-    inter = _interaction(999)
-    await handle_source_note_reject(session, inter, sub.id, _settings())
+    dest = MockDest()
+    outcome = await handle_source_note_reject(session, _event(999, sub.id), dest, _settings())
 
     await session.refresh(sub)
     assert sub.source_note is None
     assert sub.source_note_confirmed is False
-    assert any("discarded" in m.lower() for m in inter.channel.sent)
+    assert any("discarded" in m.lower() for m in dest.sent)
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_source_note_reject_unauthorized(session, board):
@@ -235,17 +227,15 @@ async def test_source_note_reject_unauthorized(session, board):
     sub.source_note = "keep me"
     session.add(sub)
     await session.flush()
-    inter = _interaction(555)
-    await handle_source_note_reject(session, inter, sub.id, _settings())
+    outcome = await handle_source_note_reject(session, _event(555, sub.id), MockDest(), _settings())
     await session.refresh(sub)
     assert sub.source_note == "keep me"  # unauthorized: unchanged
-    inter.followup.send.assert_awaited_once()
+    assert isinstance(outcome, Ack)
 
 
 async def test_source_note_reject_missing_submission(session, board):
-    inter = _interaction(999)
-    await handle_source_note_reject(session, inter, 999999, _settings())
-    inter.followup.send.assert_not_awaited()
+    outcome = await handle_source_note_reject(session, _event(999, 999999), MockDest(), _settings())
+    assert isinstance(outcome, Noop)
 
 
 async def test_source_note_confirm_without_open_request(session, board):
@@ -254,56 +244,9 @@ async def test_source_note_confirm_without_open_request(session, board):
     sub.source_note = "an old catalog"
     session.add(sub)
     await session.flush()
-    await handle_source_note_confirm(session, _interaction(999), sub.id, _settings())
+    await handle_source_note_confirm(session, _event(999, sub.id), MockDest(), _settings())
     await session.refresh(sub)
     assert sub.source_note_confirmed is True
-
-
-async def test_source_note_confirm_channel_none_returns_after_commit(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    sub.source_note = "an old catalog"
-    session.add(sub)
-    await session.flush()
-    inter = _interaction(999)
-    inter.channel = None
-    await handle_source_note_confirm(session, inter, sub.id, _settings())
-    # committed even with nowhere to post the notice (in-memory: no recompute/flush on this path)
-    assert sub.source_note_confirmed is True
-
-
-async def test_source_note_confirm_tombstone_edit_error_swallowed(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    sub.source_note = "an old catalog"
-    session.add(sub)
-    await session.flush()
-    inter = _interaction(999)
-    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-    await handle_source_note_confirm(session, inter, sub.id, _settings())  # must not raise
-    await session.refresh(sub)
-    assert sub.source_note_confirmed is True
-
-
-async def test_source_note_reject_channel_none_returns_after_discard(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    sub.source_note = "misfire"
-    session.add(sub)
-    await session.flush()
-    inter = _interaction(999)
-    inter.channel = None
-    await handle_source_note_reject(session, inter, sub.id, _settings())
-    assert sub.source_note is None  # in-memory: no recompute/flush on the channel-None path
-
-
-async def test_source_note_reject_tombstone_edit_error_swallowed(session, board):
-    sub = make_submission(board, state=SubmissionState.AWAITING_SOURCE.value, author_id=999)
-    sub.source_note = "misfire"
-    session.add(sub)
-    await session.flush()
-    inter = _interaction(999)
-    inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-    await handle_source_note_reject(session, inter, sub.id, _settings())  # must not raise
-    await session.refresh(sub)
-    assert sub.source_note is None
 
 
 async def test_waive_source_without_open_request(session, board):

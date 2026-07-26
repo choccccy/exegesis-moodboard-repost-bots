@@ -18,7 +18,7 @@ from ..db import session_scope
 from ..models import ConfirmationRequest, Submission, SubmissionThread
 from ..moderation import GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
-from . import replies, service
+from . import gateway, replies, service
 from .replies import CANCEL_EMOJI
 
 log = logging.getLogger(__name__)
@@ -221,27 +221,28 @@ class RepostBot(discord.Client):
         # The edit button's initial response IS the modal - defer() is not allowed first.
         # All other buttons defer immediately before any DB work so we stay within
         # Discord's 3-second acknowledgement window even when the bot is rate-limited.
+        # These handlers go through the surface-agnostic gateway (Phase C): a short DB
+        # scope decides and returns a HandlerOutcome; the gateway performs the Discord
+        # response (modal/picker) with the DB lock released.
         if custom_id.startswith("edit:"):
+            event = gateway.to_event(interaction, int(custom_id.removeprefix("edit:")))
             async with session_scope() as session:
-                await service.handle_edit_button(
-                    session, interaction, int(custom_id.removeprefix("edit:")), self.settings
-                )
+                outcome = await service.handle_edit_button(session, event, self.settings)
+            await gateway.perform(interaction, outcome)
             return
 
         # The alt picker opens a message-with-select then a modal - neither may defer first.
         if custom_id.startswith("alt_edit:"):
+            event = gateway.to_event(interaction, int(custom_id.removeprefix("alt_edit:")))
             async with session_scope() as session:
-                await service.handle_alt_edit_button(
-                    session, interaction, int(custom_id.removeprefix("alt_edit:")),
-                    self.settings, self._yt_client,
-                )
+                outcome = await service.handle_alt_edit_button(session, event, self.settings, self._yt_client)
+            await gateway.perform(interaction, outcome)
             return
         if custom_id.startswith("alt_pick:"):
+            event = gateway.to_event(interaction, int(custom_id.removeprefix("alt_pick:")))
             async with session_scope() as session:
-                await service.handle_alt_pick(
-                    session, interaction, int(custom_id.removeprefix("alt_pick:")),
-                    self.settings, self._yt_client,
-                )
+                outcome = await service.handle_alt_pick(session, event, self.settings, self._yt_client)
+            await gateway.perform(interaction, outcome)
             return
 
         try:
@@ -260,25 +261,32 @@ class RepostBot(discord.Client):
                 pass
             return
 
+        # The deferred button handlers go through the surface-agnostic gateway (Phase C):
+        # they take a normalized event + a Surface and return a HandlerOutcome, which the
+        # gateway performs (ack/tombstone) after the DB scope closes. (pl_skip still has
+        # deeper channel coupling and stays on the direct path until its Surface support
+        # lands.)
+        outcome = None
         async with session_scope() as session:
             if custom_id.startswith("cancel:"):
-                await service.handle_cancel_button(
-                    session, interaction, int(custom_id.removeprefix("cancel:")), self.settings
+                outcome = await service.handle_cancel_button(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("cancel:"))),
+                    gateway.surface_for(interaction), self.settings,
                 )
             elif custom_id.startswith("confirm:"):
-                await service.handle_confirm_button(
-                    session, interaction, int(custom_id.removeprefix("confirm:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_confirm_button(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("confirm:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("meta_ok:"):
-                await service.handle_metadata_confirm_button(
-                    session, interaction, int(custom_id.removeprefix("meta_ok:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_metadata_confirm_button(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("meta_ok:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("graphic:"):
-                await service.handle_graphic_button(
-                    session, interaction, int(custom_id.removeprefix("graphic:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_graphic_button(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("graphic:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("pl_skip:"):
                 await service.handle_playlist_skip_button(
@@ -286,15 +294,17 @@ class RepostBot(discord.Client):
                     self.settings, self._yt_client,
                 )
             elif custom_id.startswith("srcnote_ok:"):
-                await service.handle_source_note_confirm(
-                    session, interaction, int(custom_id.removeprefix("srcnote_ok:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_source_note_confirm(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("srcnote_ok:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("srcnote_no:"):
-                await service.handle_source_note_reject(
-                    session, interaction, int(custom_id.removeprefix("srcnote_no:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_source_note_reject(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("srcnote_no:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
+        if outcome is not None:
+            await gateway.perform(interaction, outcome)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == getattr(self.user, "id", None):

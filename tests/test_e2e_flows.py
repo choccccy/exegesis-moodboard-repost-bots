@@ -43,7 +43,12 @@ from bot.models import (
 from bot.scheduler import _fire_board
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
-from conftest import make_submission
+from bot.ingest.events import InteractionEvent
+from conftest import MockDest, make_submission
+
+
+def _event(user_id: int, submission_id: int):
+    return InteractionEvent(user_id=user_id, submission_id=submission_id, member=None)
 from test_publish_dispatch import _fake_client, _patched_client, _record_of
 
 _ids = itertools.count(20_000)
@@ -132,22 +137,6 @@ def _source_message(board, *, msg_id=None, content="https://example.com/robot", 
     return msg, thread
 
 
-def _confirm_interaction(user_id=999):
-    interaction = MagicMock(spec=discord.Interaction)
-    interaction.user = MagicMock()
-    interaction.user.id = user_id
-    interaction.user.display_name = "poster"
-    member = MagicMock()
-    member.roles = []
-    interaction.user.roles = []
-    interaction.channel = _thread_mock()
-    interaction.followup = MagicMock()
-    interaction.followup.send = AsyncMock()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock()
-    return interaction
-
-
 async def _ingest(session, settings, msg):
     """Run handle_reaction with link metadata resolution stubbed to empty."""
     from bot.resolve import ResolvedMetadata
@@ -222,7 +211,7 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board, bind_db_scope
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
 
     # Confirm button queues it.
-    await handle_confirm_button(session, _confirm_interaction(), sub.id, settings)
+    await handle_confirm_button(session, _event(999, sub.id), MockDest(), settings)
     await session.flush()
     assert sub.state == SubmissionState.QUEUED.value
 
@@ -484,7 +473,7 @@ async def test_e2e_confirm_triggers_playlist_add(session, board, bind_db_scopes)
     yt_client = MagicMock()
     yt_client.add_to_playlist.return_value = "playlist-item-1"
 
-    await handle_confirm_button(session, _confirm_interaction(), sub.id, settings,
+    await handle_confirm_button(session, _event(999, sub.id), MockDest(), settings,
                                 yt_client=yt_client)
 
     await session.flush()

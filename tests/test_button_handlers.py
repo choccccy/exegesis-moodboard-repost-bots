@@ -32,9 +32,10 @@ from bot.models import (
     SubmissionLink,
     YoutubePlaylistAdd,
 )
+from bot.ingest.outcomes import Ack, Noop, OpenModal, Tombstone
 from bot.state import AltTextStatus, GraphicStatus, SubmissionState
 
-from conftest import make_submission
+from conftest import MockDest, make_submission
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +64,14 @@ def _settings(**kw) -> MagicMock:
     s.trigger_emoji = "🦋"
     s.attachments_dir = "/tmp/test-attachments"
     return s
+
+
+def _event(user_id: int = CURATOR_ID, submission_id: int = 0, *, values=()):
+    """A normalized button/select event (member=None; curator authz here is by id)."""
+    from bot.ingest.events import InteractionEvent
+    return InteractionEvent(
+        user_id=user_id, submission_id=submission_id, member=None, values=tuple(values)
+    )
 
 
 def _interaction(user_id: int = CURATOR_ID, channel: object = None) -> MagicMock:
@@ -107,36 +116,35 @@ def _channel_mock() -> MagicMock:
 
 
 @patch("bot.discord_ingest.service.remove_submission_dir")
-@patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock)
-@patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock)
-async def test_cancel_button_deletes_submission(mock_clear, mock_archive, mock_remove, session, board):
+async def test_cancel_button_deletes_submission(mock_remove, session, board):
     sub = make_submission(board, author_id=AUTHOR_ID, channel_id=100)
     session.add(sub)
     await session.flush()
     sub_id = sub.id
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_cancel_button(session, interaction, sub_id, _settings())
+    dest = MockDest()
+    outcome = await handle_cancel_button(session, _event(CURATOR_ID, sub_id), dest, _settings())
 
     remaining = await session.scalar(select(Submission).where(Submission.id == sub_id))
     assert remaining is None
+    assert isinstance(outcome, Tombstone)
+    assert dest.cleared_triggers == [(100, sub.source_discord_message_id)]  # trigger 🦋 removed
+    assert dest.archived  # thread archived
 
 
 @patch("bot.discord_ingest.service.remove_submission_dir")
-@patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock)
-@patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock)
-async def test_cancel_button_op_can_cancel(mock_clear, mock_archive, mock_remove, session, board):
+async def test_cancel_button_op_can_cancel(mock_remove, session, board):
     """The OP (author) can cancel their own submission."""
     sub = make_submission(board, author_id=AUTHOR_ID, channel_id=100)
     session.add(sub)
     await session.flush()
     sub_id = sub.id
 
-    interaction = _interaction(user_id=AUTHOR_ID)
-    await handle_cancel_button(session, interaction, sub_id, _settings())
+    outcome = await handle_cancel_button(session, _event(AUTHOR_ID, sub_id), MockDest(), _settings())
 
     remaining = await session.scalar(select(Submission).where(Submission.id == sub_id))
     assert remaining is None
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_cancel_button_unauthorized_user_rejected(session, board):
@@ -145,12 +153,11 @@ async def test_cancel_button_unauthorized_user_rejected(session, board):
     await session.flush()
     sub_id = sub.id
 
-    interaction = _interaction(user_id=777)  # not OP, not curator
-    await handle_cancel_button(session, interaction, sub_id, _settings())
+    outcome = await handle_cancel_button(session, _event(777, sub_id), MockDest(), _settings())
 
     remaining = await session.scalar(select(Submission).where(Submission.id == sub_id))
     assert remaining is not None
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack)  # rejected, not tombstoned
 
 
 async def test_cancel_button_published_submission_blocked(session, board):
@@ -163,17 +170,16 @@ async def test_cancel_button_published_submission_blocked(session, board):
     session.add(attempt)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_cancel_button(session, interaction, sub.id, _settings())
+    outcome = await handle_cancel_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
     remaining = await session.scalar(select(Submission).where(Submission.id == sub.id))
     assert remaining is not None
+    assert isinstance(outcome, Ack)
 
 
 async def test_cancel_button_not_found(session, board):
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_cancel_button(session, interaction, 99999, _settings())
-    interaction.followup.send.assert_called_once()
+    outcome = await handle_cancel_button(session, _event(CURATOR_ID, 99999), MockDest(), _settings())
+    assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +201,12 @@ async def test_confirm_button_queues_submission(mock_pclose, mock_playlist, sess
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
-    await handle_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_confirm_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
     assert sub.state == SubmissionState.QUEUED.value
     assert req.confirmed_at is not None
     assert req.confirmed_by == CURATOR_ID
+    assert isinstance(outcome, Tombstone)
 
 
 @patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
@@ -222,16 +227,14 @@ async def test_confirm_button_refuses_when_gap_reopened(mock_recompute, session,
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_confirm_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
     assert sub.state == SubmissionState.READY_TO_QUEUE.value  # not queued
     assert req.confirmed_at is None
     mock_recompute.assert_awaited_once()
-    interaction.followup.send.assert_called_once()
-    args, kwargs = interaction.followup.send.call_args
-    assert "alt text" in args[0]
-    assert kwargs.get("ephemeral") is True
+    assert isinstance(outcome, Ack)
+    assert "alt text" in outcome.message
+    assert outcome.ephemeral is True
 
 
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
@@ -245,11 +248,10 @@ async def test_confirm_button_unauthorized_user_rejected(mock_pclose, mock_playl
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=777)
-    await handle_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_confirm_button(session, _event(777, sub.id), MockDest(), _settings())
 
     assert sub.state == SubmissionState.READY_TO_QUEUE.value
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack)
 
 
 async def test_confirm_button_no_pending_req(session, board):
@@ -258,10 +260,9 @@ async def test_confirm_button_no_pending_req(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_confirm_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack) and "Already queued" in outcome.message
 
 
 async def test_confirm_button_already_queued_blocked(session, board):
@@ -273,10 +274,9 @@ async def test_confirm_button_already_queued_blocked(session, board):
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_confirm_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack) and "Nothing to queue" in outcome.message
 
 
 # ---------------------------------------------------------------------------
@@ -613,13 +613,12 @@ async def test_graphic_button_marks_graphic(mock_recompute, session, board):
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
-    await handle_graphic_button(session, interaction, sub.id, _settings())
+    outcome = await handle_graphic_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
     assert sub.graphic_status == GraphicStatus.GRAPHIC.value
     assert req.answered_at is not None
     mock_recompute.assert_called_once()
+    assert isinstance(outcome, Tombstone)
 
 
 @patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
@@ -632,12 +631,10 @@ async def test_graphic_button_unauthorized_rejected(mock_recompute, session, boa
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=777, channel=channel)
-    await handle_graphic_button(session, interaction, sub.id, _settings())
+    outcome = await handle_graphic_button(session, _event(777, sub.id), MockDest(), _settings())
 
     assert sub.graphic_status == GraphicStatus.UNKNOWN.value
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack)
     mock_recompute.assert_not_called()
 
 
@@ -647,10 +644,9 @@ async def test_graphic_button_no_req(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_graphic_button(session, interaction, sub.id, _settings())
+    outcome = await handle_graphic_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack) and "Already classified" in outcome.message
 
 
 # ---------------------------------------------------------------------------
@@ -706,10 +702,8 @@ async def test_edit_button_sends_modal_for_authorized(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=AUTHOR_ID)
-    await handle_edit_button(session, interaction, sub.id, _settings())
-
-    interaction.response.send_modal.assert_called_once()
+    outcome = await handle_edit_button(session, _event(AUTHOR_ID, sub.id), _settings())
+    assert isinstance(outcome, OpenModal)
 
 
 async def test_edit_button_unauthorized_rejected(session, board):
@@ -717,18 +711,13 @@ async def test_edit_button_unauthorized_rejected(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=777)
-    await handle_edit_button(session, interaction, sub.id, _settings())
-
-    interaction.response.send_message.assert_called_once()
-    interaction.response.send_modal.assert_not_called()
+    outcome = await handle_edit_button(session, _event(777, sub.id), _settings())
+    assert isinstance(outcome, Ack) and "not authorised" in outcome.message
 
 
 async def test_edit_button_not_found(session, board):
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_edit_button(session, interaction, 99999, _settings())
-
-    interaction.response.send_message.assert_called_once()
+    outcome = await handle_edit_button(session, _event(CURATOR_ID, 99999), _settings())
+    assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
 # ---------------------------------------------------------------------------
@@ -823,15 +812,14 @@ async def test_metadata_confirm_button_happy_path(mock_recompute, session, board
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
-    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+    dest = MockDest()
+    outcome = await handle_metadata_confirm_button(session, _event(CURATOR_ID, sub.id), dest, _settings())
 
     assert req.answer == "confirmed"
     assert req.answered_by == CURATOR_ID
     assert req.answered_at is not None
-    interaction.message.edit.assert_called_once()  # button tombstoned
-    channel.send.assert_called_once()  # metadata_confirmed notice
+    assert isinstance(outcome, Tombstone)  # button tombstoned
+    assert dest.sent  # metadata_confirmed notice posted to the thread
     mock_recompute.assert_called_once()
 
 
@@ -845,12 +833,11 @@ async def test_metadata_confirm_button_unauthorized_rejected(mock_recompute, ses
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=777)  # not OP, not curator
-    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_metadata_confirm_button(session, _event(777, sub.id), MockDest(), _settings())
 
     assert req.answer is None
     assert req.answered_at is None
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack)
     mock_recompute.assert_not_called()
 
 
@@ -867,10 +854,9 @@ async def test_metadata_confirm_button_already_answered(mock_recompute, session,
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
+    outcome = await handle_metadata_confirm_button(session, _event(CURATOR_ID, sub.id), MockDest(), _settings())
 
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack) and "Already confirmed" in outcome.message
     mock_recompute.assert_not_called()
 
 
@@ -881,30 +867,10 @@ async def test_metadata_confirm_button_missing_submission(mock_recompute, sessio
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_metadata_confirm_button(session, interaction, 99999, _settings())
+    outcome = await handle_metadata_confirm_button(session, _event(CURATOR_ID, 99999), MockDest(), _settings())
 
     assert req.answer is None
-    interaction.followup.send.assert_not_called()
-    mock_recompute.assert_not_called()
-
-
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
-async def test_metadata_confirm_button_no_channel_skips_recompute(mock_recompute, session, board):
-    """interaction.channel is None: request still answered, no notice/recompute."""
-    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
-    session.add(sub)
-    await session.flush()
-
-    req = MetadataRequest(submission_id=sub.id, bot_message_id=6004)
-    session.add(req)
-    await session.flush()
-
-    interaction = _interaction(user_id=CURATOR_ID)
-    interaction.channel = None
-    await handle_metadata_confirm_button(session, interaction, sub.id, _settings())
-
-    assert req.answer == "confirmed"
+    assert isinstance(outcome, Noop)
     mock_recompute.assert_not_called()
 
 
@@ -920,49 +886,10 @@ async def test_graphic_button_missing_submission(mock_recompute, session, board)
     session.add(req)
     await session.flush()
 
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_graphic_button(session, interaction, 99999, _settings())
+    outcome = await handle_graphic_button(session, _event(CURATOR_ID, 99999), MockDest(), _settings())
 
     assert req.answered_at is None
-    mock_recompute.assert_not_called()
-
-
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
-async def test_graphic_button_tombstone_failure_tolerated(mock_recompute, session, board):
-    """A failing message.edit (tombstone) must not block the classification."""
-    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
-    session.add(sub)
-    await session.flush()
-
-    req = ContentLabelRequest(submission_id=sub.id, bot_message_id=5003)
-    session.add(req)
-    await session.flush()
-
-    channel = _channel_mock()
-    interaction = _interaction(user_id=CURATOR_ID, channel=channel)
-    interaction.message.edit.side_effect = discord.HTTPException(MagicMock(), "no")
-    await handle_graphic_button(session, interaction, sub.id, _settings())
-
-    assert sub.graphic_status == GraphicStatus.GRAPHIC.value
-    assert req.answered_at is not None
-    mock_recompute.assert_called_once()
-
-
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
-async def test_graphic_button_no_channel_skips_recompute(mock_recompute, session, board):
-    sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
-    session.add(sub)
-    await session.flush()
-
-    req = ContentLabelRequest(submission_id=sub.id, bot_message_id=5004)
-    session.add(req)
-    await session.flush()
-
-    interaction = _interaction(user_id=CURATOR_ID)
-    interaction.channel = None
-    await handle_graphic_button(session, interaction, sub.id, _settings())
-
-    assert sub.graphic_status == GraphicStatus.GRAPHIC.value
+    assert isinstance(outcome, Noop)
     mock_recompute.assert_not_called()
 
 

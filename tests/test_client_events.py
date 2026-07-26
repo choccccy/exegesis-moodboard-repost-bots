@@ -62,7 +62,7 @@ async def test_on_interaction_edit_prefix_routes_without_defer(repost_bot, sessi
     ):
         await repost_bot.on_interaction(interaction)
     handler.assert_awaited_once()
-    assert handler.await_args.args[2] == 7
+    assert handler.await_args.args[1].submission_id == 7  # normalized event
     interaction.response.defer.assert_not_awaited()
 
 
@@ -84,7 +84,7 @@ async def test_on_interaction_alt_prefixes_route_without_defer(
     ):
         await repost_bot.on_interaction(interaction)
     handler.assert_awaited_once()
-    assert handler.await_args.args[2] == expected_id
+    assert handler.await_args.args[1].submission_id == expected_id  # normalized event
     interaction.response.defer.assert_not_awaited()
 
 
@@ -136,7 +136,10 @@ async def test_on_interaction_routes_prefix_to_handler(
         await repost_bot.on_interaction(interaction)
     interaction.response.defer.assert_awaited_once()
     handler.assert_awaited_once()
-    assert handler.await_args.args[2] == expected_id
+    if handler_name == "handle_playlist_skip_button":
+        assert handler.await_args.args[2] == expected_id  # legacy (session, interaction, submission_id, ...)
+    else:
+        assert handler.await_args.args[1].submission_id == expected_id  # normalized event
 
 
 async def test_on_interaction_unknown_custom_id_is_ignored(repost_bot, session):

@@ -20,10 +20,21 @@ from bot.discord_ingest.service import (
     handle_alt_pick,
     handle_edit_button,
 )
+from bot.ingest.events import InteractionEvent
+from bot.ingest.outcomes import Ack, Noop, OpenModal
 from bot.models import Attachment, SubmissionLink
 from bot.state import AltTextStatus, SubmissionState
 
 from conftest import make_submission
+
+
+def _event(user_id=999, submission_id=0, *, values=()):
+    """A normalized button/select event. member=None matches the pre-migration path
+    where a MagicMock user was never a real discord.Member (so only OP/curator-id
+    authorization applied)."""
+    return InteractionEvent(
+        user_id=user_id, submission_id=submission_id, member=None, values=tuple(values)
+    )
 
 _ids = itertools.count(80_000)
 
@@ -183,13 +194,11 @@ async def test_handle_edit_button_passes_first_four_media(session, board):
     ))
     for i in range(6):
         await _img(session, sub, filename=f"{i}.jpg")
-    inter = _interaction(999)
 
-    await handle_edit_button(session, inter, sub.id, _settings())
-    inter.response.send_modal.assert_awaited_once()
-    modal = inter.response.send_modal.await_args.args[0]
-    alt_inputs = [c for c in modal.children if (c.custom_id or "").startswith("alt:")]
-    assert len(alt_inputs) == 4  # capped at 4
+    outcome = await handle_edit_button(session, _event(999, sub.id), _settings())
+    assert isinstance(outcome, OpenModal)
+    alt_fields = [f for f in outcome.spec.fields if f.action_id.startswith("alt:")]
+    assert len(alt_fields) == 4  # capped at 4
 
 
 # --- make_confirm_view alt button gating ------------------------------------
@@ -215,11 +224,9 @@ async def test_alt_edit_button_sends_picker(session, board):
     await _img(session, sub, filename="a.jpg")
     await _img(session, sub, filename="b.mp4", is_video=True)
 
-    inter = _interaction(999)
-    await handle_alt_edit_button(session, inter, sub.id, _settings())
-    inter.response.send_message.assert_awaited_once()
-    view = inter.response.send_message.await_args.kwargs["view"]
-    selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
+    outcome = await handle_alt_edit_button(session, _event(999, sub.id), _settings())
+    assert isinstance(outcome, Ack)
+    selects = list(outcome.components)
     assert len(selects) == 1
     assert {o.label for o in selects[0].options} == {"a.jpg", "b.mp4"}
 
@@ -235,9 +242,8 @@ def test_alt_overwritten_message_variants():
 
 
 async def test_alt_edit_button_submission_missing(session, board):
-    inter = _interaction(999)
-    await handle_alt_edit_button(session, inter, 999999, _settings())
-    assert "not found" in inter.response.send_message.await_args.args[0]
+    outcome = await handle_alt_edit_button(session, _event(999, 999999), _settings())
+    assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
 async def test_alt_edit_button_over_25_media_still_sends(session, board):
@@ -246,10 +252,8 @@ async def test_alt_edit_button_over_25_media_still_sends(session, board):
     await session.flush()
     for i in range(26):
         await _img(session, sub, filename=f"{i}.jpg")
-    inter = _interaction(999)
-    await handle_alt_edit_button(session, inter, sub.id, _settings())
-    view = inter.response.send_message.await_args.kwargs["view"]
-    select = next(c for c in view.children if isinstance(c, discord.ui.Select))
+    outcome = await handle_alt_edit_button(session, _event(999, sub.id), _settings())
+    (select,) = outcome.components
     assert len(select.options) == 25  # capped at Discord's limit
 
 
@@ -257,9 +261,8 @@ async def test_alt_edit_button_no_media(session, board):
     sub = make_submission(board, author_id=999)
     session.add(sub)
     await session.flush()
-    inter = _interaction(999)
-    await handle_alt_edit_button(session, inter, sub.id, _settings())
-    assert "no images" in inter.response.send_message.await_args.args[0]
+    outcome = await handle_alt_edit_button(session, _event(999, sub.id), _settings())
+    assert isinstance(outcome, Ack) and "no images" in outcome.message
 
 
 async def test_alt_edit_button_unauthorized(session, board):
@@ -267,9 +270,8 @@ async def test_alt_edit_button_unauthorized(session, board):
     session.add(sub)
     await session.flush()
     await _img(session, sub)
-    inter = _interaction(555)
-    await handle_alt_edit_button(session, inter, sub.id, _settings())
-    assert "not authorised" in inter.response.send_message.await_args.args[0]
+    outcome = await handle_alt_edit_button(session, _event(555, sub.id), _settings())
+    assert isinstance(outcome, Ack) and "not authorised" in outcome.message
 
 
 async def test_alt_pick_opens_modal(session, board):
@@ -277,20 +279,17 @@ async def test_alt_pick_opens_modal(session, board):
     session.add(sub)
     await session.flush()
     att = await _img(session, sub, filename="a.jpg", body="cur")
-    inter = _interaction(999, values=[str(att.id)])
-    await handle_alt_pick(session, inter, sub.id, _settings())
-    inter.response.send_modal.assert_awaited_once()
-    modal = inter.response.send_modal.await_args.args[0]
-    assert modal.custom_id == f"edit_alt:{att.id}"
+    outcome = await handle_alt_pick(session, _event(999, sub.id, values=(str(att.id),)), _settings())
+    assert isinstance(outcome, OpenModal)
+    assert outcome.spec.action_id == f"edit_alt:{att.id}"
 
 
 async def test_alt_pick_no_values_noop(session, board):
     sub = make_submission(board, author_id=999)
     session.add(sub)
     await session.flush()
-    inter = _interaction(999, values=[])
-    await handle_alt_pick(session, inter, sub.id, _settings())
-    inter.response.send_modal.assert_not_awaited()
+    outcome = await handle_alt_pick(session, _event(999, sub.id, values=()), _settings())
+    assert isinstance(outcome, Noop)
 
 
 async def test_alt_pick_foreign_attachment_rejected(session, board):
@@ -299,10 +298,8 @@ async def test_alt_pick_foreign_attachment_rejected(session, board):
     session.add_all([sub, other])
     await session.flush()
     foreign = await _img(session, other, filename="x.jpg")
-    inter = _interaction(999, values=[str(foreign.id)])
-    await handle_alt_pick(session, inter, sub.id, _settings())
-    inter.response.send_modal.assert_not_awaited()
-    assert "not found" in inter.response.send_message.await_args.args[0]
+    outcome = await handle_alt_pick(session, _event(999, sub.id, values=(str(foreign.id),)), _settings())
+    assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
 async def test_alt_pick_unauthorized(session, board):
@@ -310,10 +307,8 @@ async def test_alt_pick_unauthorized(session, board):
     session.add(sub)
     await session.flush()
     att = await _img(session, sub)
-    inter = _interaction(555, values=[str(att.id)])
-    await handle_alt_pick(session, inter, sub.id, _settings())
-    inter.response.send_modal.assert_not_awaited()
-    assert "not authorised" in inter.response.send_message.await_args.args[0]
+    outcome = await handle_alt_pick(session, _event(555, sub.id, values=(str(att.id),)), _settings())
+    assert isinstance(outcome, Ack) and "not authorised" in outcome.message
 
 
 async def test_alt_edit_modal_on_submit_applies(session, board):

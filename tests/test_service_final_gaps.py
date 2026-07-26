@@ -70,7 +70,13 @@ from bot.publish import PublishResult
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
+from bot.ingest.events import InteractionEvent
+from bot.ingest.outcomes import Ack, Noop, Tombstone
 from conftest import MockDest, make_interaction, make_submission
+
+
+def _event(user_id: int, submission_id: int):
+    return InteractionEvent(user_id=user_id, submission_id=submission_id, member=None)
 
 QUEUED = SubmissionState.QUEUED.value
 PUBLISHED = SubmissionState.PUBLISHED.value
@@ -591,41 +597,34 @@ async def test_playlist_opt_out_naive_queued_at_schedules_archive(session, board
 # ---------------------------------------------------------------------------
 
 
-async def test_cancel_button_tombstone_failure_and_cached_source_channel(session, board, tmp_path):
+async def test_cancel_button_deletes_and_clears_trigger(session, board, tmp_path):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
-    interaction = make_interaction(custom_id=f"cancel:{sub.id}")
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock(side_effect=_forbidden())
-    source_channel = MagicMock()
-    source_channel.fetch_message = AsyncMock(return_value=MagicMock(clear_reaction=AsyncMock()))
-    interaction.client = MagicMock()
-    interaction.client.get_channel = MagicMock(return_value=source_channel)
 
-    await handle_cancel_button(session, interaction, sub.id, _svc_settings(board, tmp_dir=str(tmp_path)))
+    dest = MockDest()
+    outcome = await handle_cancel_button(
+        session, _event(999, sub.id), dest, _svc_settings(board, tmp_dir=str(tmp_path))
+    )
 
     gone = await session.scalar(select(Submission).where(Submission.id == sub.id))
     assert gone is None
-    # channel is not a Thread: no thread notice; cached source channel is used directly
-    source_channel.fetch_message.assert_awaited_once()
+    assert isinstance(outcome, Tombstone)
+    assert dest.cleared_triggers  # trigger reaction cleared on the source (via the Surface)
 
 
-async def test_confirm_button_skipped_playlist_edit_failure_no_channel(session, board):
+async def test_confirm_button_skipped_playlist_queues(session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, source_waived=True)
     sub.playlist_skipped = True
     session.add(sub)
     await session.flush()
     session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=908))
     await session.flush()
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock(side_effect=_forbidden())
-    interaction.channel = None
 
-    await handle_confirm_button(session, interaction, sub.id, _svc_settings(board))
+    outcome = await handle_confirm_button(session, _event(999, sub.id), MockDest(), _svc_settings(board))
 
     assert sub.state == QUEUED
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_confirm_button_playlist_pending_blocks_archive(session, board):
@@ -634,35 +633,29 @@ async def test_confirm_button_playlist_pending_blocks_archive(session, board):
     await session.flush()
     session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=909))
     await session.flush()
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock()
-    interaction.channel = MagicMock(spec=discord.Thread)
+    dest = MockDest()
     settings = _svc_settings(board, youtube_playlist_id="PL1")
 
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as mock_delay:
-        await handle_confirm_button(session, interaction, sub.id, settings)
+    await handle_confirm_button(session, _event(999, sub.id), dest, settings)
 
     assert sub.state == QUEUED
-    mock_delay.assert_not_called()  # playlist auto-add hasn't recorded a row yet
+    assert not dest.archived  # playlist auto-add hasn't recorded a row yet -> not close-ready
 
 
-async def test_metadata_confirm_button_tombstone_failure(session, board):
+async def test_metadata_confirm_button_posts_notice(session, board):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
     session.add(MetadataRequest(submission_id=sub.id, bot_message_id=910))
     await session.flush()
     req = await session.scalar(select(MetadataRequest).where(MetadataRequest.submission_id == sub.id))
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock(side_effect=_forbidden())
-    interaction.channel = MockDest()
 
-    await handle_metadata_confirm_button(session, interaction, sub.id, _svc_settings(board))
+    dest = MockDest()
+    outcome = await handle_metadata_confirm_button(session, _event(999, sub.id), dest, _svc_settings(board))
 
     assert req.answer == "confirmed"
-    assert replies.metadata_confirmed() in interaction.channel.sent
+    assert replies.metadata_confirmed() in dest.sent
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_playlist_skip_button_edit_failure_no_channel(session, board):

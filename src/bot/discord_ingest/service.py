@@ -68,6 +68,8 @@ from ..state import (
 from ..notifier import NullNotifier, Notifier, Surface
 from ..ingest.types import InboundAttachment, InboundMessage
 from . import prompts, render, replies
+from ..ingest.events import InteractionEvent
+from ..ingest.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
 from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
 from .discord_notifier import DiscordSurface
 from .urls import extract_urls, is_discord_internal_url
@@ -1257,22 +1259,18 @@ async def handle_playlist_opt_out(
 
 async def handle_cancel_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
-) -> None:
+) -> HandlerOutcome:
     """Cancel button clicked: delete the submission if authorized."""
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        await interaction.followup.send("Submission not found.", ephemeral=True)
-        return
+        return Ack("Submission not found.")
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to cancel this submission.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to cancel this submission.")
 
     if submission.state == SubmissionState.PUBLISHED.value:
         attempt = await session.scalar(
@@ -1281,67 +1279,46 @@ async def handle_cancel_button(
             .order_by(PublishAttempt.attempted_at.desc())
         )
         bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
-        await interaction.followup.send(replies.cannot_remove_published(bsky_url), ephemeral=True)
-        return
+        return Ack(replies.cannot_remove_published(bsky_url))
 
     sub_id = submission.id
     source_channel_id = submission.channel_id
     source_message_id = submission.source_discord_message_id
-    thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
     await _delete_submission_cascade(session, sub_id)
-    log.info("deleted submission %s after button cancel by user %s", sub_id, user.id)
+    log.info("deleted submission %s after button cancel by user %s", sub_id, event.user_id)
 
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Submission cancelled")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone cancel button for submission %s: %s", sub_id, exc)
-
-    channel = interaction.channel
-    if isinstance(channel, discord.Thread):
-        await channel.send(replies.reaction_removed())
-        await _archive_thread(channel, notice=replies.closing_notice("submission cancelled"))
-
-    source_channel = interaction.client.get_channel(source_channel_id)
-    if source_channel is None:
-        try:
-            source_channel = await interaction.client.fetch_channel(source_channel_id)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-    if source_channel is not None:
-        await _clear_trigger_reaction(source_channel, source_message_id, settings.trigger_emoji)
+    await surface.send(replies.reaction_removed())
+    await surface.archive(notice=replies.closing_notice("submission cancelled"))
+    await surface.clear_trigger(source_channel_id, source_message_id, settings.trigger_emoji)
+    return Tombstone("Submission cancelled")
 
 
 async def handle_confirm_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Queue for posting button clicked: queue the submission if authorized."""
     req = await session.scalar(
         select(ConfirmationRequest).where(
-            ConfirmationRequest.submission_id == submission_id,
+            ConfirmationRequest.submission_id == event.submission_id,
             ConfirmationRequest.confirmed_at.is_(None),
         )
     )
     if req is None:
-        await interaction.followup.send("Already queued.", ephemeral=True)
-        return
+        return Ack("Already queued.")
 
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None or submission.state in _QUEUE_TERMINAL:
-        await interaction.followup.send("Nothing to queue.", ephemeral=True)
-        return
+        return Ack("Nothing to queue.")
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to queue this submission.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to queue this submission.")
 
     # Re-validate gaps at click time: a gap (e.g. alt text for a late-added image) may have
     # opened after this button was posted. Refuse and refresh rather than queue blindly.
@@ -1349,141 +1326,106 @@ async def handle_confirm_button(
     gaps = missing_gaps(snap)
     if gaps:
         log.info("refusing to queue submission %s via button: gaps reopened (%s)", submission.id, _gap_summary(gaps))
-        channel = interaction.channel
-        if channel is not None:
-            await recompute_and_request(
-                submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session
-            )
-        await interaction.followup.send(
-            f"Can't queue yet - still needs: {_gap_summary(gaps)}. See the checklist in this thread.",
-            ephemeral=True,
+        await recompute_and_request(
+            submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session
         )
-        return
+        return Ack(
+            f"Can't queue yet - still needs: {_gap_summary(gaps)}. See the checklist in this thread."
+        )
 
     req.confirmed_at = _now()
-    req.confirmed_by = user.id
+    req.confirmed_by = event.user_id
     submission.state = SubmissionState.QUEUED.value
-    log.info("submission %s queued by %s via button", submission.id, user.id)
+    log.info("submission %s queued by %s via button", submission.id, event.user_id)
 
     videos_added = 0
     if not submission.playlist_skipped:
         videos_added = await _auto_add_to_playlist(session, submission, links, board_cfg, yt_client)
 
-    # The Queue button lives on the status/confirmation message; disable it in place.
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Queued ✅")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone confirm button for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
     queue_url = (
         f"https://dashboard.exegesis.space/boards/{board_cfg.name}" if board_cfg else None
     )
-    await channel.send(replies.queued_notice(
+    await surface.send(replies.queued_notice(
         bluesky_handle=board_cfg.bluesky_handle if board_cfg else None,
         dashboard_url=queue_url,
         youtube_playlist_id=board_cfg.youtube_playlist_id if board_cfg else None,
         videos_added=videos_added,
     ))
-    if isinstance(channel, discord.Thread):
-        if await _playlist_close_ready(
-            session, submission.board_id,
-            submission.source_discord_message_id, board_cfg,
-            playlist_skipped=submission.playlist_skipped,
-        ):
-            _archive_thread_after_delay(channel, notice=replies.closing_notice("queued"))
+    if await _playlist_close_ready(
+        session, submission.board_id,
+        submission.source_discord_message_id, board_cfg,
+        playlist_skipped=submission.playlist_skipped,
+    ):
+        surface.archive_after_delay(notice=replies.closing_notice("queued"))
+    return Tombstone("Queued ✅")
 
 
 async def handle_metadata_confirm_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Use link as-is button clicked: confirm current link metadata."""
     req = await session.scalar(
         select(MetadataRequest).where(
-            MetadataRequest.submission_id == submission_id,
+            MetadataRequest.submission_id == event.submission_id,
             MetadataRequest.answered_at.is_(None),
         )
     )
     if req is None:
-        await interaction.followup.send("Already confirmed.", ephemeral=True)
-        return
+        return Ack("Already confirmed.")
 
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        return
+        return Noop()
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to confirm this.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to confirm this.")
 
     req.answer = "confirmed"
-    req.answered_by = user.id
+    req.answered_by = event.user_id
     req.answered_at = _now()
 
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Link confirmed 🔗")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone metadata confirm button for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
-    await channel.send(replies.metadata_confirmed())
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    await surface.send(replies.metadata_confirmed())
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
+    return Tombstone("Link confirmed 🔗")
 
 
 async def handle_graphic_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Mark as graphic content button clicked."""
     req = await session.scalar(
         select(ContentLabelRequest).where(
-            ContentLabelRequest.submission_id == submission_id,
+            ContentLabelRequest.submission_id == event.submission_id,
             ContentLabelRequest.answered_at.is_(None),
         )
     )
     if req is None:
-        await interaction.followup.send("Already classified.", ephemeral=True)
-        return
+        return Ack("Already classified.")
 
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        return
+        return Noop()
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to classify this.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to classify this.")
 
     submission.graphic_status = GraphicStatus.GRAPHIC.value
     req.answer = GRAPHIC_YES_EMOJI
-    req.answered_by = user.id
+    req.answered_by = event.user_id
     req.answered_at = _now()
 
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Marked as graphic 🩸")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone graphic button for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
+    return Tombstone("Marked as graphic 🩸")
 
 
 async def waive_source(
@@ -1568,27 +1510,23 @@ _SOURCE_NOTE_MAX = 300
 
 async def handle_source_note_confirm(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Confirm-button on the 'that's not a URL - use it as the source?' prompt.
 
     Commits the pending source_note so it counts as the source (OP or curator).
     """
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        return
+        return Noop()
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to mark this.")
     if not submission.source_note:
-        await interaction.followup.send("Nothing to confirm - reply with the source first.", ephemeral=True)
-        return
+        return Ack("Nothing to confirm - reply with the source first.")
 
     submission.source_note_confirmed = True
     # Close any open source request - the note satisfies it.
@@ -1600,51 +1538,34 @@ async def handle_source_note_confirm(
     )
     if req is not None:
         req.answer = "source_note"
-        req.answered_by = user.id
+        req.answered_by = event.user_id
         req.answered_at = _now()
 
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Source noted 📄")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
-    await channel.send(replies.source_note_confirmed(submission.source_note))
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    await surface.send(replies.source_note_confirmed(submission.source_note))
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
+    return Tombstone("Source noted 📄")
 
 
 async def handle_source_note_reject(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Cancel-button on the source-note prompt: discard the pending note and re-prompt."""
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        return
+        return Noop()
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to mark this.")
 
     submission.source_note = None
     submission.source_note_confirmed = False
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Discarded 🗑️")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone source-note buttons for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
-    await channel.send(replies.source_note_rejected())
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    await surface.send(replies.source_note_rejected())
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
+    return Tombstone("Discarded 🗑️")
 
 
 async def handle_playlist_skip_button(
@@ -1711,99 +1632,72 @@ async def handle_playlist_skip_button(
 
 async def handle_edit_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
     settings: Settings,
-) -> None:
-    """Edit button clicked: send a modal to update the post text."""
-    submission = await session.get(Submission, submission_id)
+) -> HandlerOutcome:
+    """Edit button clicked: open a modal to update the post text."""
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        await interaction.response.send_message("Submission not found.", ephemeral=True)
-        return
+        return Ack("Submission not found.")
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.response.send_message(
-            "You're not authorised to edit this submission.", ephemeral=True
-        )
-        return
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to edit this submission.")
 
     primary = await session.scalar(
         select(SubmissionLink)
-        .where(SubmissionLink.submission_id == submission_id, SubmissionLink.order_index == 0)
+        .where(SubmissionLink.submission_id == event.submission_id, SubmissionLink.order_index == 0)
     )
-    media = await _media_attachments(session, submission_id)
-    modal = render.render_modal(prompts.post_edit_modal(
-        submission_id=submission_id,
+    media = await _media_attachments(session, event.submission_id)
+    return OpenModal(prompts.post_edit_modal(
+        submission_id=event.submission_id,
         current_title=primary.resolved_title if primary else None,
         media=[(a.id, a.filename, a.alt_text_body) for a in media[:4]],
     ))
-    await interaction.response.send_modal(modal)
 
 
 async def handle_alt_edit_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
     settings: Settings,
     yt_client=None,
-) -> None:
-    """Edit-alt-text button: send an image picker (for posts with more media than the modal fits)."""
-    submission = await session.get(Submission, submission_id)
+) -> HandlerOutcome:
+    """Edit-alt-text button: show an image picker (for posts with more media than the modal fits)."""
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        await interaction.response.send_message("Submission not found.", ephemeral=True)
-        return
+        return Ack("Submission not found.")
     board_cfg = settings.board_for_channel(submission.channel_id)
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.response.send_message(
-            "You're not authorised to edit this submission.", ephemeral=True
-        )
-        return
-    media = await _media_attachments(session, submission_id)
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to edit this submission.")
+    media = await _media_attachments(session, event.submission_id)
     if not media:
-        await interaction.response.send_message("This post has no images to edit.", ephemeral=True)
-        return
+        return Ack("This post has no images to edit.")
     if len(media) > 25:
-        log.warning("submission %s has %d media; alt picker shows the first 25", submission_id, len(media))
-    await interaction.response.send_message(
+        log.warning("submission %s has %d media; alt picker shows the first 25", event.submission_id, len(media))
+    return Ack(
         "Pick an image to edit its alt text:",
-        view=render.render_components(prompts.alt_picker_components(submission_id, [(a.id, a.filename) for a in media])),
-        ephemeral=True,
+        components=prompts.alt_picker_components(event.submission_id, [(a.id, a.filename) for a in media]),
     )
 
 
 async def handle_alt_pick(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Image picked from the alt picker: open that attachment's alt-text modal."""
-    values = (interaction.data or {}).get("values") or []
-    if not values:
-        return
-    attachment_id = int(values[0])
-    submission = await session.get(Submission, submission_id)
+    if not event.values:
+        return Noop()
+    attachment_id = int(event.values[0])
+    submission = await session.get(Submission, event.submission_id)
     att = await session.get(Attachment, attachment_id)
     board_cfg = settings.board_for_channel(submission.channel_id) if submission else None
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    if submission is None or not _reaction_authorized(member, user.id, submission, board_cfg):
-        await interaction.response.send_message(
-            "You're not authorised to edit this submission.", ephemeral=True
-        )
-        return
-    if att is None or att.submission_id != submission_id:
-        await interaction.response.send_message("Image not found.", ephemeral=True)
-        return
-    await interaction.response.send_modal(
-        render.render_modal(prompts.alt_edit_modal(attachment_id, att.filename, att.alt_text_body))
-    )
+    if submission is None or not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return Ack("You're not authorised to edit this submission.")
+    if att is None or att.submission_id != event.submission_id:
+        return Ack("Image not found.")
+    return OpenModal(prompts.alt_edit_modal(attachment_id, att.filename, att.alt_text_body))
 
 
 async def _media_attachments(session: AsyncSession, submission_id: int) -> list[Attachment]:
