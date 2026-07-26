@@ -83,7 +83,7 @@ def test_checklist_alt_text_states():
     needed = replies.status_checklist(
         _snap(image_alt_statuses=[AltTextStatus.NEEDED, AltTextStatus.PROVIDED]), ready=False
     )
-    assert "⛔ alt text - needed for 1 of 2 image(s)" in needed
+    assert "⛔ alt text - needed for 1 of 2 file(s)" in needed
 
     skipped = replies.status_checklist(
         _snap(image_alt_statuses=[AltTextStatus.SKIPPED, AltTextStatus.PROVIDED]), ready=True

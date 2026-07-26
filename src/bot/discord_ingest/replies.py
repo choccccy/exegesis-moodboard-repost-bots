@@ -108,7 +108,7 @@ def status_checklist(
         needed = sum(1 for s in statuses if s == AltTextStatus.NEEDED)
         skipped = sum(1 for s in statuses if s == AltTextStatus.SKIPPED)
         if needed:
-            lines.append(f"⛔ alt text - needed for {needed} of {len(statuses)} image(s)")
+            lines.append(f"⛔ alt text - needed for {needed} of {len(statuses)} file(s)")
         else:
             lines.append(f"✅ alt text ({skipped} skipped)" if skipped else "✅ alt text")
 

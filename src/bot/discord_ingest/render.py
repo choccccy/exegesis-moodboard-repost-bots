@@ -116,7 +116,13 @@ def render_modal(spec: ModalSpec) -> discord.ui.Modal:
 
 
 def render_preview(preview: PreviewImage) -> discord.File:
-    """Build a discord.File image preview (resizing to fit Discord's limit)."""
+    """Build a discord.File media preview (resizing images to fit Discord's limit).
+
+    Videos are uploaded as-is (the caller is responsible for keeping them under
+    Discord's upload cap); only images go through the in-memory resize helper.
+    """
+    if preview.is_video:
+        return discord.File(preview.local_path, filename=preview.filename)
     # Lazy import: the image-processing helper lives in service.py; importing it at
     # module load would create a render <-> service cycle.
     from .service import _discord_file_for_attachment

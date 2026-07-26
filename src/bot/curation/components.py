@@ -69,6 +69,11 @@ class ModalSpec:
 
 @dataclass(frozen=True)
 class PreviewImage:
-    """A local image to attach to a message (Discord: a discord.File)."""
+    """A local media file to attach to a message (Discord: a discord.File).
+
+    `is_video` skips the image-only processing (resize/re-encode) and uploads the
+    file as-is, so a caller can attach a short video preview the same way.
+    """
     local_path: str
     filename: str
+    is_video: bool = False

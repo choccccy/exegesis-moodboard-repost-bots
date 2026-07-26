@@ -2558,6 +2558,31 @@ def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File
         return discord.File(buf, filename=filename)
 
 
+def _alt_preview_for(att) -> PreviewImage | None:
+    """Media preview for an alt-text prompt, or None to fall back to a URL.
+
+    We upload the file we already downloaded so the reader sees exactly what
+    they're captioning, instead of dumping the raw source URL (for resolved
+    videos that URL is a long, signed, expiring CDN link - see issue #53).
+    Images always upload (the helper resizes them under Discord's cap); videos
+    only upload when they already fit it - a resolved video can be up to
+    `_MAX_RESOLVED_VIDEO_BYTES` (Bluesky-sized), far over Discord's limit, so an
+    oversized one falls back to the unfurled URL.
+    """
+    if not att.local_path:
+        return None
+    if att.is_image:
+        return PreviewImage(local_path=att.local_path, filename=att.filename)
+    if att.is_video:
+        try:
+            fits = os.path.getsize(att.local_path) <= _DISCORD_MAX_BYTES
+        except OSError:
+            return None
+        if fits:
+            return PreviewImage(local_path=att.local_path, filename=att.filename, is_video=True)
+    return None
+
+
 _QUEUE_TERMINAL = frozenset({
     SubmissionState.QUEUED.value,
     SubmissionState.PUBLISHED.value,
@@ -2936,14 +2961,14 @@ async def recompute_and_request(
 
         for att in needed_alt_atts:
             try:
-                if att.local_path and att.is_image:
+                preview = _alt_preview_for(att)
+                if preview is not None:
                     try:
                         msg = await destination.send(
-                            replies.alt_text_request(att.filename),
-                            preview=PreviewImage(local_path=att.local_path, filename=att.filename),
+                            replies.alt_text_request(att.filename), preview=preview,
                         )
                     except Exception as exc:
-                        log.warning("could not send image preview for alt text request (submission %s, att %s): %s", submission_id, att.id, exc)
+                        log.warning("could not send media preview for alt text request (submission %s, att %s): %s", submission_id, att.id, exc)
                         msg = await destination.send(
                             replies.alt_text_request(att.filename) + f"\n{att.discord_url}"
                         )

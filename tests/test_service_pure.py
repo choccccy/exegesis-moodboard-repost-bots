@@ -15,6 +15,8 @@ import discord
 from PIL import Image
 
 from bot.discord_ingest.service import (
+    _DISCORD_MAX_BYTES,
+    _alt_preview_for,
     _discord_file_for_animated_gif,
     _discord_file_for_attachment,
     _image_status,
@@ -263,3 +265,40 @@ def test_image_status_no_image_at_all_fails():
     ok, source = _image_status("external", [], [_link(resolved_image_path=None)])
     assert not ok
     assert "no image" in source
+
+
+# --- _alt_preview_for: which alt-text prompts get an uploaded preview ---------
+
+def _media_att(*, is_image=False, is_video=False, local_path="/data/x", filename="x"):
+    att = _att(is_image=is_image, is_video=is_video)
+    att.local_path = local_path
+    att.filename = filename
+    return att
+
+
+def test_alt_preview_none_without_local_path():
+    assert _alt_preview_for(_media_att(is_image=True, local_path=None)) is None
+
+
+def test_alt_preview_image_uploads():
+    p = _alt_preview_for(_media_att(is_image=True, local_path="/data/i.png", filename="i.png"))
+    assert p is not None and not p.is_video and p.local_path == "/data/i.png"
+
+
+def test_alt_preview_small_video_uploads():
+    att = _media_att(is_video=True, local_path="/data/v.mp4", filename="v.mp4")
+    with patch("bot.discord_ingest.service.os.path.getsize", return_value=_DISCORD_MAX_BYTES):
+        p = _alt_preview_for(att)
+    assert p is not None and p.is_video and p.filename == "v.mp4"
+
+
+def test_alt_preview_oversized_video_falls_back_to_url():
+    att = _media_att(is_video=True, local_path="/data/big.mp4")
+    with patch("bot.discord_ingest.service.os.path.getsize", return_value=_DISCORD_MAX_BYTES + 1):
+        assert _alt_preview_for(att) is None
+
+
+def test_alt_preview_unstatable_video_falls_back_to_url():
+    att = _media_att(is_video=True, local_path="/data/gone.mp4")
+    with patch("bot.discord_ingest.service.os.path.getsize", side_effect=OSError):
+        assert _alt_preview_for(att) is None

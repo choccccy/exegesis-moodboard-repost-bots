@@ -85,3 +85,14 @@ def test_render_preview_delegates_to_file_builder():
         out = render_preview(PreviewImage(local_path="/x.png", filename="x.png"))
     f.assert_called_once_with("/x.png", "x.png")
     assert out is sentinel
+
+
+def test_render_preview_video_uploads_as_is():
+    # Videos bypass the image resize helper and upload the file verbatim.
+    sentinel = MagicMock()
+    with patch("bot.discord_ingest.service._discord_file_for_attachment") as f, \
+         patch("bot.discord_ingest.render.discord.File", return_value=sentinel) as file_ctor:
+        out = render_preview(PreviewImage(local_path="/v.mp4", filename="v.mp4", is_video=True))
+    f.assert_not_called()
+    file_ctor.assert_called_once_with("/v.mp4", filename="v.mp4")
+    assert out is sentinel
