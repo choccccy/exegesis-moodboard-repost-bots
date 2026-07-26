@@ -11,7 +11,7 @@ from collections.abc import Sequence
 
 import discord
 
-from ..components import Button, ButtonStyle, Component, ModalSpec, PreviewImage, Select
+from ..curation.components import Button, ButtonStyle, Component, ModalSpec, PreviewImage, Select
 
 _STYLE = {
     ButtonStyle.PRIMARY: discord.ButtonStyle.primary,

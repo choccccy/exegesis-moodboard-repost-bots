@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import discord
 
-from ..ingest.types import (
+from ..curation.types import (
     InboundAttachment,
     InboundEmbed,
     InboundMessage,

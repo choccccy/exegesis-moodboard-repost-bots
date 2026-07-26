@@ -2,8 +2,9 @@
 
 `Surface` is the outbound port: a destination (a thread/channel) the curation core
 posts to and manages, in surface-agnostic terms (component descriptors from
-`bot.components`, not `discord.ui.View`). Concrete implementations live in
-platform-specific packages (`discord_ingest.discord_notifier.DiscordSurface`, ...).
+`bot.curation.components`, not `discord.ui.View`). Concrete implementations live in
+platform-specific packages (`discord_ingest.discord_notifier.DiscordSurface`,
+`matrix_ingest.surface.MatrixSurface`, ...).
 
 `Notifier` is retained as an alias of `Surface` for the pre-existing
 `destination: Notifier` call sites during the surface-agnostic migration (issue #50).
@@ -12,7 +13,7 @@ platform-specific packages (`discord_ingest.discord_notifier.DiscordSurface`, ..
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from .components import Component, PreviewImage
 
@@ -21,6 +22,7 @@ class SentMessage(Protocol):
     id: int
 
 
+@runtime_checkable
 class Surface(Protocol):
     """A destination (thread/channel) that receives messages and can be managed.
 

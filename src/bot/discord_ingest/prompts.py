@@ -1,6 +1,6 @@
 """Surface-agnostic component descriptors for the curation prompts.
 
-Plain `bot.components` descriptors (buttons/selects/modals); **no `discord` import** -
+Plain `bot.curation.components` descriptors (buttons/selects/modals); **no `discord` import** -
 a per-surface adapter (`render.py`) renders them. Each `action_id` is copied verbatim
 into a Discord `custom_id`, so `on_interaction` prefix-routing and every persisted
 button keep working. The scheme (these prefixes must stay stable - old buttons carry
@@ -24,7 +24,7 @@ commands, not buttons.)
 
 from __future__ import annotations
 
-from ..components import (
+from ..curation.components import (
     Button,
     ButtonStyle,
     Component,

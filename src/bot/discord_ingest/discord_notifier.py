@@ -7,8 +7,8 @@ from collections.abc import Sequence
 
 import discord
 
-from ..components import Button, ButtonStyle, Component, PreviewImage
-from ..notifier import SentMessage
+from ..curation.components import Button, ButtonStyle, Component, PreviewImage
+from ..curation.surface import SentMessage
 from .render import render_components, render_preview
 
 log = logging.getLogger(__name__)

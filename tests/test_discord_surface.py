@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
-from bot.components import Button, PreviewImage
+from bot.curation.components import Button, PreviewImage
 from bot.discord_ingest.discord_notifier import DiscordNotifier, DiscordSurface
-from bot.notifier import NullSurface
+from bot.curation.surface import NullSurface
 
 pytestmark = pytest.mark.asyncio
 

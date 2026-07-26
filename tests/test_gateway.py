@@ -9,9 +9,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from bot.components import Button, ModalSpec, TextField
+from bot.curation.components import Button, ModalSpec, TextField
 from bot.discord_ingest.gateway import perform, to_event
-from bot.ingest.outcomes import Ack, Noop, OpenModal, Tombstone
+from bot.curation.outcomes import Ack, Noop, OpenModal, Tombstone
 
 
 def _interaction(*, is_done=False):

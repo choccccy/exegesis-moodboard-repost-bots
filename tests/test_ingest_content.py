@@ -19,7 +19,7 @@ from bot.discord_ingest.service import (
     _download_attachment_file,
     _persist_ingest_skeletons,
 )
-from bot.ingest.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
+from bot.curation.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Attachment, SubmissionLink
 from bot.state import SubmissionState
 

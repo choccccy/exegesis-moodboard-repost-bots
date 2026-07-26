@@ -43,7 +43,7 @@ from bot.models import (
 from bot.scheduler import _fire_board
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
-from bot.ingest.events import InteractionEvent
+from bot.curation.events import InteractionEvent
 from conftest import MockDest, make_submission
 
 

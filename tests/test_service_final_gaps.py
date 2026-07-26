@@ -54,7 +54,7 @@ from bot.discord_ingest.service import (
     publish_queued_submission,
     recompute_and_request,
 )
-from bot.ingest.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
+from bot.curation.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import (
     Attachment,
     AttachmentAltTextRequest,
@@ -70,8 +70,8 @@ from bot.publish import PublishResult
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
-from bot.ingest.events import InteractionEvent
-from bot.ingest.outcomes import Ack, Noop, Tombstone
+from bot.curation.events import InteractionEvent
+from bot.curation.outcomes import Ack, Noop, Tombstone
 from conftest import MockDest, make_interaction, make_submission
 
 

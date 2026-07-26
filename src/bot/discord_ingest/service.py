@@ -65,15 +65,15 @@ from ..state import (
     evaluate_state,
     missing_gaps,
 )
-from ..notifier import NullNotifier, Notifier, Surface
-from ..ingest.types import InboundAttachment, InboundMessage
+from ..curation.surface import NullNotifier, Notifier, Surface
+from ..curation.types import InboundAttachment, InboundMessage
 from . import prompts, render, replies
-from ..ingest.events import InteractionEvent
-from ..ingest.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
+from ..curation.events import InteractionEvent
+from ..curation.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
 from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
 from .discord_notifier import DiscordSurface
 from .urls import extract_urls, is_discord_internal_url
-from ..components import PreviewImage
+from ..curation.components import PreviewImage
 from ..db import session_scope
 
 log = logging.getLogger(__name__)

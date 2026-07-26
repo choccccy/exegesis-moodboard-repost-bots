@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from bot.components import Button, ButtonStyle, ModalSpec, PreviewImage, Select, SelectOption, TextField
+from bot.curation.components import Button, ButtonStyle, ModalSpec, PreviewImage, Select, SelectOption, TextField
 from bot.discord_ingest.render import (
     _dispatch_modal_submit,
     render_components,

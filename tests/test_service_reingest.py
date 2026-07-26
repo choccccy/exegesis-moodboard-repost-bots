@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import select
 
 from bot.discord_ingest import service
-from bot.ingest.types import InboundAttachment, InboundMessage
+from bot.curation.types import InboundAttachment, InboundMessage
 from bot.models import Attachment, SubmissionLink
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, GraphicStatus, SubmissionState

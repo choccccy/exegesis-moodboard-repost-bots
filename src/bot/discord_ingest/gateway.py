@@ -12,8 +12,8 @@ import logging
 
 import discord
 
-from ..ingest.events import InteractionEvent
-from ..ingest.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
+from ..curation.events import InteractionEvent
+from ..curation.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
 from . import prompts
 from .discord_notifier import DiscordSurface
 from .render import render_components, render_modal

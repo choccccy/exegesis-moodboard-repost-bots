@@ -16,7 +16,7 @@ from bot.discord_ingest.adapters import (
     discord_embed_to_inbound,
     discord_message_to_inbound,
 )
-from bot.ingest.types import InboundAttachment, InboundEmbed, InboundMessage
+from bot.curation.types import InboundAttachment, InboundEmbed, InboundMessage
 
 
 # ---------------------------------------------------------------------------

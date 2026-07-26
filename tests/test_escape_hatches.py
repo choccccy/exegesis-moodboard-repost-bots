@@ -22,7 +22,7 @@ from bot.discord_ingest.service import (
     waive_source,
     render_submission_status,
 )
-from bot.ingest.outcomes import Ack, Noop, Tombstone
+from bot.curation.outcomes import Ack, Noop, Tombstone
 from bot.models import Attachment, AttachmentAltTextRequest, SourceRequest, SubmissionLink
 from bot.state import AltTextStatus, SubmissionState
 
@@ -47,7 +47,7 @@ def _settings(curator_ids=None):
 
 
 def _event(user_id: int, submission_id: int):
-    from bot.ingest.events import InteractionEvent
+    from bot.curation.events import InteractionEvent
     return InteractionEvent(user_id=user_id, submission_id=submission_id, member=None)
 
 

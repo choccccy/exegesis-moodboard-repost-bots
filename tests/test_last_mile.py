@@ -21,7 +21,7 @@ from bot.discord_ingest.service import handle_playlist_opt_out, handle_playlist_
 from bot.models import PublishAttempt, Submission, SubmissionLink
 from bot.state import SubmissionState
 
-from bot.ingest.events import InteractionEvent
+from bot.curation.events import InteractionEvent
 from conftest import MockDest, make_submission
 
 

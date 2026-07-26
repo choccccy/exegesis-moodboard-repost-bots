@@ -32,7 +32,7 @@ from bot.models import (
     SubmissionLink,
     YoutubePlaylistAdd,
 )
-from bot.ingest.outcomes import Ack, Noop, OpenModal, Tombstone
+from bot.curation.outcomes import Ack, Noop, OpenModal, Tombstone
 from bot.state import AltTextStatus, GraphicStatus, SubmissionState
 
 from conftest import MockDest, make_submission
@@ -68,7 +68,7 @@ def _settings(**kw) -> MagicMock:
 
 def _event(user_id: int = CURATOR_ID, submission_id: int = 0, *, values=()):
     """A normalized button/select event (member=None; curator authz here is by id)."""
-    from bot.ingest.events import InteractionEvent
+    from bot.curation.events import InteractionEvent
     return InteractionEvent(
         user_id=user_id, submission_id=submission_id, member=None, values=tuple(values)
     )

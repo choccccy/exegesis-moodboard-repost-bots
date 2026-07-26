@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ..components import Component, ModalSpec
+from .components import Component, ModalSpec
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,7 @@ from bot.discord_ingest.service import (
     _is_curator,
     _post_thread_anchor,
 )
-from bot.ingest.types import InboundEmbed, InboundMessage, InboundSnapshot
+from bot.curation.types import InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Submission, SubmissionLink
 from bot.state import SubmissionState, GraphicStatus
 

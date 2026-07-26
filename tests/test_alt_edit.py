@@ -20,8 +20,8 @@ from bot.discord_ingest.service import (
     handle_alt_pick,
     handle_edit_button,
 )
-from bot.ingest.events import InteractionEvent
-from bot.ingest.outcomes import Ack, Noop, OpenModal
+from bot.curation.events import InteractionEvent
+from bot.curation.outcomes import Ack, Noop, OpenModal
 from bot.models import Attachment, SubmissionLink
 from bot.state import AltTextStatus, SubmissionState
 
