@@ -21,7 +21,8 @@ from bot.discord_ingest.service import handle_playlist_opt_out, handle_playlist_
 from bot.models import PublishAttempt, Submission, SubmissionLink
 from bot.state import SubmissionState
 
-from conftest import make_submission
+from bot.ingest.events import InteractionEvent
+from conftest import MockDest, make_submission
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +208,10 @@ async def test_playlist_opt_out_reschedule_normalizes_naive_updated_at(session, 
 
 async def test_playlist_skip_button_reschedule_normalizes_naive_updated_at(session, board):
     sub = await _queued_with_naive_updated_at(session, board, msg_id=22)
-    interaction = MagicMock(spec=discord.Interaction)
-    interaction.user = MagicMock()
-    interaction.user.id = sub.author_id
-    interaction.channel = MagicMock()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock()
-    interaction.followup = MagicMock()
-    interaction.followup.send = AsyncMock()
+    dest = MockDest()
+    event = InteractionEvent(user_id=sub.author_id, submission_id=sub.id, member=None)
 
-    with patch("bot.discord_ingest.service._resolve_thread_by_id",
-               new=AsyncMock(return_value=_open_thread())), \
-         patch("bot.discord_ingest.service._fire_and_forget") as mock_fire:
-        await handle_playlist_skip_button(session, interaction, sub.id, MagicMock(), yt_client=None)
+    await handle_playlist_skip_button(session, event, dest, MagicMock(), yt_client=None)
 
-    mock_fire.assert_called_once()
+    # A naive updated_at must not crash the reschedule; the archive is re-armed.
+    assert len(dest.archive_delays) == 1

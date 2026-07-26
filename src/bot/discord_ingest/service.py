@@ -1570,41 +1570,27 @@ async def handle_source_note_reject(
 
 async def handle_playlist_skip_button(
     session: AsyncSession,
-    interaction: discord.Interaction,
-    submission_id: int,
+    event: InteractionEvent,
+    surface: Surface,
     settings: Settings,
     yt_client=None,
-) -> None:
+) -> HandlerOutcome:
     """Skip playlist button clicked: opt out and remove if already added."""
-    submission = await session.get(Submission, submission_id)
+    submission = await session.get(Submission, event.submission_id)
     if submission is None:
-        await interaction.followup.send("Submission not found.", ephemeral=True)
-        return
+        return Ack("Submission not found.")
 
     if submission.playlist_skipped:
-        await interaction.followup.send("Already opted out.", ephemeral=True)
-        return
+        return Ack("Already opted out.")
 
     board = await session.get(Board, submission.board_id)
     board_cfg = settings.board_for_channel(board.discord_channel_id) if board else None
-    user = interaction.user
-    member = user if isinstance(user, discord.Member) else None
-    is_op = user.id == submission.author_id
-    if not (is_op or _is_curator(member, user.id, board_cfg)):
-        await interaction.followup.send("You're not authorised to skip the playlist.", ephemeral=True)
-        return
+    is_op = event.user_id == submission.author_id
+    if not (is_op or _is_curator(event.member, event.user_id, board_cfg)):
+        return Ack("You're not authorised to skip the playlist.")
 
     submission.playlist_skipped = True
-    log.info("submission %s playlist opted out via button by user %s", submission.id, user.id)
-
-    try:
-        await interaction.message.edit(view=render.render_components(prompts.disabled_components("Playlist skipped ⏹️")))
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.debug("could not tombstone playlist skip button for submission %s: %s", submission_id, exc)
-
-    channel = interaction.channel
-    if channel is None:
-        return
+    log.info("submission %s playlist opted out via button by user %s", submission.id, event.user_id)
 
     playlist_rows = list(await session.scalars(
         select(YoutubePlaylistAdd).where(
@@ -1614,20 +1600,23 @@ async def handle_playlist_skip_button(
         )
     ))
     for row in playlist_rows:
-        await _do_playlist_remove(row, channel, session, yt_client)
+        await _do_playlist_remove(row, surface, session, yt_client)
 
+    # If it was already queued, the thread is on a close timer; opting out shouldn't
+    # reset it. Re-arm the archive for the time that was left (0 = close now). The
+    # surface is the submission's thread, so no separate thread lookup is needed.
     if submission.state == SubmissionState.QUEUED.value and submission.thread_id:
-        resolved_thread = await _resolve_thread_by_id(channel, submission.thread_id)
-        if resolved_thread is not None and not resolved_thread.archived:
-            queued_at = submission.updated_at
-            if queued_at is not None and queued_at.tzinfo is None:
-                queued_at = queued_at.replace(tzinfo=timezone.utc)
-            elapsed = (
-                (datetime.now(timezone.utc) - queued_at).total_seconds()
-                if queued_at else _THREAD_CLOSE_DELAY
-            )
-            remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
-            _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
+        queued_at = submission.updated_at
+        if queued_at is not None and queued_at.tzinfo is None:
+            queued_at = queued_at.replace(tzinfo=timezone.utc)
+        elapsed = (
+            (datetime.now(timezone.utc) - queued_at).total_seconds()
+            if queued_at else _THREAD_CLOSE_DELAY
+        )
+        remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
+        surface.archive_after_delay(delay=remaining)
+
+    return Tombstone("Playlist skipped ⏹️")
 
 
 async def handle_edit_button(

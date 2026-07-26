@@ -658,60 +658,30 @@ async def test_metadata_confirm_button_posts_notice(session, board):
     assert isinstance(outcome, Tombstone)
 
 
-async def test_playlist_skip_button_edit_failure_no_channel(session, board):
+async def test_playlist_skip_button_sets_flag(session, board):
     sub = make_submission(board)
     session.add(sub)
     await session.flush()
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock(side_effect=_forbidden())
-    interaction.channel = None
 
-    await handle_playlist_skip_button(session, interaction, sub.id, _svc_settings(board))
+    outcome = await handle_playlist_skip_button(session, _event(999, sub.id), MockDest(), _svc_settings(board))
 
     assert sub.playlist_skipped is True
-
-
-async def test_playlist_skip_button_archived_thread_not_rescheduled(session, board):
-    sub = make_submission(board, state=QUEUED)
-    sub.thread_id = 700
-    session.add(sub)
-    await session.flush()
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock()
-    interaction.channel = MagicMock()
-    interaction.channel.guild.get_thread.return_value = MagicMock(archived=True)
-    scheduled = []
-
-    with patch("bot.discord_ingest.service._fire_and_forget", scheduled.append):
-        await handle_playlist_skip_button(session, interaction, sub.id, _svc_settings(board))
-
-    assert sub.playlist_skipped is True
-    assert scheduled == []
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_playlist_skip_button_naive_queued_at_schedules_archive(session, board):
     sub = make_submission(board, state=QUEUED)
     sub.thread_id = 701
-    sub.updated_at = datetime(2020, 1, 1)  # naive datetime path
+    sub.updated_at = datetime(2020, 1, 1)  # naive datetime path: normalized to aware, long past
     session.add(sub)
     await session.flush()
-    interaction = make_interaction()
-    interaction.message = MagicMock()
-    interaction.message.edit = AsyncMock()
-    interaction.channel = MagicMock()
-    interaction.channel.guild.get_thread.return_value = MagicMock(archived=False)
-    scheduled = []
 
-    def fake_fire_and_forget(coro):
-        scheduled.append(coro)
-        coro.close()
+    dest = MockDest()
+    await handle_playlist_skip_button(session, _event(999, sub.id), dest, _svc_settings(board))
 
-    with patch("bot.discord_ingest.service._fire_and_forget", fake_fire_and_forget):
-        await handle_playlist_skip_button(session, interaction, sub.id, _svc_settings(board))
-
-    assert len(scheduled) == 1
+    # The naive updated_at must be normalized (not crash) and the archive re-armed.
+    assert len(dest.archive_delays) == 1
+    assert isinstance(dest.archive_delays[0], float)
 
 
 # ---------------------------------------------------------------------------

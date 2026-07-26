@@ -144,6 +144,7 @@ class MockDest:
         self.previews: list = []                 # PreviewImage per send (or None)
         self.disabled: list[tuple[int, str]] = []  # (message_id, label) tombstones
         self.archived: list[str | None] = []
+        self.archive_delays: list[float | None] = []  # delay= per archive_after_delay call
         self.unarchived: int = 0
         self.cleared_triggers: list[tuple[int, int]] = []  # (channel_id, message_id)
         self.missing_message_ids: set[int] = set()
@@ -185,9 +186,10 @@ class MockDest:
         self.sent.append(f"[archive] {notice}")
         self.archived.append(notice)
 
-    def archive_after_delay(self, notice: str | None = None) -> None:
+    def archive_after_delay(self, notice: str | None = None, *, delay: float | None = None) -> None:
         self.sent.append(f"[archive] {notice}")
         self.archived.append(notice)
+        self.archive_delays.append(delay)
 
     async def unarchive(self) -> None:
         self.unarchived += 1

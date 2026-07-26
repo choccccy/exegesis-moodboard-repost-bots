@@ -660,11 +660,10 @@ async def test_playlist_skip_sets_flag(session, board):
     session.add(sub)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=AUTHOR_ID, channel=channel)
-    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+    outcome = await handle_playlist_skip_button(session, _event(AUTHOR_ID, sub.id), MockDest(), _settings())
 
     assert sub.playlist_skipped is True
+    assert isinstance(outcome, Tombstone)
 
 
 async def test_playlist_skip_already_opted_out(session, board):
@@ -673,10 +672,9 @@ async def test_playlist_skip_already_opted_out(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=AUTHOR_ID)
-    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+    outcome = await handle_playlist_skip_button(session, _event(AUTHOR_ID, sub.id), MockDest(), _settings())
 
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack) and "Already opted out" in outcome.message
 
 
 async def test_playlist_skip_unauthorized_rejected(session, board):
@@ -685,11 +683,10 @@ async def test_playlist_skip_unauthorized_rejected(session, board):
     session.add(sub)
     await session.flush()
 
-    interaction = _interaction(user_id=777)
-    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+    outcome = await handle_playlist_skip_button(session, _event(777, sub.id), MockDest(), _settings())
 
     assert sub.playlist_skipped is False
-    interaction.followup.send.assert_called_once()
+    assert isinstance(outcome, Ack)
 
 
 # ---------------------------------------------------------------------------
@@ -899,10 +896,8 @@ async def test_graphic_button_missing_submission(mock_recompute, session, board)
 
 
 async def test_playlist_skip_submission_not_found(session, board):
-    interaction = _interaction(user_id=CURATOR_ID)
-    await handle_playlist_skip_button(session, interaction, 99999, _settings())
-
-    interaction.followup.send.assert_called_once()
+    outcome = await handle_playlist_skip_button(session, _event(CURATOR_ID, 99999), MockDest(), _settings())
+    assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
 @patch("bot.discord_ingest.service._do_playlist_remove", new_callable=AsyncMock)
@@ -924,37 +919,28 @@ async def test_playlist_skip_removes_existing_playlist_adds(mock_remove, session
     session.add(row)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=AUTHOR_ID, channel=channel)
-    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+    dest = MockDest()
+    outcome = await handle_playlist_skip_button(session, _event(AUTHOR_ID, sub.id), dest, _settings())
 
     assert sub.playlist_skipped is True
+    assert isinstance(outcome, Tombstone)
     mock_remove.assert_called_once()
     assert mock_remove.call_args[0][0] is row
+    assert mock_remove.call_args[0][1] is dest  # removal notices go through the Surface
 
 
-@patch("bot.discord_ingest.service._archive_thread_after_delay_seconds")
-@patch("bot.discord_ingest.service._fire_and_forget")
-@patch("bot.discord_ingest.service._resolve_thread_by_id", new_callable=AsyncMock)
-async def test_playlist_skip_on_queued_schedules_archive(
-    mock_resolve_thread, mock_fire, mock_delay, session, board
-):
-    """Skipping the playlist on an already-queued submission re-schedules the
-    thread archive with the remaining close delay.
-    """
-    mock_resolve_thread.return_value = _thread_mock(thread_id=500)
-    mock_delay.return_value = MagicMock()  # avoid creating a real coroutine
-
+async def test_playlist_skip_on_queued_schedules_archive(session, board):
+    """Skipping the playlist on an already-queued submission re-arms the thread
+    archive (through the Surface) with the remaining close delay."""
     sub = make_submission(board, state=SubmissionState.QUEUED.value, channel_id=100, author_id=AUTHOR_ID)
     sub.playlist_skipped = False
     sub.thread_id = 500
     session.add(sub)
     await session.flush()
 
-    channel = _channel_mock()
-    interaction = _interaction(user_id=AUTHOR_ID, channel=channel)
-    await handle_playlist_skip_button(session, interaction, sub.id, _settings())
+    dest = MockDest()
+    await handle_playlist_skip_button(session, _event(AUTHOR_ID, sub.id), dest, _settings())
 
     assert sub.playlist_skipped is True
-    mock_resolve_thread.assert_called_once()
-    mock_fire.assert_called_once()
+    assert len(dest.archive_delays) == 1  # archive re-armed with an explicit delay
+    assert isinstance(dest.archive_delays[0], float)

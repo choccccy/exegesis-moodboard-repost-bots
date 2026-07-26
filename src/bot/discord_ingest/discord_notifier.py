@@ -124,10 +124,14 @@ class DiscordSurface:
             from .service import _archive_thread
             await _archive_thread(self._channel, notice=notice)
 
-    def archive_after_delay(self, notice: str | None = None) -> None:
+    def archive_after_delay(self, notice: str | None = None, *, delay: float | None = None) -> None:
         if isinstance(self._channel, discord.Thread):
-            from .service import _archive_thread_after_delay
-            _archive_thread_after_delay(self._channel, notice=notice)
+            if delay is None:
+                from .service import _archive_thread_after_delay
+                _archive_thread_after_delay(self._channel, notice=notice)
+            else:
+                from .service import _archive_thread_after_delay_seconds, _fire_and_forget
+                _fire_and_forget(_archive_thread_after_delay_seconds(self._channel, delay, notice=notice))
 
     async def unarchive(self) -> None:
         if isinstance(self._channel, discord.Thread):

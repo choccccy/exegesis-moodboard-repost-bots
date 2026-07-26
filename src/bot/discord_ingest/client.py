@@ -263,9 +263,7 @@ class RepostBot(discord.Client):
 
         # The deferred button handlers go through the surface-agnostic gateway (Phase C):
         # they take a normalized event + a Surface and return a HandlerOutcome, which the
-        # gateway performs (ack/tombstone) after the DB scope closes. (pl_skip still has
-        # deeper channel coupling and stays on the direct path until its Surface support
-        # lands.)
+        # gateway performs (ack/tombstone) after the DB scope closes.
         outcome = None
         async with session_scope() as session:
             if custom_id.startswith("cancel:"):
@@ -289,9 +287,9 @@ class RepostBot(discord.Client):
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("pl_skip:"):
-                await service.handle_playlist_skip_button(
-                    session, interaction, int(custom_id.removeprefix("pl_skip:")),
-                    self.settings, self._yt_client,
+                outcome = await service.handle_playlist_skip_button(
+                    session, gateway.to_event(interaction, int(custom_id.removeprefix("pl_skip:"))),
+                    gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("srcnote_ok:"):
                 outcome = await service.handle_source_note_confirm(

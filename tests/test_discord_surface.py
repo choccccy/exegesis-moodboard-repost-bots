@@ -159,6 +159,21 @@ async def test_archive_after_delay_calls_helper_for_threads():
     arch.assert_called_once()
 
 
+async def test_archive_after_delay_with_explicit_delay_uses_seconds_helper():
+    # An explicit delay (e.g. remaining close time on an already-queued thread) routes
+    # to the seconds-parameterized helper instead of the fixed default.
+    thread = _thread()
+    with (
+        patch("bot.discord_ingest.service._archive_thread_after_delay_seconds") as secs,
+        patch("bot.discord_ingest.service._fire_and_forget") as fire,
+    ):
+        secs.return_value = MagicMock()  # avoid building a real coroutine
+        DiscordSurface(thread).archive_after_delay(delay=42.0)
+    secs.assert_called_once()
+    assert secs.call_args.args[1] == 42.0
+    fire.assert_called_once()
+
+
 async def test_archive_after_delay_noop_for_non_thread():
     channel = MagicMock(spec=discord.TextChannel)
     with patch("bot.discord_ingest.service._archive_thread_after_delay") as arch:

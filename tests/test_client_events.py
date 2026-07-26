@@ -136,10 +136,7 @@ async def test_on_interaction_routes_prefix_to_handler(
         await repost_bot.on_interaction(interaction)
     interaction.response.defer.assert_awaited_once()
     handler.assert_awaited_once()
-    if handler_name == "handle_playlist_skip_button":
-        assert handler.await_args.args[2] == expected_id  # legacy (session, interaction, submission_id, ...)
-    else:
-        assert handler.await_args.args[1].submission_id == expected_id  # normalized event
+    assert handler.await_args.args[1].submission_id == expected_id  # normalized event
 
 
 async def test_on_interaction_unknown_custom_id_is_ignored(repost_bot, session):

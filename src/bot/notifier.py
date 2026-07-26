@@ -68,8 +68,10 @@ class Surface(Protocol):
 
     async def archive(self, notice: str | None = None) -> None: ...
 
-    def archive_after_delay(self, notice: str | None = None) -> None:
-        """Schedule archival after a delay (fire-and-forget, hence sync)."""
+    def archive_after_delay(self, notice: str | None = None, *, delay: float | None = None) -> None:
+        """Schedule archival after a delay (fire-and-forget, hence sync). `delay`
+        overrides the default close delay in seconds (e.g. the remaining time on an
+        already-queued thread); None uses the standard delay."""
         ...
 
     async def unarchive(self) -> None: ...
@@ -108,7 +110,7 @@ class NullSurface:
     async def archive(self, notice: str | None = None) -> None:
         pass
 
-    def archive_after_delay(self, notice: str | None = None) -> None:
+    def archive_after_delay(self, notice: str | None = None, *, delay: float | None = None) -> None:
         pass
 
     async def unarchive(self) -> None:
