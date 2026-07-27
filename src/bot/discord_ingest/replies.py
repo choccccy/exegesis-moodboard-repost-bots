@@ -314,13 +314,13 @@ def thread_anchor(
         playlist_part = ""
 
     parts = [
-        f"🦋 {author_mention}, your post was picked up{board_part} and will be scheduled to post to {dest}{playlist_part}."
+        f"🦋 {author_mention}, this post was picked up{board_part} and will be scheduled to post to {dest}{playlist_part}."
     ]
     if content_title:
         parts.append(f"📌 \"{content_title}\"")
     parts.append(
         f"\n-# {bot_mention} will ask below for anything missing (source, alt text, rating). "
-        "Answer here, or leave it to a curator."
+        "Answer here, or leave it to a <@&1517006033472454687>."
     )
     if dashboard_url:
         parts.append(f"\nYou can see what else is queued on the [dashboard](<{dashboard_url}>).")
