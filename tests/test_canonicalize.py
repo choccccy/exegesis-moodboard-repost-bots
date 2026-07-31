@@ -1,4 +1,4 @@
-from bot.canonicalize import canonicalize
+from bot.canonicalize import canonicalize, is_bluesky_post_url
 
 
 def c(url: str) -> str:
@@ -284,3 +284,14 @@ def test_tiktok_tnktok_mirror_canonicalized():
 def test_tiktok_other_mirror_families():
     assert fam("https://vxtiktok.com/@user/video/123456") == "tiktok"
     assert fam("https://vt.tiktok.com/ZMAbcDef/") == "tiktok"
+
+
+def test_is_bluesky_post_url():
+    # Real post URLs (#62): only these should route through the repost/quote flow.
+    assert is_bluesky_post_url("https://bsky.app/profile/alice.bsky.social/post/abc123")
+    assert is_bluesky_post_url("https://bsky.app/profile/did:plc:xyz/post/abc123")
+    # Bare profile / feed / bare host are NOT posts.
+    assert not is_bluesky_post_url("https://bsky.app/profile/alice.bsky.social")
+    assert not is_bluesky_post_url("https://bsky.app/profile/alice.bsky.social/")
+    assert not is_bluesky_post_url("https://bsky.app/profile/alice.bsky.social/feed/xyz")
+    assert not is_bluesky_post_url("https://bsky.app/")

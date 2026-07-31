@@ -29,7 +29,8 @@ from ..asset_store import (
     remove_submission_dir,
     submission_dir,
 )
-from ..canonicalize import canonicalize
+from ..canonicalize import canonicalize, is_bluesky_post_url
+from ..mirrors import mirror_hint_for_url
 from ..config import BoardConfig, Settings
 from ..models import (
     AttachmentAltTextRequest,
@@ -65,7 +66,7 @@ from ..state import (
     evaluate_state,
     missing_gaps,
 )
-from ..curation.surface import NullNotifier, Notifier, Surface
+from ..curation.surface import NullSurface, Surface
 from ..curation.types import InboundAttachment, InboundMessage
 from . import prompts, render, replies
 from ..curation.events import InteractionEvent
@@ -418,7 +419,7 @@ async def handle_reaction(
         if created:
             async with session_scope() as session:
                 submission = await session.get(Submission, submission_id)
-                if submission is None:
+                if submission is None:  # pragma: no cover - deleted between DB scopes mid-thread-create
                     return False
                 dup_notice = await _detect_and_teardown_duplicate(session, settings, message, submission)
 
@@ -595,7 +596,7 @@ async def ensure_thread_persisted(
     # Beat 3 (DB): persist the thread id + mapping.
     async with session_scope() as session:
         submission = await session.get(Submission, submission_id)
-        if submission is None:
+        if submission is None:  # pragma: no cover - deleted between DB scopes mid-thread-create
             log.warning("submission %s vanished during thread creation", submission_id)
             return None, False
         await _persist_thread_mapping(session, submission, thread.id)
@@ -1434,7 +1435,7 @@ async def waive_source(
     *,
     settings: Settings,
     user_id: int,
-    destination: Notifier,
+    destination: Surface,
     yt_client=None,
 ) -> bool:
     """Mark a submission as having no known source (the `/nosource` action).
@@ -1466,7 +1467,7 @@ async def skip_all_alt_text(
     *,
     settings: Settings,
     user_id: int,
-    destination: Notifier,
+    destination: Surface,
     yt_client=None,
 ) -> int:
     """Skip alt text for every image/video still needing it (the `/skipalt` action).
@@ -2374,8 +2375,8 @@ async def _transcode_video(input_path: str) -> str:
 def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool, has_uploaded_video: bool = False) -> str:
     """Choose the Bluesky embed mode this submission would use."""
     first_family = links[0].domain_family if links else None
-    if first_family == "bluesky":
-        return "record"  # native repost/quote
+    if first_family == "bluesky" and is_bluesky_post_url(links[0].canonical_url):
+        return "record"  # native repost/quote (bare profile links fall through to external)
     if has_uploaded_video:
         return "video"
     if has_uploaded_image:
@@ -2896,6 +2897,8 @@ async def recompute_and_request(
             has_media = any(a.is_image or a.is_video for a in atts)
             primary = _primary_link(links)
             metadata_url = primary.canonical_url if primary else "?"
+            # Nag toward a known-good mirror off the *raw* link (canonical strips mirrors).
+            metadata_mirror_tip = mirror_hint_for_url(primary.raw_url) if primary else None
             image_source_unavailable = primary is not None and primary.resolved_via == "unavailable"
 
         # --- I/O (lock released): post in order, collecting rows / deletes / new checklist id. ---
@@ -2944,7 +2947,7 @@ async def recompute_and_request(
         if Gap.METADATA in gaps and not metadata_open:
             try:
                 msg = await destination.send(
-                    replies.metadata_request(metadata_url),
+                    replies.metadata_request(metadata_url, mirror_tip=metadata_mirror_tip),
                     components=prompts.metadata_confirm_components(submission_id),
                 )
                 to_add.append(MetadataRequest(submission_id=submission_id, bot_message_id=msg.id))
@@ -3082,7 +3085,7 @@ class _PublishPlan:
     curator_user_ids: list[int] | None
 
 
-async def _safe_send(destination: Notifier, content: str, what: str, submission_id: int) -> None:
+async def _safe_send(destination: Surface, content: str, what: str, submission_id: int) -> None:
     """Send a Discord notice, swallowing failures (a publish must never be rolled
     back or a queue tick wasted because a status message couldn't be delivered)."""
     try:
@@ -3120,7 +3123,7 @@ async def _find_publish_time_duplicate(
 async def publish_queued_submission(
     settings: Settings,
     submission_id: int,
-    destination: Notifier | None = None,
+    destination: Surface | None = None,
 ) -> PublishOutcome:
     """Publish a QUEUED or PUBLISH_FAILED submission, keeping all network and
     Discord I/O out of the DB write lock (see docs/db-lock-io-refactor.md).
@@ -3136,7 +3139,7 @@ async def publish_queued_submission(
     Returns a PublishOutcome so the scheduler can decide whether the tick is spent.
     """
     if destination is None:
-        destination = NullNotifier()
+        destination = NullSurface()
 
     # ---- Beat 1: load, validate, decide (short DB scope; no I/O) ----
     plan: _PublishPlan | None = None

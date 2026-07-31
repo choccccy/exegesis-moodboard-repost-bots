@@ -44,6 +44,8 @@ def render_components(components: Sequence[Component] | None) -> discord.ui.View
                     for o in comp.options
                 ],
             ))
+        else:  # pragma: no cover - Component union is exhaustively Button | Select
+            continue
     return view
 
 

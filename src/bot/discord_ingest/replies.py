@@ -175,11 +175,12 @@ def confirmation_request(
     return f"queue this for posting to {dest}{playlist_part}?"
 
 
-def metadata_request(url: str) -> str:
-    return (
+def metadata_request(url: str, mirror_tip: str | None = None) -> str:
+    base = (
         f"couldn't get metadata from **{url}** - **reply with a better link**, "
         f"or press **Use link as-is** below (at least one image will be required)"
     )
+    return f"{base}\n-# {mirror_tip}" if mirror_tip else base
 
 
 def metadata_confirmed() -> str:

@@ -209,8 +209,19 @@ def test_labels_unknown_graphic_status_on_sfw_board_is_none():
 # _determine_kind
 # ---------------------------------------------------------------------------
 
-def test_kind_record_for_bluesky_link():
-    assert _determine_kind([_link(domain_family="bluesky")], False) == "record"
+_BSKY_POST = "https://bsky.app/profile/alice.bsky.social/post/abc123"
+_BSKY_PROFILE = "https://bsky.app/profile/alice.bsky.social"
+
+
+def test_kind_record_for_bluesky_post_link():
+    link = _link(domain_family="bluesky", canonical_url=_BSKY_POST)
+    assert _determine_kind([link], False) == "record"
+
+
+def test_kind_external_for_bluesky_profile_link():
+    # A bare profile link (no /post/<rkey>) is a normal source link, not a repost (#62).
+    link = _link(domain_family="bluesky", canonical_url=_BSKY_PROFILE)
+    assert _determine_kind([link], False) == "external"
 
 
 def test_kind_images_when_has_uploaded_image():
@@ -225,9 +236,10 @@ def test_kind_empty_when_no_links():
     assert _determine_kind([], False) == "empty"
 
 
-def test_kind_bluesky_takes_precedence_over_uploaded_image():
-    # Even with an uploaded image, a Bluesky primary link means record embed.
-    assert _determine_kind([_link(domain_family="bluesky")], True) == "record"
+def test_kind_bluesky_post_takes_precedence_over_uploaded_image():
+    # Even with an uploaded image, a Bluesky post primary link means record embed.
+    link = _link(domain_family="bluesky", canonical_url=_BSKY_POST)
+    assert _determine_kind([link], True) == "record"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [project]
 name = "bluesky-repost-bot"
-version = "1.13.5"  # semantic version
+version = "1.13.6"  # semantic version
 description = "Source-first Discord -> Bluesky moodboard repost bot"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -51,8 +51,12 @@ source = ["bot"]
 branch = true
 concurrency = ["greenlet"]  # trace inside SQLAlchemy-async greenlet switches
 omit = [
-    "*/bot/admin/reauth_youtube.py",  # interactive browser OAuth flow
-    "*/bot/dashboard/__main__.py",    # module-level uvicorn.run()
+    # Interactive / one-shot maintenance scripts, run by hand - not unit-tested.
+    "*/bot/admin/reauth_youtube.py",         # interactive browser OAuth flow
+    "*/bot/admin/backfill_bsky_did.py",      # one-shot DID backfill
+    "*/bot/admin/cancel_lost_submissions.py",# one-shot cleanup
+    "*/bot/admin/repoint_dead_handles.py",   # one-shot handle repoint
+    "*/bot/dashboard/__main__.py",           # module-level uvicorn.run()
 ]
 
 [tool.coverage.report]

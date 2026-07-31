@@ -536,3 +536,28 @@
   </div>
 </section>
 {% endif %}
+
+<section>
+  <h2>Known-good embed mirrors</h2>
+  <p class="empty" style="margin-bottom:10px">Paste these mirror links in Discord for a clean preview - the bot canonicalizes them back to the real URL when it posts.</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>platform</th>
+          <th>paste this host</th>
+          <th>example</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in mirrors %}
+        <tr>
+          <td style="white-space:nowrap">{{ m.label }}</td>
+          <td style="white-space:nowrap"><code>{{ m.host }}</code></td>
+          <td style="color:#777"><code>{{ m.example }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

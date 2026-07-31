@@ -5,9 +5,6 @@ posts to and manages, in surface-agnostic terms (component descriptors from
 `bot.curation.components`, not `discord.ui.View`). Concrete implementations live in
 platform-specific packages (`discord_ingest.discord_notifier.DiscordSurface`,
 `matrix_ingest.surface.MatrixSurface`, ...).
-
-`Notifier` is retained as an alias of `Surface` for the pre-existing
-`destination: Notifier` call sites during the surface-agnostic migration (issue #50).
 """
 
 from __future__ import annotations
@@ -120,8 +117,3 @@ class NullSurface:
 
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         pass
-
-
-# Back-compat aliases for the pre-migration `destination: Notifier` call sites.
-Notifier = Surface
-NullNotifier = NullSurface

@@ -797,7 +797,16 @@ async def test_download_attachment_storage_full_returns_none(session, board, tmp
 def test_determine_kind_bluesky_record():
     link = MagicMock()
     link.domain_family = "bluesky"
+    link.canonical_url = "https://bsky.app/profile/alice.bsky.social/post/abc123"
     assert _determine_kind([link], has_uploaded_image=False) == "record"
+
+
+def test_determine_kind_bluesky_profile_is_external():
+    # A bare bsky profile link is a source link, not a native repost (#62).
+    link = MagicMock()
+    link.domain_family = "bluesky"
+    link.canonical_url = "https://bsky.app/profile/alice.bsky.social"
+    assert _determine_kind([link], has_uploaded_image=False) == "external"
 
 
 def test_discord_file_reencodes_oversized_image(tmp_path):

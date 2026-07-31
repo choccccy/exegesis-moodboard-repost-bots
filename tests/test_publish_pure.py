@@ -46,9 +46,13 @@ def _animated_gif_bytes(size=(24, 24), n_frames=3) -> bytes:
     return buf.getvalue()
 
 
-def _link(domain_family: str = "artstation") -> SubmissionLink:
+def _link(
+    domain_family: str = "artstation",
+    canonical_url: str = "https://bsky.app/profile/alice.bsky.social/post/abc123",
+) -> SubmissionLink:
     link = MagicMock(spec=SubmissionLink)
     link.domain_family = domain_family
+    link.canonical_url = canonical_url
     return link
 
 

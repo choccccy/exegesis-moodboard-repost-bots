@@ -6,6 +6,6 @@ canonical form plus a coarse `domain_family` used downstream for platform-specif
 handling.
 """
 
-from .registry import CanonResult, canonicalize
+from .registry import CanonResult, canonicalize, is_bluesky_post_url
 
-__all__ = ["CanonResult", "canonicalize"]
+__all__ = ["CanonResult", "canonicalize", "is_bluesky_post_url"]

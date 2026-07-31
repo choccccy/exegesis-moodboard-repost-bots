@@ -258,3 +258,13 @@ def canonicalize(url: str) -> CanonResult:
     cleaned_query = _strip_tracking(parts.query)
     canonical = urlunsplit(("https", parts.netloc.lower(), parts.path, cleaned_query, ""))
     return CanonResult(canonical_url=canonical, domain_family="other")
+
+
+def is_bluesky_post_url(url: str) -> bool:
+    """True only for bsky *post* URLs (/profile/<handle-or-did>/post/<rkey>).
+
+    A bare profile link (or a /feed/ URL, bare host, etc.) returns False so callers
+    can treat it as an ordinary source link rather than a native repost/quote.
+    """
+    parts = urlsplit(url).path.strip("/").split("/")
+    return len(parts) >= 4 and parts[0] == "profile" and parts[2] == "post"

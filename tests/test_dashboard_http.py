@@ -72,6 +72,9 @@ async def test_index_empty_db(global_engine, dash_settings):
     body = resp.text
     assert f"v{__version__}" in body
     assert "no publishes yet" in body
+    # Known-good mirrors cheat-sheet always renders (#61).
+    assert "Known-good embed mirrors" in body
+    assert "tnktok.com" in body
 
 
 async def test_index_with_seeded_data(global_engine, dash_settings):

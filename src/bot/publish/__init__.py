@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from atproto import AsyncClient, models
 
+from ..canonicalize import is_bluesky_post_url
 from ..config import BoardConfig
 from ..models import Attachment, Submission, SubmissionLink
 from ..state import GraphicStatus
@@ -172,7 +173,7 @@ async def publish_submission(
 
 def _determine_kind(links: list[SubmissionLink], has_uploaded_image: bool, has_uploaded_video: bool = False) -> str:
     first_family = links[0].domain_family if links else None
-    if first_family == "bluesky":
+    if first_family == "bluesky" and is_bluesky_post_url(links[0].canonical_url):
         return "record"
     if has_uploaded_video:
         return "video"

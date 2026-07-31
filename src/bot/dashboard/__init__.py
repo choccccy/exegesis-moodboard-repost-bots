@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ..db import init_engine, session_scope
+from ..mirrors import KNOWN_GOOD_MIRRORS
 from ..version import __version__
 from . import queries as q
 from .settings import DashboardSettings
@@ -55,6 +56,7 @@ async def index(request: Request):
             "loaded_at": loaded_at,
             "version": __version__,
             "stats": stats,
+            "mirrors": KNOWN_GOOD_MIRRORS,
         },
     )
 
