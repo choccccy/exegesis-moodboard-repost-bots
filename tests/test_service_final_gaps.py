@@ -30,7 +30,6 @@ from bot.discord_ingest.service import (
     _download_attachment_file,
     _download_resolved_video,
     _find_publish_time_duplicate,
-    _curator_authorized,
     _determine_kind,
     _discord_file_for_attachment,
     _gather_ingest,
@@ -70,13 +69,19 @@ from bot.publish import PublishResult
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
-from bot.curation.events import InteractionEvent
+from bot.curation.events import InteractionEvent, ReactionEvent, ReplyEvent
 from bot.curation.outcomes import Ack, Noop, Tombstone
 from conftest import MockDest, make_interaction, make_submission
 
 
 def _event(user_id: int, submission_id: int):
     return InteractionEvent(user_id=user_id, submission_id=submission_id, member=None)
+
+
+def _reaction_event(user_id: int, message_id: int, *, emoji: str = "\N{DROP OF BLOOD}",
+                    channel_id: int = 100):
+    return ReactionEvent(user_id=user_id, message_id=message_id, channel_id=channel_id,
+                         emoji=emoji, member=None)
 
 QUEUED = SubmissionState.QUEUED.value
 PUBLISHED = SubmissionState.PUBLISHED.value
@@ -327,16 +332,17 @@ async def test_resolve_thread_edge_cases():
 # ---------------------------------------------------------------------------
 
 
+def _removed_event(user_id: int, message_id: int, board):
+    return _reaction_event(user_id, message_id, emoji="🦋", channel_id=board.discord_channel_id)
+
+
 async def test_reaction_removed_published_without_thread_noop(session, board):
     sub = make_submission(board, state=PUBLISHED, source_discord_message_id=61)
     session.add(sub)
     await session.flush()
     settings = _svc_settings(board, curator_user_ids=[42])
 
-    await handle_reaction_removed(
-        session, settings=settings, channel=MagicMock(),
-        channel_id=board.discord_channel_id, message_id=61, user_id=42,
-    )
+    await handle_reaction_removed(session, _removed_event(42, 61, board), MockDest(), settings)
 
     still = await session.scalar(select(Submission).where(Submission.id == sub.id))
     assert still is not None  # published submissions are never deleted
@@ -351,18 +357,12 @@ async def test_reaction_removed_published_at_uri_fallback(session, board):
         submission_id=sub.id, success=True,
         at_uri="at://did:plc:z/app.bsky.feed.post/rr", at_cid="c", bsky_url=None,
     ))
-    thread = _thread(500)
-    channel = MagicMock()
-    channel.guild.get_thread.return_value = thread
+    dest = MockDest()
     settings = _svc_settings(board, curator_user_ids=[42])
 
-    await handle_reaction_removed(
-        session, settings=settings, channel=channel,
-        channel_id=board.discord_channel_id, message_id=62, user_id=42,
-    )
+    await handle_reaction_removed(session, _removed_event(42, 62, board), dest, settings)
 
-    sent = thread.send.call_args.args[0]
-    assert "bsky.app/profile/robots.exegesis.space/post/rr" in sent
+    assert "bsky.app/profile/robots.exegesis.space/post/rr" in dest.sent[0]
 
 
 async def test_reaction_removed_published_no_attempt_generic_name(session, board):
@@ -370,17 +370,12 @@ async def test_reaction_removed_published_no_attempt_generic_name(session, board
     sub.thread_id = 501
     session.add(sub)
     await session.flush()
-    thread = _thread(501)
-    channel = MagicMock()
-    channel.guild.get_thread.return_value = thread
+    dest = MockDest()
     settings = _svc_settings(board, curator_user_ids=[42])
 
-    await handle_reaction_removed(
-        session, settings=settings, channel=channel,
-        channel_id=board.discord_channel_id, message_id=63, user_id=42,
-    )
+    await handle_reaction_removed(session, _removed_event(42, 63, board), dest, settings)
 
-    assert thread.send.call_args.args[0] == replies.cannot_remove_published("Bluesky")
+    assert dest.sent[0] == replies.cannot_remove_published("Bluesky")
 
 
 # ---------------------------------------------------------------------------
@@ -391,15 +386,13 @@ async def test_reaction_removed_published_no_attempt_generic_name(session, board
 async def test_label_reaction_missing_submission(session, board):
     session.add(ContentLabelRequest(submission_id=999_999, bot_message_id=901))
     await session.flush()
-    channel = MagicMock()
-    channel.send = AsyncMock()
+    dest = MockDest()
 
     await handle_label_reaction(
-        session, settings=MagicMock(), channel=channel, message_id=901,
-        emoji="\N{DROP OF BLOOD}", member=None, user_id=1,
+        session, _reaction_event(1, 901), dest, MagicMock(),
     )
 
-    channel.send.assert_not_called()
+    assert not dest.sent
 
 
 async def test_label_reaction_unauthorized(session, board):
@@ -412,35 +405,30 @@ async def test_label_reaction_unauthorized(session, board):
     settings.board_for_channel.return_value = None
 
     await handle_label_reaction(
-        session, settings=settings, channel=MagicMock(), message_id=902,
-        emoji="\N{DROP OF BLOOD}", member=None, user_id=55,  # not OP, no curators
+        session, _reaction_event(55, 902), MockDest(), settings,  # not OP, no curators
     )
 
     assert sub.graphic_status == "unknown"
 
 
 async def test_metadata_reaction_no_open_request(session, board):
-    channel = MagicMock()
-    channel.send = AsyncMock()
+    dest = MockDest()
     await handle_metadata_reaction(
-        session, settings=MagicMock(), channel=channel, message_id=54321,
-        member=None, user_id=1,
+        session, _reaction_event(1, 54321, emoji="🔗"), dest, MagicMock(),
     )
-    channel.send.assert_not_called()
+    assert not dest.sent
 
 
 async def test_metadata_reaction_missing_submission(session, board):
     session.add(MetadataRequest(submission_id=999_999, bot_message_id=903))
     await session.flush()
-    channel = MagicMock()
-    channel.send = AsyncMock()
+    dest = MockDest()
 
     await handle_metadata_reaction(
-        session, settings=MagicMock(), channel=channel, message_id=903,
-        member=None, user_id=1,
+        session, _reaction_event(1, 903, emoji="🔗"), dest, MagicMock(),
     )
 
-    channel.send.assert_not_called()
+    assert not dest.sent
 
 
 async def test_confirmation_reaction_terminal_state_returns_false(session, board):
@@ -451,8 +439,7 @@ async def test_confirmation_reaction_terminal_state_returns_false(session, board
     await session.flush()
 
     result = await handle_confirmation_reaction(
-        session, settings=MagicMock(), channel=MagicMock(), message_id=904,
-        member=None, user_id=999,
+        session, _reaction_event(999, 904, emoji="✅"), MockDest(), MagicMock(),
     )
 
     assert result is False
@@ -466,40 +453,16 @@ async def test_confirmation_reaction_playlist_skipped_archives_thread(session, b
     await session.flush()
     session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=905))
     await session.flush()
-    channel = MagicMock(spec=discord.Thread)
+    dest = MockDest()
     settings = _svc_settings(board)
 
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as mock_delay:
-        result = await handle_confirmation_reaction(
-            session, settings=settings, channel=channel, message_id=905,
-            member=None, user_id=999,
-        )
+    result = await handle_confirmation_reaction(
+        session, _reaction_event(999, 905, emoji="✅"), dest, settings,
+    )
 
     assert result is True
     assert sub.state == QUEUED
-    mock_delay.assert_called_once()  # playlist opt-out means archival is unblocked
-
-
-# ---------------------------------------------------------------------------
-# _curator_authorized guards
-# ---------------------------------------------------------------------------
-
-
-async def test_curator_authorized_edge_cases(board):
-    cfg = BoardConfig(
-        name="robots", discord_guild_id=1, discord_channel_id=100,
-        curator_role_ids=[7], curator_user_ids=[],
-    )
-    assert await _curator_authorized(MagicMock(), 1, None) is False
-
-    dm_channel = MagicMock()
-    dm_channel.guild = None
-    assert await _curator_authorized(dm_channel, 1, cfg) is False
-
-    channel = MagicMock()
-    channel.guild.get_member.return_value = None
-    channel.guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
-    assert await _curator_authorized(channel, 1, cfg) is False
+    assert dest.archive_delays  # playlist opt-out means archival is unblocked
 
 
 # ---------------------------------------------------------------------------
@@ -507,38 +470,38 @@ async def test_curator_authorized_edge_cases(board):
 # ---------------------------------------------------------------------------
 
 
-async def test_cancel_reaction_published_without_thread(session, board):
+async def test_cancel_reaction_published_keeps_row(session, board):
     sub = make_submission(board, state=PUBLISHED)
     session.add(sub)
     await session.flush()
     session.add(CancellationRequest(submission_id=sub.id, bot_message_id=906))
     await session.flush()
+    dest = MockDest()
 
-    result = await handle_cancel_reaction(
-        session, settings=_svc_settings(board), channel=MagicMock(),
-        message_id=906, member=None, user_id=999,
+    await handle_cancel_reaction(
+        session, _reaction_event(999, 906, emoji="❌"), dest, _svc_settings(board),
     )
 
-    assert result is None
     assert sub.state == PUBLISHED
+    assert dest.sent  # cannot-remove-published notice
+    assert not dest.cleared_triggers
 
 
-async def test_cancel_reaction_no_thread_still_returns_source(session, board, tmp_path):
+async def test_cancel_reaction_deletes_and_clears_trigger(session, board, tmp_path):
     sub = make_submission(board)
     sub.thread_id = 555
     session.add(sub)
     await session.flush()
     session.add(CancellationRequest(submission_id=sub.id, bot_message_id=907))
     await session.flush()
-    channel = MagicMock()
-    channel.guild = None  # thread cannot be resolved: notice is skipped
+    dest = MockDest()
 
-    result = await handle_cancel_reaction(
-        session, settings=_svc_settings(board, tmp_dir=str(tmp_path)), channel=channel,
-        message_id=907, member=None, user_id=999,
+    await handle_cancel_reaction(
+        session, _reaction_event(999, 907, emoji="❌"), dest,
+        _svc_settings(board, tmp_dir=str(tmp_path)),
     )
 
-    assert result == (board.discord_channel_id, 1)
+    assert dest.cleared_triggers == [(board.discord_channel_id, 1)]
     gone = await session.scalar(select(Submission).where(Submission.id == sub.id))
     assert gone is None
 
@@ -548,48 +511,24 @@ async def test_cancel_reaction_no_thread_still_returns_source(session, board, tm
 # ---------------------------------------------------------------------------
 
 
-async def test_playlist_opt_out_archived_thread_not_rescheduled(session, board):
-    sub = make_submission(board, state=QUEUED)
-    sub.thread_id = 650
-    sub.playlist_opt_out_message_id = 9911
-    session.add(sub)
-    await session.flush()
-    channel = MagicMock()
-    channel.guild.get_thread.return_value = MagicMock(archived=True)
-    scheduled = []
-
-    with patch("bot.discord_ingest.service._fire_and_forget", scheduled.append):
-        await handle_playlist_opt_out(
-            session, message_id=9911, user_id=999, member=None,
-            channel=channel, settings=_svc_settings(board), yt_client=None,
-        )
-
-    assert sub.playlist_skipped is True
-    assert scheduled == []
-
-
-async def test_playlist_opt_out_naive_queued_at_schedules_archive(session, board):
+async def test_playlist_opt_out_queued_schedules_archive(session, board):
+    # Opting out of a QUEUED submission with a thread re-arms archival through the
+    # port. (Re-arming an already-archived thread is a harmless no-op, so the old
+    # not-archived guard was dropped in the surface migration.)
     sub = make_submission(board, state=QUEUED)
     sub.thread_id = 651
     sub.playlist_opt_out_message_id = 9912
-    sub.updated_at = datetime(2020, 1, 1)  # naive: exercises the tzinfo backfill
+    sub.updated_at = datetime(2020, 1, 1)  # naive updated_at input
     session.add(sub)
     await session.flush()
-    channel = MagicMock()
-    channel.guild.get_thread.return_value = MagicMock(archived=False)
-    scheduled = []
+    dest = MockDest()
 
-    def fake_fire_and_forget(coro):
-        scheduled.append(coro)
-        coro.close()
+    await handle_playlist_opt_out(
+        session, _reaction_event(999, 9912, emoji="⏹️"), dest, _svc_settings(board),
+    )
 
-    with patch("bot.discord_ingest.service._fire_and_forget", fake_fire_and_forget):
-        await handle_playlist_opt_out(
-            session, message_id=9912, user_id=999, member=None,
-            channel=channel, settings=_svc_settings(board), yt_client=None,
-        )
-
-    assert len(scheduled) == 1
+    assert sub.playlist_skipped is True
+    assert len(dest.archive_delays) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -824,11 +763,9 @@ def test_discord_file_reencodes_oversized_image(tmp_path):
 
 
 def test_is_authorized_non_op_without_board_cfg():
-    author = MagicMock()
-    author.id = 5
     submission = MagicMock()
     submission.author_id = 999
-    assert _is_authorized(author, submission, None) is False
+    assert _is_authorized(None, 5, submission, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1082,14 +1019,10 @@ async def test_preview_reply_url_from_at_uri(session, board):
 # ---------------------------------------------------------------------------
 
 
-def _reply_message(content: str) -> MagicMock:
-    msg = MagicMock(spec=discord.Message)
-    msg.content = content
-    msg.attachments = []
-    msg.author = MagicMock()
-    msg.author.id = 999
-    msg.reply = AsyncMock()
-    return msg
+def _reply_event(content: str) -> ReplyEvent:
+    from bot.curation.types import InboundMessage
+    return ReplyEvent(bot_message_id=1, author_id=999, member=None,
+                      message=InboundMessage(content=content))
 
 
 async def test_apply_answer_alt_text_missing_attachment(session, board):
@@ -1097,9 +1030,10 @@ async def test_apply_answer_alt_text_missing_attachment(session, board):
     session.add(sub)
     await session.flush()
     req = AttachmentAltTextRequest(submission_id=sub.id, attachment_id=424_242, bot_message_id=911)
-    message = _reply_message("a fine description")
 
-    handled = await _apply_answer(session, req, sub, message, MagicMock(), AsyncMock())
+    handled = await _apply_answer(
+        session, req, sub, _reply_event("a fine description"), MockDest(), MagicMock(), AsyncMock(),
+    )
 
     assert handled is True
     assert req.answered_at is not None  # answer recorded even though the row is gone
@@ -1110,9 +1044,10 @@ async def test_apply_answer_unknown_request_type_falls_through(session, board):
     session.add(sub)
     await session.flush()
     req = MagicMock()  # matches none of the request model types
-    message = _reply_message("free text")
 
-    handled = await _apply_answer(session, req, sub, message, MagicMock(), AsyncMock())
+    handled = await _apply_answer(
+        session, req, sub, _reply_event("free text"), MockDest(), MagicMock(), AsyncMock(),
+    )
 
     assert handled is True
     assert req.answer == "free text"
@@ -1123,10 +1058,12 @@ async def test_apply_answer_metadata_without_primary_link(session, board):
     session.add(sub)
     await session.flush()
     req = MetadataRequest(submission_id=sub.id, bot_message_id=912)
-    message = _reply_message("https://example.com/better")
+    dest = MockDest()
 
-    handled = await _apply_answer(session, req, sub, message, MagicMock(), AsyncMock())
+    handled = await _apply_answer(
+        session, req, sub, _reply_event("https://example.com/better"), dest, MagicMock(), AsyncMock(),
+    )
 
     assert handled is True
-    message.reply.assert_awaited_once()  # link-updated ack sent even with no primary link
+    assert dest.sent  # link-updated ack sent even with no primary link
     assert req.answered_at is not None

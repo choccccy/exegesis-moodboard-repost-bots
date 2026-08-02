@@ -55,6 +55,11 @@ def make_history_message(*, msg_id=555, author_id=7, emojis=(), reference=None):
     message.id = msg_id
     message.author.id = author_id
     message.reference = reference
+    # Fields read by adapters.discord_message_to_inbound (via gateway.to_reply_event).
+    message.content = ""
+    message.embeds = []
+    message.attachments = []
+    message.message_snapshots = []
     reaction_mocks = []
     for emoji in emojis:
         r = MagicMock()
@@ -330,13 +335,13 @@ async def test_thread_catchup_replays_reactions_and_replies(repost_bot, session,
     ):
         await repost_bot._run_thread_catchup()
     label.assert_awaited_once()
-    assert label.await_args.kwargs["user_id"] == 7  # bot's own vote skipped
+    assert label.await_args.args[1].user_id == 7  # bot's own vote skipped (ReactionEvent)
     meta.assert_awaited_once()
-    assert meta.await_args.kwargs["user_id"] == 7
+    assert meta.await_args.args[1].user_id == 7
     cancel.assert_awaited_once()
-    assert cancel.await_args.kwargs["user_id"] == 7
+    assert cancel.await_args.args[1].user_id == 7  # ReactionEvent
     reply.assert_awaited_once()
-    assert reply.await_args.kwargs["message"] is human_reply
+    assert reply.await_args.args[1].author_id == 7  # ReplyEvent built from the human reply
     recompute.assert_awaited_once()
     assert recompute.await_args.args[0] == sub.id  # recompute(submission_id, ...)
     assert len(fired) == 1  # queued-thread archival scan scheduled at the end

@@ -244,7 +244,12 @@ async def test_reaction_add_routes_special_emoji(repost_bot, session, emoji, han
     ):
         await repost_bot.on_raw_reaction_add(payload)
     handler.assert_awaited_once()
-    assert handler.await_args.kwargs["message_id"] == payload.message_id
+    # Migrated reaction handlers take a ReactionEvent positionally; not-yet-migrated
+    # ones still take message_id as a kwarg. Accept either.
+    call = handler.await_args
+    assert payload.message_id in call.kwargs.values() or any(
+        getattr(a, "message_id", None) == payload.message_id for a in call.args
+    )
 
 
 @pytest.mark.parametrize(
@@ -267,151 +272,103 @@ async def test_reaction_add_special_emoji_unresolvable_channel_skips(
     handler.assert_not_awaited()
 
 
-async def test_reaction_add_cancel_on_watched_channel_cancels_and_archives(repost_bot, session):
-    # ❌ on the source post: submission cancelled, thread notified and archived,
-    # plus a removed-video notice.
+async def test_reaction_add_source_cancel_invokes_handler(repost_bot, session):
+    # ❌ on the source post (watched channel): routes to the source-cancel handler
+    # with a ReactionEvent + a thread surface. The handler owns all thread I/O and
+    # trigger-clearing (see test_cancel_flows).
     payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
-    source_channel = MagicMock()
-    thread = MagicMock(spec=discord.Thread)
-    repost_bot._resolve_channel = AsyncMock(side_effect=[source_channel, thread])
+    repost_bot._resolve_channel = AsyncMock(return_value=MagicMock())
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_source_cancel_reaction",
-            new_callable=AsyncMock,
-            return_value=(555, True, ["vid123"]),
-        ) as handler,
-        patch("bot.discord_ingest.client.service._archive_thread", new_callable=AsyncMock) as archive,
+        patch("bot.discord_ingest.client.service.handle_source_cancel_reaction",
+              new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_add(payload)
     handler.assert_awaited_once()
-    archive.assert_awaited_once()
-    sent = [call.args[0] for call in thread.send.await_args_list]
-    assert any("cancel" in text.lower() for text in sent)
-    assert any("vid123" in text for text in sent)
+    assert handler.await_args.args[1].message_id == payload.message_id  # ReactionEvent
 
 
-async def test_reaction_add_cancel_on_watched_channel_without_thread(repost_bot, session):
-    # Nothing was cancelled and no thread exists: no notifications go out.
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
-    source_channel = MagicMock()
-    repost_bot._resolve_channel = AsyncMock(return_value=source_channel)
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_source_cancel_reaction",
-            new_callable=AsyncMock, return_value=(None, False, []),
-        ),
-        patch("bot.discord_ingest.client.service._archive_thread", new_callable=AsyncMock) as archive,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    archive.assert_not_awaited()
-    assert repost_bot._resolve_channel.await_count == 1  # no thread lookup
-
-
-async def test_reaction_add_cancel_watched_thread_unresolvable(repost_bot, session):
-    # The submission had a thread but it can no longer be resolved: nothing sent.
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
-    repost_bot._resolve_channel = AsyncMock(side_effect=[MagicMock(), None])
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_source_cancel_reaction",
-            new_callable=AsyncMock, return_value=(555, True, ["vid123"]),
-        ),
-        patch("bot.discord_ingest.client.service._archive_thread", new_callable=AsyncMock) as archive,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    archive.assert_not_awaited()
-
-
-async def test_reaction_add_cancel_watched_non_thread_destination_skips_archive(repost_bot, session):
-    # Destination resolves to a plain channel, not a Thread: confirmation and
-    # video notices still go out, but no archive happens.
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
-    plain_channel = MagicMock()
-    plain_channel.send = AsyncMock()
-    repost_bot._resolve_channel = AsyncMock(side_effect=[MagicMock(), plain_channel])
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_source_cancel_reaction",
-            new_callable=AsyncMock, return_value=(555, True, ["vid123"]),
-        ),
-        patch("bot.discord_ingest.client.service._archive_thread", new_callable=AsyncMock) as archive,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    archive.assert_not_awaited()
-    assert plain_channel.send.await_count == 2
-
-
-async def test_reaction_add_cancel_watched_video_removal_only(repost_bot, session):
-    # Nothing cancelled, but a playlist video was removed: only that notice goes out.
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
-    thread = MagicMock(spec=discord.Thread)
-    repost_bot._resolve_channel = AsyncMock(side_effect=[MagicMock(), thread])
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_source_cancel_reaction",
-            new_callable=AsyncMock, return_value=(555, False, ["vid123"]),
-        ),
-        patch("bot.discord_ingest.client.service._archive_thread", new_callable=AsyncMock) as archive,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    archive.assert_not_awaited()
-    thread.send.assert_awaited_once()
-    assert "vid123" in thread.send.await_args.args[0]
-
-
-async def test_reaction_add_cancel_in_thread_without_source_info(repost_bot, session):
+async def test_reaction_add_cancel_in_thread_invokes_handler(repost_bot, session):
+    # ❌ on a bot message inside a thread (unwatched channel id): routes to the
+    # cancel handler with a ReactionEvent + surface. The handler now owns the
+    # thread notice, archival, and source-trigger clearing (see test_cancel_flows).
     payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=555)
     repost_bot._resolve_channel = AsyncMock(return_value=MagicMock())
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_cancel_reaction",
-            new_callable=AsyncMock, return_value=None,
-        ),
-        patch("bot.discord_ingest.client.service._clear_trigger_reaction", new_callable=AsyncMock) as clear,
+        patch("bot.discord_ingest.client.service.handle_cancel_reaction", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_add(payload)
-    clear.assert_not_awaited()
+    handler.assert_awaited_once()
+    assert handler.await_args.args[1].message_id == payload.message_id  # ReactionEvent
 
 
-async def test_reaction_add_cancel_in_thread_source_channel_unresolvable(repost_bot, session):
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=555)
-    repost_bot._resolve_channel = AsyncMock(side_effect=[MagicMock(), None])
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_cancel_reaction",
-            new_callable=AsyncMock, return_value=(100, 777),
-        ),
-        patch("bot.discord_ingest.client.service._clear_trigger_reaction", new_callable=AsyncMock) as clear,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    clear.assert_not_awaited()
+# ---------------------------------------------------------------------------
+# thread-surface / member resolution for the react-on-source handlers
+# ---------------------------------------------------------------------------
 
 
-async def test_reaction_add_cancel_in_thread_clears_source_trigger(repost_bot, session):
-    # ❌ on a bot message inside a thread (unwatched channel id): the cancel
-    # handler returns the source location and the trigger reaction gets cleared.
-    payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=555)
-    thread = MagicMock()
-    src_channel = MagicMock()
-    repost_bot._resolve_channel = AsyncMock(side_effect=[thread, src_channel])
-    with (
-        patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(
-            "bot.discord_ingest.client.service.handle_cancel_reaction",
-            new_callable=AsyncMock,
-            return_value=(100, 777),
-        ),
-        patch("bot.discord_ingest.client.service._clear_trigger_reaction", new_callable=AsyncMock) as clear,
-    ):
-        await repost_bot.on_raw_reaction_add(payload)
-    clear.assert_awaited_once_with(src_channel, 777, repost_bot.settings.trigger_emoji)
+async def test_thread_surface_for_source_resolves_mapping(repost_bot, session, board):
+    from bot.models import SubmissionThread
+    from bot.discord_ingest.discord_notifier import DiscordSurface
+
+    session.add(SubmissionThread(board_id=board.id, source_discord_message_id=4321, thread_id=888))
+    await session.flush()
+    repost_bot._resolve_channel = AsyncMock(return_value=MagicMock())
+    with patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)):
+        surface = await repost_bot._thread_surface_for_source(board.discord_channel_id, 4321)
+    assert isinstance(surface, DiscordSurface)
+
+
+async def test_thread_surface_for_source_no_mapping_is_null(repost_bot, session, board):
+    from bot.curation.surface import NullSurface
+    with patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)):
+        surface = await repost_bot._thread_surface_for_source(board.discord_channel_id, 999)
+    assert isinstance(surface, NullSurface)
+
+
+async def test_thread_surface_for_source_unresolvable_thread_is_null(repost_bot, session, board):
+    from bot.models import SubmissionThread
+    from bot.curation.surface import NullSurface
+
+    session.add(SubmissionThread(board_id=board.id, source_discord_message_id=4322, thread_id=889))
+    await session.flush()
+    repost_bot._resolve_channel = AsyncMock(return_value=None)
+    with patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)):
+        surface = await repost_bot._thread_surface_for_source(board.discord_channel_id, 4322)
+    assert isinstance(surface, NullSurface)
+
+
+async def test_thread_surface_for_source_unknown_channel_is_null(repost_bot, session):
+    from bot.curation.surface import NullSurface
+    with patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)):
+        surface = await repost_bot._thread_surface_for_source(9999, 1)
+    assert isinstance(surface, NullSurface)
+
+
+async def test_resolve_member_uses_cache_then_fetch(repost_bot):
+    guild = MagicMock()
+    guild.get_member.return_value = None
+    fetched = MagicMock()
+    guild.fetch_member = AsyncMock(return_value=fetched)
+    channel = MagicMock()
+    channel.guild = guild
+    assert await repost_bot._resolve_member(channel, 7) is fetched
+
+
+async def test_resolve_member_no_guild_is_none(repost_bot):
+    channel = MagicMock()
+    channel.guild = None
+    assert await repost_bot._resolve_member(channel, 7) is None
+
+
+async def test_resolve_member_fetch_failure_is_none(repost_bot):
+    guild = MagicMock()
+    guild.get_member.return_value = None
+    guild.fetch_member = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
+    channel = MagicMock()
+    channel.guild = guild
+    assert await repost_bot._resolve_member(channel, 7) is None
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +386,7 @@ async def test_reaction_remove_trigger_routes_to_cleanup(repost_bot, session):
     ):
         await repost_bot.on_raw_reaction_remove(payload)
     handler.assert_awaited_once()
-    assert handler.await_args.kwargs["message_id"] == payload.message_id
+    assert handler.await_args.args[1].message_id == payload.message_id  # ReactionEvent
 
 
 async def test_reaction_remove_unresolvable_channel_skips(repost_bot):
@@ -467,6 +424,11 @@ def _make_message(*, author_id=7, channel_id=100, has_reference=True):
     message.reference = MagicMock() if has_reference else None
     message.channel = MagicMock()
     message.channel.id = channel_id
+    # Fields read by gateway.to_reply_event -> adapters.discord_message_to_inbound.
+    message.content = ""
+    message.embeds = []
+    message.attachments = []
+    message.message_snapshots = []
     return message
 
 
@@ -489,7 +451,7 @@ async def test_on_message_reply_in_watched_channel_routes(repost_bot, session):
     ):
         await repost_bot.on_message(message)
     handler.assert_awaited_once()
-    assert handler.await_args.kwargs["message"] is message
+    assert handler.await_args.args[1].author_id == message.author.id  # ReplyEvent
 
 
 async def test_on_message_non_reply_ignored(repost_bot):

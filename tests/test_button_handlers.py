@@ -74,6 +74,16 @@ def _event(user_id: int = CURATOR_ID, submission_id: int = 0, *, values=()):
     )
 
 
+def _reaction_event(user_id: int = CURATOR_ID, message_id: int = 0, *,
+                    emoji: str = "🩸", channel_id: int = 100, member=None):
+    """A normalized emoji-reaction event."""
+    from bot.curation.events import ReactionEvent
+    return ReactionEvent(
+        user_id=user_id, message_id=message_id, channel_id=channel_id,
+        emoji=emoji, member=member,
+    )
+
+
 def _interaction(user_id: int = CURATOR_ID, channel: object = None) -> MagicMock:
     interaction = MagicMock(spec=discord.Interaction)
     user = MagicMock()
@@ -295,18 +305,11 @@ async def test_label_reaction_graphic_yes(mock_recompute, session, board):
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
     await handle_label_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=3000,
-        emoji="🩸",
-        member=member,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 3000, emoji="🩸"),
+        MockDest(),
+        _settings(),
     )
 
     assert sub.graphic_status == GraphicStatus.GRAPHIC.value
@@ -327,18 +330,11 @@ async def test_label_reaction_graphic_sets_answered_at(mock_recompute, session, 
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
     await handle_label_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=3001,
-        emoji=GRAPHIC_YES_EMOJI,
-        member=member,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 3001, emoji=GRAPHIC_YES_EMOJI),
+        MockDest(),
+        _settings(),
     )
 
     assert req.answered_at is not None
@@ -356,15 +352,11 @@ async def test_label_reaction_unknown_emoji_ignored(mock_recompute, session, boa
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
     await handle_label_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=3002,
-        emoji="🐶",
-        member=None,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 3002, emoji="🐶"),
+        MockDest(),
+        _settings(),
     )
 
     assert sub.graphic_status == GraphicStatus.UNKNOWN.value
@@ -382,15 +374,11 @@ async def test_label_reaction_already_answered_ignored(mock_recompute, session, 
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
     await handle_label_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=3003,
-        emoji="🩸",
-        member=None,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 3003, emoji="🩸"),
+        MockDest(),
+        _settings(),
     )
 
     mock_recompute.assert_not_called()
@@ -411,21 +399,17 @@ async def test_metadata_reaction_confirms_link(mock_recompute, session, board):
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
+    dest = MockDest()
     await handle_metadata_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=4000,
-        member=member,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 4000, emoji="🔗"),
+        dest,
+        _settings(),
     )
 
     assert req.answer == "confirmed"
     assert req.answered_at is not None
+    assert dest.sent  # posted the "link confirmed" notice
     mock_recompute.assert_called_once()
 
 
@@ -439,17 +423,11 @@ async def test_metadata_reaction_unauthorized_ignored(mock_recompute, session, b
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
     await handle_metadata_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=4001,
-        member=member,
-        user_id=777,  # not OP or curator
+        _reaction_event(777, 4001, emoji="🔗"),  # not OP or curator
+        MockDest(),
+        _settings(),
     )
 
     assert req.answer is None
@@ -475,17 +453,11 @@ async def test_confirmation_reaction_queues_submission(mock_pclose, mock_playlis
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
     result = await handle_confirmation_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=7000,
-        member=member,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 7000, emoji="✅"),
+        MockDest(),
+        _settings(),
     )
 
     assert result is True
@@ -510,51 +482,17 @@ async def test_confirmation_reaction_refuses_when_gap_reopened(mock_recompute, s
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
+    dest = MockDest()
     result = await handle_confirmation_reaction(
-        session, settings=_settings(), channel=channel, message_id=7050,
-        member=member, user_id=CURATOR_ID,
+        session, _reaction_event(CURATOR_ID, 7050, emoji="✅"), dest, _settings(),
     )
 
     assert result is False
     assert sub.state == SubmissionState.READY_TO_QUEUE.value  # not queued
     assert req.confirmed_at is None
     mock_recompute.assert_awaited_once()
-    channel.send.assert_awaited_once()
-    assert "alt text" in channel.send.call_args.args[0]
-
-
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
-async def test_confirmation_reaction_refusal_notice_send_failure_swallowed(mock_recompute, session, board):
-    """A failure posting the blocked-notice must not crash the refusal path."""
-    sub = make_submission(
-        board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100,
-        author_id=AUTHOR_ID, source_waived=True,
-    )
-    session.add(sub)
-    await session.flush()
-    session.add(Attachment(
-        submission_id=sub.id, discord_attachment_id=1, filename="pic.jpg", discord_url="u",
-        is_image=True, is_video=False, alt_text_status=AltTextStatus.NEEDED.value,
-    ))
-    session.add(ConfirmationRequest(submission_id=sub.id, bot_message_id=7060))
-    await session.flush()
-
-    channel = _channel_mock()
-    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=500), "boom"))
-    member = MagicMock()
-    member.roles = []
-
-    result = await handle_confirmation_reaction(
-        session, settings=_settings(), channel=channel, message_id=7060,
-        member=member, user_id=CURATOR_ID,
-    )
-
-    assert result is False
-    assert sub.state == SubmissionState.READY_TO_QUEUE.value
+    assert len(dest.sent) == 1
+    assert "alt text" in dest.sent[0]
 
 
 @patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
@@ -568,17 +506,11 @@ async def test_confirmation_reaction_unauthorized_returns_false(mock_pclose, moc
     session.add(req)
     await session.flush()
 
-    channel = _channel_mock()
-    member = MagicMock()
-    member.roles = []
-
     result = await handle_confirmation_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=7001,
-        member=member,
-        user_id=777,
+        _reaction_event(777, 7001, emoji="✅"),
+        MockDest(),
+        _settings(),
     )
 
     assert result is False
@@ -586,14 +518,11 @@ async def test_confirmation_reaction_unauthorized_returns_false(mock_pclose, moc
 
 
 async def test_confirmation_reaction_no_req_returns_false(session, board):
-    channel = _channel_mock()
     result = await handle_confirmation_reaction(
         session,
-        settings=_settings(),
-        channel=channel,
-        message_id=99999,
-        member=None,
-        user_id=CURATOR_ID,
+        _reaction_event(CURATOR_ID, 99999, emoji="✅"),
+        MockDest(),
+        _settings(),
     )
     assert result is False
 

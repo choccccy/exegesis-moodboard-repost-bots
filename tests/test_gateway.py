@@ -10,7 +10,14 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 
 from bot.curation.components import Button, ModalSpec, TextField
-from bot.discord_ingest.gateway import perform, to_event
+from bot.curation.surface import Surface
+from bot.discord_ingest.gateway import (
+    perform,
+    surface_for_channel,
+    to_event,
+    to_reaction_event,
+    to_reply_event,
+)
 from bot.curation.outcomes import Ack, Noop, OpenModal, Tombstone
 
 
@@ -116,3 +123,55 @@ async def test_perform_tombstone_swallows_edit_failure():
     inter = _interaction()
     inter.message.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "gone"))
     await perform(inter, Tombstone("Queued ✅"))  # must not raise
+
+
+# --- reaction / reply event builders + channel surface ----------------------
+
+def test_to_reaction_event_normalizes_payload():
+    payload = MagicMock(spec=discord.RawReactionActionEvent)
+    payload.user_id = 42
+    payload.message_id = 555
+    payload.channel_id = 100
+    payload.emoji = "🩸"  # str() of a unicode emoji is itself
+    payload.member = MagicMock(spec=discord.Member)
+    event = to_reaction_event(payload)
+    assert (event.user_id, event.message_id, event.channel_id) == (42, 555, 100)
+    assert event.emoji == "🩸"
+    assert event.member is payload.member
+
+
+def test_to_reply_event_normalizes_message():
+    msg = MagicMock(spec=discord.Message)
+    msg.author = MagicMock(spec=discord.Member)
+    msg.author.id = 7
+    msg.reference = MagicMock()
+    msg.reference.message_id = 909
+    msg.content = "here's a better link https://example.com"
+    msg.embeds = []
+    msg.attachments = []
+    msg.message_snapshots = []
+    event = to_reply_event(msg)
+    assert event.bot_message_id == 909
+    assert event.author_id == 7
+    assert event.member is msg.author
+    assert event.message.content == "here's a better link https://example.com"
+
+
+def test_to_reply_event_non_member_author_has_no_member():
+    msg = MagicMock(spec=discord.Message)
+    msg.author = MagicMock(spec=discord.User)  # DM-style / not a guild member
+    msg.author.id = 8
+    msg.reference = MagicMock()
+    msg.reference.message_id = 1
+    msg.content = ""
+    msg.embeds = []
+    msg.attachments = []
+    msg.message_snapshots = []
+    event = to_reply_event(msg)
+    assert event.member is None
+
+
+def test_surface_for_channel_is_a_surface():
+    channel = MagicMock(spec=discord.TextChannel)
+    surface = surface_for_channel(channel, client=MagicMock())
+    assert isinstance(surface, Surface)

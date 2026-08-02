@@ -43,7 +43,8 @@ from bot.models import (
 from bot.scheduler import _fire_board
 from bot.state import AltTextStatus, PublishOutcome, SubmissionState
 
-from bot.curation.events import InteractionEvent
+from bot.curation.events import InteractionEvent, ReplyEvent
+from bot.curation.types import InboundMessage
 from conftest import MockDest, make_submission
 
 
@@ -189,21 +190,16 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board, bind_db_scope
         for link in links:
             _write_resolved(link)
 
-    reply = MagicMock(spec=discord.Message)
-    reply.id = next(_ids)
-    reply.content = "https://example.com/better-link"
-    reply.attachments = []
-    reply.embeds = []
-    reply.author = msg.author
-    reply.channel = thread
-    reply.reference = MagicMock()
-    reply.reference.message_id = meta_req.bot_message_id
-    reply.add_reaction = AsyncMock()
-    reply.reply = AsyncMock()
+    reply_event = ReplyEvent(
+        bot_message_id=meta_req.bot_message_id,
+        author_id=msg.author.id,
+        member=None,
+        message=InboundMessage(content="https://example.com/better-link"),
+    )
 
     with patch("bot.discord_ingest.service._resolve_links_in_session", AsyncMock(side_effect=_resolve_ok)):
         handled = await handle_reply(
-            session, settings=settings, message=reply, http_client=AsyncMock(),
+            session, reply_event, MockDest(), settings, AsyncMock(),
         )
     assert handled is True
 

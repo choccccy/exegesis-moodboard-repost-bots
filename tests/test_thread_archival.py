@@ -1,8 +1,7 @@
 """Tests for thread archival helpers in the ingest service.
 
 Covers _fire_and_forget (background task scheduling), the delayed and
-immediate archive helpers, _unarchive_thread, _clear_trigger_reaction, and
-_resolve_thread_by_id.
+immediate archive helpers, _unarchive_thread, and _clear_trigger_reaction.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from bot.discord_ingest.service import (
     _archive_thread_after_delay_seconds,
     _clear_trigger_reaction,
     _fire_and_forget,
-    _resolve_thread_by_id,
     _unarchive_thread,
 )
 
@@ -199,55 +197,3 @@ async def test_clear_trigger_reaction_not_found_swallowed():
     channel = MagicMock()
     channel.fetch_message = AsyncMock(return_value=msg)
     await _clear_trigger_reaction(channel, 42, "\N{BUTTERFLY}")  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# _resolve_thread_by_id
-# ---------------------------------------------------------------------------
-
-
-async def test_resolve_thread_no_guild_returns_none():
-    channel = MagicMock()
-    channel.guild = None
-    assert await _resolve_thread_by_id(channel, 9999) is None
-
-
-async def test_resolve_thread_returns_cached_thread():
-    thread = _thread(thread_id=9999)
-    channel = MagicMock()
-    channel.guild.get_thread = MagicMock(return_value=thread)
-    channel.guild.fetch_channel = AsyncMock()
-
-    result = await _resolve_thread_by_id(channel, 9999)
-
-    assert result is thread
-    channel.guild.fetch_channel.assert_not_awaited()
-
-
-async def test_resolve_thread_fetches_when_not_cached():
-    thread = _thread(thread_id=9999)
-    channel = MagicMock()
-    channel.guild.get_thread = MagicMock(return_value=None)
-    channel.guild.fetch_channel = AsyncMock(return_value=thread)
-
-    result = await _resolve_thread_by_id(channel, 9999)
-
-    assert result is thread
-    channel.guild.fetch_channel.assert_awaited_once_with(9999)
-
-
-async def test_resolve_thread_non_thread_channel_returns_none():
-    not_a_thread = MagicMock(spec=discord.TextChannel)
-    channel = MagicMock()
-    channel.guild.get_thread = MagicMock(return_value=None)
-    channel.guild.fetch_channel = AsyncMock(return_value=not_a_thread)
-
-    assert await _resolve_thread_by_id(channel, 9999) is None
-
-
-async def test_resolve_thread_fetch_error_returns_none():
-    channel = MagicMock()
-    channel.guild.get_thread = MagicMock(return_value=None)
-    channel.guild.fetch_channel = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
-
-    assert await _resolve_thread_by_id(channel, 9999) is None

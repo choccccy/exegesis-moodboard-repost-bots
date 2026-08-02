@@ -21,8 +21,14 @@ from bot.discord_ingest.service import (
     handle_playlist_opt_out,
 )
 from bot.models import SubmissionLink, YoutubePlaylistAdd
+from bot.curation.events import ReactionEvent
 
 from conftest import MockDest, make_submission
+
+
+def _reaction_event(user_id: int, message_id: int, *, member=None, channel_id: int = 100):
+    return ReactionEvent(user_id=user_id, message_id=message_id, channel_id=channel_id,
+                         emoji="\N{BLACK SQUARE FOR STOP}", member=member)
 
 
 def _board_cfg(board, *, playlist_id="PL_test123", curator_user_ids=None) -> BoardConfig:
@@ -261,8 +267,7 @@ async def test_opt_out_unknown_prompt_message_ignored(session, board):
     settings = _opt_out_settings(board, _board_cfg(board))
     # No submission has playlist_opt_out_message_id == 12345; must return quietly.
     await handle_playlist_opt_out(
-        session, message_id=12345, user_id=999, member=None,
-        channel=MockDest(), settings=settings, yt_client=_yt_client(),
+        session, _reaction_event(999, 12345), MockDest(), settings, yt_client=_yt_client(),
     )
 
 
@@ -274,8 +279,7 @@ async def test_opt_out_before_add_marks_skipped(session, board):
     settings = _opt_out_settings(board, _board_cfg(board))
 
     await handle_playlist_opt_out(
-        session, message_id=777, user_id=sub.author_id, member=None,
-        channel=MockDest(), settings=settings, yt_client=yt,
+        session, _reaction_event(sub.author_id, 777), MockDest(), settings, yt_client=yt,
     )
 
     assert sub.playlist_skipped is True
@@ -292,8 +296,7 @@ async def test_opt_out_after_add_removes_from_playlist(session, board):
     settings = _opt_out_settings(board, _board_cfg(board))
 
     await handle_playlist_opt_out(
-        session, message_id=778, user_id=sub.author_id, member=None,
-        channel=dest, settings=settings, yt_client=yt,
+        session, _reaction_event(sub.author_id, 778), dest, settings, yt_client=yt,
     )
 
     assert sub.playlist_skipped is True
@@ -311,8 +314,7 @@ async def test_opt_out_unauthorized_user_ignored(session, board):
     settings = _opt_out_settings(board, _board_cfg(board))
 
     await handle_playlist_opt_out(
-        session, message_id=779, user_id=555, member=None,
-        channel=MockDest(), settings=settings, yt_client=yt,
+        session, _reaction_event(555, 779), MockDest(), settings, yt_client=yt,
     )
 
     assert sub.playlist_skipped is False
@@ -322,8 +324,6 @@ async def test_opt_out_unauthorized_user_ignored(session, board):
 
 async def test_opt_out_on_queued_submission_reschedules_archive(session, board):
     """Opting out of a QUEUED submission with an open thread schedules archival."""
-    import discord
-
     sub = make_submission(
         board,
         state=SubmissionState.QUEUED.value,
@@ -334,21 +334,15 @@ async def test_opt_out_on_queued_submission_reschedules_archive(session, board):
     session.add(sub)
     await session.flush()
 
-    thread = MagicMock(spec=discord.Thread)
-    thread.archived = False
-    channel = MagicMock()
-    channel.guild.get_thread = MagicMock(return_value=thread)
+    dest = MockDest()
     settings = _opt_out_settings(board, _board_cfg(board))
 
-    with patch("bot.discord_ingest.service._fire_and_forget") as mock_fnf:
-        await handle_playlist_opt_out(
-            session, message_id=785, user_id=sub.author_id, member=None,
-            channel=channel, settings=settings, yt_client=_yt_client(),
-        )
+    await handle_playlist_opt_out(
+        session, _reaction_event(sub.author_id, 785), dest, settings, yt_client=_yt_client(),
+    )
 
     assert sub.playlist_skipped is True
-    mock_fnf.assert_called_once()
-    mock_fnf.call_args.args[0].close()  # avoid a never-awaited coroutine warning
+    assert len(dest.archive_delays) == 1  # archival scheduled through the port
 
 
 async def test_opt_out_explicit_curator_allowed(session, board):
@@ -359,8 +353,7 @@ async def test_opt_out_explicit_curator_allowed(session, board):
     settings = _opt_out_settings(board, cfg)
 
     await handle_playlist_opt_out(
-        session, message_id=780, user_id=555, member=None,
-        channel=MockDest(), settings=settings, yt_client=_yt_client(),
+        session, _reaction_event(555, 780), MockDest(), settings, yt_client=_yt_client(),
     )
 
     assert sub.playlist_skipped is True

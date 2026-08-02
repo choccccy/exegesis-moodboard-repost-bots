@@ -19,6 +19,8 @@ from ..models import ConfirmationRequest, Submission, SubmissionThread
 from ..moderation import GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
 from . import gateway, replies, service
+from ..curation.events import ReactionEvent
+from ..curation.surface import NullSurface
 from .replies import CANCEL_EMOJI
 
 log = logging.getLogger(__name__)
@@ -329,31 +331,22 @@ class RepostBot(discord.Client):
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
+            surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
                 await service.handle_label_reaction(
-                    session,
-                    settings=self.settings,
-                    channel=channel,
-                    message_id=payload.message_id,
-                    emoji=emoji,
-                    member=payload.member,
-                    user_id=payload.user_id,
-                    yt_client=self._yt_client,
+                    session, gateway.to_reaction_event(payload), surface,
+                    self.settings, yt_client=self._yt_client,
                 )
 
         if emoji == replies.METADATA_CONFIRM_EMOJI:
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
+            surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
                 await service.handle_metadata_reaction(
-                    session,
-                    settings=self.settings,
-                    channel=channel,
-                    message_id=payload.message_id,
-                    member=payload.member,
-                    user_id=payload.user_id,
-                    yt_client=self._yt_client,
+                    session, gateway.to_reaction_event(payload), surface,
+                    self.settings, yt_client=self._yt_client,
                 )
 
         if emoji == CANCEL_EMOJI:
@@ -361,73 +354,43 @@ class RepostBot(discord.Client):
             if channel is None:
                 return
             if payload.channel_id in self._watched_channels:
-                # ❌ on the original source post - OP or curator can cancel
+                # ❌ on the original source post - OP or curator can cancel. The thread
+                # (where notices go) is resolved up front so the handler routes all its
+                # outbound work through the port.
+                surface = await self._thread_surface_for_source(payload.channel_id, payload.message_id)
                 async with session_scope() as session:
-                    thread_id, cancelled_sub, removed_videos = await service.handle_source_cancel_reaction(
-                        session,
-                        settings=self.settings,
-                        channel=channel,
-                        message_id=payload.message_id,
-                        member=payload.member,
-                        user_id=payload.user_id,
-                        yt_client=self._yt_client,
+                    await service.handle_source_cancel_reaction(
+                        session, gateway.to_reaction_event(payload), surface,
+                        self.settings, yt_client=self._yt_client,
                     )
-                if thread_id is not None:
-                    thread = await self._resolve_channel(thread_id)
-                    if thread is not None:
-                        if cancelled_sub:
-                            await thread.send(replies.source_cancel_confirmation(payload.user_id))
-                            if isinstance(thread, discord.Thread):
-                                await service._archive_thread(thread, notice=replies.closing_notice("submission cancelled"))
-                        for video_id in removed_videos:
-                            await thread.send(
-                                f"<@{payload.user_id}> removed https://youtu.be/{video_id} from the playlist via ❌ on the source post"
-                            )
             else:
                 # ❌ on a bot message inside a thread - submission cancel button
+                surface = gateway.surface_for_channel(channel, self)
                 async with session_scope() as session:
-                    source_info = await service.handle_cancel_reaction(
-                        session,
-                        settings=self.settings,
-                        channel=channel,
-                        message_id=payload.message_id,
-                        member=payload.member,
-                        user_id=payload.user_id,
+                    await service.handle_cancel_reaction(
+                        session, gateway.to_reaction_event(payload), surface, self.settings,
                     )
-                if source_info is not None:
-                    src_channel_id, src_message_id = source_info
-                    src_channel = await self._resolve_channel(src_channel_id)
-                    if src_channel is not None:
-                        await service._clear_trigger_reaction(src_channel, src_message_id, self.settings.trigger_emoji)
 
         if emoji == replies.PLAYLIST_OPT_OUT_EMOJI:
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
+            surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
                 await service.handle_playlist_opt_out(
-                    session,
-                    message_id=payload.message_id,
-                    user_id=payload.user_id,
-                    member=payload.member,
-                    channel=channel,
-                    settings=self.settings,
-                    yt_client=self._yt_client,
+                    session, gateway.to_reaction_event(payload), surface,
+                    self.settings, yt_client=self._yt_client,
                 )
 
         if emoji == replies.CONFIRMATION_EMOJI:
             channel = await self._resolve_channel(payload.channel_id)
             if channel is None:
                 return
+            surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
                 await service.handle_confirmation_reaction(
-                    session,
-                    settings=self.settings,
-                    channel=channel,
-                    message_id=payload.message_id,
-                    member=payload.member,
-                    user_id=payload.user_id,
-                    yt_client=self._yt_client,
+                    session, gateway.to_reaction_event(payload), surface,
+                    self.settings, yt_client=self._yt_client,
                 )
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
@@ -438,15 +401,16 @@ class RepostBot(discord.Client):
         channel = await self._resolve_channel(payload.channel_id)
         if channel is None:
             return
+        # Reaction-remove payloads carry no member, so resolve it here for role authz;
+        # the notice goes to the submission's thread, resolved up front.
+        member = await self._resolve_member(channel, payload.user_id)
+        surface = await self._thread_surface_for_source(payload.channel_id, payload.message_id)
+        event = ReactionEvent(
+            user_id=payload.user_id, message_id=payload.message_id,
+            channel_id=payload.channel_id, emoji=str(payload.emoji), member=member,
+        )
         async with session_scope() as session:
-            await service.handle_reaction_removed(
-                session,
-                settings=self.settings,
-                channel=channel,
-                channel_id=payload.channel_id,
-                message_id=payload.message_id,
-                user_id=payload.user_id,
-            )
+            await service.handle_reaction_removed(session, event, surface, self.settings)
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
         """A submission thread was deleted - purge the orphaned open submission so it
@@ -467,12 +431,10 @@ class RepostBot(discord.Client):
             return  # only replies can answer a request
         if not self._is_watched_location(message.channel):
             return
+        surface = gateway.surface_for_channel(message.channel, self)
         async with session_scope() as session:
             await service.handle_reply(
-                session,
-                settings=self.settings,
-                message=message,
-                http_client=self.httpx_client,
+                session, gateway.to_reply_event(message), surface, self.settings, self.httpx_client,
             )
 
     async def _handle_scan_slash(self, interaction: discord.Interaction, days: int) -> None:
@@ -764,6 +726,42 @@ class RepostBot(discord.Client):
                 return None
         return channel
 
+    async def _resolve_member(self, channel, user_id: int):
+        """Resolve a guild member for role-based authz (used where the event carries
+        no member, e.g. reaction-remove). Returns None if the user can't be resolved."""
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return None
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return None
+
+    async def _thread_surface_for_source(self, source_channel_id: int, source_message_id: int):
+        """Resolve the submission thread mapped to a source post and wrap it as a Surface,
+        so the react-on-source handlers post/archive through the port. NullSurface if the
+        source has no (resolvable) thread."""
+        async with session_scope() as session:
+            board = await service._board_for_channel(session, source_channel_id)
+            if board is None:
+                return NullSurface()
+            mapping = await session.scalar(
+                select(SubmissionThread).where(
+                    SubmissionThread.board_id == board.id,
+                    SubmissionThread.source_discord_message_id == source_message_id,
+                )
+            )
+            thread_id = mapping.thread_id if mapping else None
+        if not thread_id:
+            return NullSurface()
+        thread = await self._resolve_channel(thread_id)
+        if thread is None:
+            return NullSurface()
+        return gateway.surface_for_channel(thread, self)
+
     async def _channel_is_deleted(self, channel_id: int) -> bool:
         """Definitively confirm a channel/thread no longer exists (404). Distinguishes a
         genuine deletion from a transient/permission error so callers don't purge on a blip."""
@@ -923,6 +921,7 @@ class RepostBot(discord.Client):
                     if purged is not None:
                         log.info("purged submission %s: thread %s gone (catch-up)", purged, thread_id)
                 continue
+            replay_surface = gateway.surface_for_channel(thread, self)
             try:
                 async for message in thread.history(limit=None, oldest_first=True):  # type: ignore[union-attr]
                     bot_id = getattr(self.user, "id", None)
@@ -934,53 +933,47 @@ class RepostBot(discord.Client):
                                 async for user in reaction.users():
                                     if user.id == bot_id:
                                         continue
+                                    event = ReactionEvent(
+                                        user_id=user.id, message_id=message.id,
+                                        channel_id=thread.id, emoji=emoji, member=None,
+                                    )
                                     async with session_scope() as session:
                                         await service.handle_label_reaction(
-                                            session,
-                                            settings=self.settings,
-                                            channel=thread,
-                                            message_id=message.id,
-                                            emoji=emoji,
-                                            member=None,
-                                            user_id=user.id,
+                                            session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
                             elif emoji == replies.METADATA_CONFIRM_EMOJI:
                                 async for user in reaction.users():
                                     if user.id == bot_id:
                                         continue
+                                    event = ReactionEvent(
+                                        user_id=user.id, message_id=message.id,
+                                        channel_id=thread.id, emoji=emoji, member=None,
+                                    )
                                     async with session_scope() as session:
                                         await service.handle_metadata_reaction(
-                                            session,
-                                            settings=self.settings,
-                                            channel=thread,
-                                            message_id=message.id,
-                                            member=None,
-                                            user_id=user.id,
+                                            session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
                             elif emoji == CANCEL_EMOJI:
                                 async for user in reaction.users():
                                     if user.id == bot_id:
                                         continue
+                                    event = ReactionEvent(
+                                        user_id=user.id, message_id=message.id,
+                                        channel_id=thread.id, emoji=emoji, member=None,
+                                    )
                                     async with session_scope() as session:
                                         await service.handle_cancel_reaction(
-                                            session,
-                                            settings=self.settings,
-                                            channel=thread,
-                                            message_id=message.id,
-                                            member=None,
-                                            user_id=user.id,
+                                            session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
                     elif message.reference is not None:
                         # Replay human replies (alt text, source, etc.).
                         async with session_scope() as session:
                             await service.handle_reply(
-                                session,
-                                settings=self.settings,
-                                message=message,
-                                http_client=self.httpx_client,
+                                session, gateway.to_reply_event(message), replay_surface,
+                                self.settings, self.httpx_client,
                             )
                         replayed += 1
             except (discord.Forbidden, discord.HTTPException) as exc:

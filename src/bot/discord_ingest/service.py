@@ -69,9 +69,9 @@ from ..state import (
 from ..curation.surface import NullSurface, Surface
 from ..curation.types import InboundAttachment, InboundMessage
 from . import prompts, render, replies
-from ..curation.events import InteractionEvent
+from ..curation.events import InteractionEvent, ReactionEvent, ReplyEvent
 from ..curation.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
-from .adapters import discord_attachment_to_inbound, discord_message_to_inbound
+from .adapters import discord_message_to_inbound
 from .discord_notifier import DiscordSurface
 from .urls import extract_urls, is_discord_internal_url
 from ..curation.components import PreviewImage
@@ -414,6 +414,9 @@ async def handle_reaction(
             log.warning("could not create/resolve thread for submission %s", submission_id)
             return False
 
+        # The thread now exists; the rest of the flow talks to it through the port.
+        surface = _ensure_surface(thread)
+
         # Beat 4a (DB): is this new submission a duplicate? Detect + tear it down.
         dup_notice = None
         if created:
@@ -424,18 +427,21 @@ async def handle_reaction(
                 dup_notice = await _detect_and_teardown_duplicate(session, settings, message, submission)
 
         if dup_notice is not None:
-            # Beat 4b (I/O, lock released): post the notice, clear the 🦋, archive.
+            # Beat 4b (I/O, lock released): post the notice, clear the 🦋 on the source
+            # post, archive the thread. The notice send is best-effort - a failure must
+            # NOT skip the trigger-clear + archive teardown. clear_trigger stays direct:
+            # the orchestrator holds the source channel and builds no client-backed surface.
             try:
-                await thread.send(dup_notice)
+                await surface.send(dup_notice)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 log.warning("could not post duplicate notice for message %s: %s", message.id, exc)
             await _clear_trigger_reaction(message.channel, message.id, settings.trigger_emoji)
-            await _archive_thread(thread)
+            await surface.archive()
             return False
 
         # Beat 4c (lock released): recompute is self-managing (its sends run off the lock).
         await recompute_and_request(
-            submission_id, settings=settings, destination=thread, yt_client=yt_client, bot_id=bot_id,
+            submission_id, settings=settings, destination=surface, yt_client=yt_client, bot_id=bot_id,
         )
         return new_thread
 
@@ -719,32 +725,31 @@ async def _resolve_thread(
 
 async def handle_reaction_removed(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    channel_id: int,
-    message_id: int,
-    user_id: int,
 ) -> None:
     """A 🦋 was removed: delete the prospective post so a re-react starts fresh.
 
     Only curators (by role or explicit user ID) may trigger deletion this way.
-    The OP can cancel via the ❌ button in the thread instead.
+    The OP can cancel via the ❌ button in the thread instead. `surface` is the
+    submission's thread (resolved by the gateway); `event.member` is resolved by the
+    gateway because reaction-remove payloads carry no member.
 
     Deletes the submission, its links/attachments/requests, and the downloaded
     files, then posts a short notice. Re-adding 🦋 re-runs ingest via
     handle_reaction (get-or-create will create a new submission).
     """
-    board = await _board_for_channel(session, channel_id)
+    board = await _board_for_channel(session, event.channel_id)
     if board is None:
         return
-    board_cfg = settings.board_for_channel(channel_id)
-    if not await _curator_authorized(channel, user_id, board_cfg):
+    board_cfg = settings.board_for_channel(event.channel_id)
+    if not _is_curator(event.member, event.user_id, board_cfg):
         return  # only curators can cancel via butterfly removal; OP uses the ❌ button
     submission = await session.scalar(
         select(Submission).where(
             Submission.board_id == board.id,
-            Submission.source_discord_message_id == message_id,
+            Submission.source_discord_message_id == event.message_id,
         )
     )
     if submission is None:
@@ -752,57 +757,45 @@ async def handle_reaction_removed(
 
     # Block removal of already-published submissions to prevent duplicate posts.
     if submission.state == SubmissionState.PUBLISHED.value:
-        thread = await _resolve_thread_by_id(channel, submission.thread_id) if submission.thread_id else None
-        if thread is not None:
-            attempt = await session.scalar(
-                select(PublishAttempt)
-                .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
-                .order_by(PublishAttempt.attempted_at.desc())
-            )
-            board_cfg = settings.board_for_channel(channel_id)
-            if attempt and attempt.bsky_url:
-                bsky_url = attempt.bsky_url
-            elif attempt and attempt.at_uri:
-                bsky_url = publisher.at_uri_to_url(attempt.at_uri, board_cfg.bluesky_handle if board_cfg else None)
-            else:
-                bsky_url = "Bluesky"
-            await thread.send(replies.cannot_remove_published(bsky_url))
+        attempt = await session.scalar(
+            select(PublishAttempt)
+            .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
+            .order_by(PublishAttempt.attempted_at.desc())
+        )
+        if attempt and attempt.bsky_url:
+            bsky_url = attempt.bsky_url
+        elif attempt and attempt.at_uri:
+            bsky_url = publisher.at_uri_to_url(attempt.at_uri, board_cfg.bluesky_handle if board_cfg else None)
+        else:
+            bsky_url = "Bluesky"
+        await surface.send(replies.cannot_remove_published(bsky_url))
         return
 
     sub_id = submission.id
-    thread_id = submission.thread_id
     remove_submission_dir(settings.attachments_dir, board.id, sub_id)
     await _delete_submission_cascade(session, sub_id)
-    log.info("deleted submission %s after 🦋 removal on message %s", sub_id, message_id)
+    log.info("deleted submission %s after 🦋 removal on message %s", sub_id, event.message_id)
 
     # Notice goes in the thread (never the main channel). The thread is kept and
     # reused if the 🦋 is re-added, so we don't spam the channel with new threads.
-    thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
-    if thread is not None:
-        await thread.send(replies.reaction_removed())
-        await _archive_thread(thread, notice=replies.closing_notice("submission removed"))
-    else:
-        log.info("no thread to notify for removed submission %s", sub_id)
+    await surface.send(replies.reaction_removed())
+    await surface.archive(notice=replies.closing_notice("submission removed"))
 
 
 async def handle_label_reaction(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    message_id: int,
-    emoji: str,
-    member: discord.Member | None,
-    user_id: int,
     yt_client=None,
 ) -> None:
     """A curator reacted ✅/❌ on a graphic-classification request message."""
     req = await session.scalar(
-        select(ContentLabelRequest).where(ContentLabelRequest.bot_message_id == message_id)
+        select(ContentLabelRequest).where(ContentLabelRequest.bot_message_id == event.message_id)
     )
     if req is None or req.answered_at is not None:
         return
-    status = graphic_from_emoji(emoji)
+    status = graphic_from_emoji(event.emoji)
     if status is None:
         return
 
@@ -810,31 +803,28 @@ async def handle_label_reaction(
     if submission is None:
         return
     board_cfg = settings.board_for_channel(submission.channel_id)
-    if not _reaction_authorized(member, user_id, submission, board_cfg):
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
         return
 
     submission.graphic_status = status.value
-    req.answer = emoji
-    req.answered_by = user_id
+    req.answer = event.emoji
+    req.answered_by = event.user_id
     req.answered_at = _now()
-    # The reaction is on a message in the thread, so `channel` is the thread.
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    # The reaction is on a message in the thread, so `surface` is the thread.
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
 
 
 async def handle_metadata_reaction(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    message_id: int,
-    member: discord.Member | None,
-    user_id: int,
     yt_client=None,
 ) -> None:
     """A curator reacted 🔗 on a metadata-request message - confirm this is the best link."""
     req = await session.scalar(
         select(MetadataRequest).where(
-            MetadataRequest.bot_message_id == message_id,
+            MetadataRequest.bot_message_id == event.message_id,
             MetadataRequest.answered_at.is_(None),
         )
     )
@@ -844,14 +834,14 @@ async def handle_metadata_reaction(
     if submission is None:
         return
     board_cfg = settings.board_for_channel(submission.channel_id)
-    if not _reaction_authorized(member, user_id, submission, board_cfg):
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
         return
 
     req.answer = "confirmed"
-    req.answered_by = user_id
+    req.answered_by = event.user_id
     req.answered_at = _now()
-    await channel.send(replies.metadata_confirmed())
-    await recompute_and_request(submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session)
+    await surface.send(replies.metadata_confirmed())
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session)
 
 
 def _gap_summary(gaps) -> str:
@@ -861,18 +851,15 @@ def _gap_summary(gaps) -> str:
 
 async def handle_confirmation_reaction(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    message_id: int,
-    member: discord.Member | None,
-    user_id: int,
     yt_client=None,
 ) -> bool:
     """A curator or OP reacted ✅ on the confirmation prompt - queue the submission."""
     req = await session.scalar(
         select(ConfirmationRequest).where(
-            ConfirmationRequest.bot_message_id == message_id,
+            ConfirmationRequest.bot_message_id == event.message_id,
             ConfirmationRequest.confirmed_at.is_(None),
         )
     )
@@ -882,7 +869,7 @@ async def handle_confirmation_reaction(
     if submission is None or submission.state in _QUEUE_TERMINAL:
         return False
     board_cfg = settings.board_for_channel(submission.channel_id)
-    if not _reaction_authorized(member, user_id, submission, board_cfg):
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
         return False
 
     # Re-validate gaps at react time: a gap (e.g. alt text for a late-added image) may have
@@ -892,18 +879,15 @@ async def handle_confirmation_reaction(
     if gaps:
         log.info("refusing to queue submission %s via ✅: gaps reopened (%s)", submission.id, _gap_summary(gaps))
         await recompute_and_request(
-            submission.id, settings=settings, destination=channel, yt_client=yt_client, ambient_session=session
+            submission.id, settings=settings, destination=surface, yt_client=yt_client, ambient_session=session
         )
-        try:
-            await channel.send(replies.queue_blocked_notice(_gap_summary(gaps)))
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+        await surface.send(replies.queue_blocked_notice(_gap_summary(gaps)))
         return False
 
     req.confirmed_at = _now()
-    req.confirmed_by = user_id
+    req.confirmed_by = event.user_id
     submission.state = SubmissionState.QUEUED.value
-    log.info("submission %s queued by %s via ✅ confirmation", submission.id, user_id)
+    log.info("submission %s queued by %s via ✅ confirmation", submission.id, event.user_id)
     videos_added = 0
     if not submission.playlist_skipped:
         videos_added = await _auto_add_to_playlist(
@@ -913,19 +897,18 @@ async def handle_confirmation_reaction(
     queue_url = (
         f"https://dashboard.exegesis.space/boards/{board_cfg.name}" if board_cfg else None
     )
-    await channel.send(replies.queued_notice(
+    await surface.send(replies.queued_notice(
         bluesky_handle=board_cfg.bluesky_handle if board_cfg else None,
         dashboard_url=queue_url,
         youtube_playlist_id=board_cfg.youtube_playlist_id if board_cfg else None,
         videos_added=videos_added,
     ))
-    if isinstance(channel, discord.Thread):
-        if await _playlist_close_ready(
-            session, submission.board_id,
-            submission.source_discord_message_id, board_cfg,
-            playlist_skipped=submission.playlist_skipped,
-        ):
-            _archive_thread_after_delay(channel, notice=replies.closing_notice("queued"))
+    if await _playlist_close_ready(
+        session, submission.board_id,
+        submission.source_discord_message_id, board_cfg,
+        playlist_skipped=submission.playlist_skipped,
+    ):
+        surface.archive_after_delay(notice=replies.closing_notice("queued"))
     return True
 
 
@@ -956,112 +939,76 @@ def _reaction_authorized(
     return _is_curator(member, user_id, board_cfg)
 
 
-async def _curator_authorized(
-    channel: discord.abc.Messageable,
-    user_id: int,
-    board_cfg: BoardConfig | None,
-) -> bool:
-    """Check curator status for contexts where member object is unavailable (reaction remove)."""
-    if board_cfg is None:
-        return False
-    if user_id in board_cfg.curator_user_ids:
-        return True
-    guild = getattr(channel, "guild", None)
-    if guild is None:
-        return False
-    try:
-        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
-    except (discord.NotFound, discord.HTTPException):
-        return False
-    role_ids = {r.id for r in member.roles}
-    return any(rid in role_ids for rid in board_cfg.curator_role_ids)
-
-
 async def handle_cancel_reaction(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    message_id: int,
-    member: discord.Member | None,
-    user_id: int,
-) -> tuple[int, int] | None:
-    """❌ was reacted on a cancel-request message: delete the submission if authorized.
-
-    Returns (source_channel_id, source_message_id) so the caller can clear the
-    trigger reaction from the source post, or None if no cancellation occurred.
-    """
+) -> None:
+    """❌ was reacted on a cancel-request message inside a thread: delete the submission
+    if authorized. The reaction is in the thread, so `surface` is the thread; it also
+    clears the trigger reaction from the source post via the port."""
     req = await session.scalar(
-        select(CancellationRequest).where(CancellationRequest.bot_message_id == message_id)
+        select(CancellationRequest).where(CancellationRequest.bot_message_id == event.message_id)
     )
     if req is None:
-        return None
+        return
 
     submission = await session.get(Submission, req.submission_id)
     if submission is None:
-        return None
+        return
 
     board_cfg = settings.board_for_channel(submission.channel_id)
-    if not _reaction_authorized(member, user_id, submission, board_cfg):
-        return None
+    if not _reaction_authorized(event.member, event.user_id, submission, board_cfg):
+        return
 
     if submission.state == SubmissionState.PUBLISHED.value:
-        thread = await _resolve_thread_by_id(channel, submission.thread_id) if submission.thread_id else None
-        if thread is not None:
-            attempt = await session.scalar(
-                select(PublishAttempt)
-                .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
-                .order_by(PublishAttempt.attempted_at.desc())
-            )
-            bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
-            await thread.send(replies.cannot_remove_published(bsky_url))
-        return None
+        attempt = await session.scalar(
+            select(PublishAttempt)
+            .where(PublishAttempt.submission_id == submission.id, PublishAttempt.success.is_(True))
+            .order_by(PublishAttempt.attempted_at.desc())
+        )
+        bsky_url = attempt.bsky_url if attempt and attempt.bsky_url else "Bluesky"
+        await surface.send(replies.cannot_remove_published(bsky_url))
+        return
 
     sub_id = submission.id
     source_channel_id = submission.channel_id
     source_message_id = submission.source_discord_message_id
-    thread_id = submission.thread_id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
     await _delete_submission_cascade(session, sub_id)
-    log.info("deleted submission %s after ❌ cancel by user %s", sub_id, user_id)
+    log.info("deleted submission %s after ❌ cancel by user %s", sub_id, event.user_id)
 
-    thread = await _resolve_thread_by_id(channel, thread_id) if thread_id else None
-    if thread is not None:
-        await thread.send(replies.reaction_removed())
-        await _archive_thread(thread, notice=replies.closing_notice("submission cancelled"))
-
-    return source_channel_id, source_message_id
+    await surface.send(replies.reaction_removed())
+    await surface.archive(notice=replies.closing_notice("submission cancelled"))
+    await surface.clear_trigger(source_channel_id, source_message_id, settings.trigger_emoji)
 
 
 async def handle_source_cancel_reaction(
     session: AsyncSession,
-    *,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    channel: discord.abc.Messageable,
-    message_id: int,
-    member: discord.Member | None,
-    user_id: int,
     yt_client=None,
-) -> tuple[int | None, bool, list[str]]:
+) -> None:
     """❌ reacted on the original source post: cancel the submission and/or playlist add if OP or curator.
 
-    Returns (thread_id, cancelled_submission, removed_video_ids).
-    thread_id is None if there's no thread to notify.
-    """
-    board = await _board_for_channel(session, channel.id)
+    `surface` is the submission's thread (resolved by the gateway), used for the
+    cancellation confirmation + per-video removal notices; the trigger reaction on the
+    source post is cleared through the same port."""
+    board = await _board_for_channel(session, event.channel_id)
     if board is None:
-        return None
-    board_cfg = settings.board_for_channel(channel.id)
+        return
+    board_cfg = settings.board_for_channel(event.channel_id)
 
-    is_explicit_curator = board_cfg is not None and user_id in board_cfg.curator_user_ids
+    is_explicit_curator = board_cfg is not None and event.user_id in board_cfg.curator_user_ids
     is_role_curator = (
-        member is not None
+        event.member is not None
         and board_cfg is not None
-        and any(r.id in board_cfg.curator_role_ids for r in member.roles)
+        and any(r.id in board_cfg.curator_role_ids for r in event.member.roles)
     )
 
-    thread_id: int | None = None
     cancelled_submission = False
     removed_video_ids: list[str] = []
 
@@ -1069,30 +1016,29 @@ async def handle_source_cancel_reaction(
     submission = await session.scalar(
         select(Submission).where(
             Submission.board_id == board.id,
-            Submission.source_discord_message_id == message_id,
+            Submission.source_discord_message_id == event.message_id,
         )
     )
     if submission is not None and submission.state != SubmissionState.PUBLISHED.value:
-        is_op = user_id == submission.author_id
+        is_op = event.user_id == submission.author_id
         if is_op or is_explicit_curator or is_role_curator:
-            thread_id = thread_id or submission.thread_id
             sub_id = submission.id
             remove_submission_dir(settings.attachments_dir, board.id, sub_id)
             await _delete_submission_cascade(session, sub_id)
-            log.info("deleted submission %s after source-post ❌ by user %s", sub_id, user_id)
+            log.info("deleted submission %s after source-post ❌ by user %s", sub_id, event.user_id)
             cancelled_submission = True
-            await _clear_trigger_reaction(channel, message_id, settings.trigger_emoji)
+            await surface.clear_trigger(event.channel_id, event.message_id, settings.trigger_emoji)
 
     # Cancel any playlist addition(s) for this source message.
     playlist_rows = list(await session.scalars(
         select(YoutubePlaylistAdd).where(
             YoutubePlaylistAdd.board_id == board.id,
-            YoutubePlaylistAdd.source_discord_message_id == message_id,
+            YoutubePlaylistAdd.source_discord_message_id == event.message_id,
             YoutubePlaylistAdd.success.is_(True),
         )
     ))
     for row in playlist_rows:
-        is_requester = user_id == row.discord_requester_id
+        is_requester = event.user_id == row.discord_requester_id
         if not (is_requester or is_explicit_curator or is_role_curator):
             continue
         if row.playlist_item_id and yt_client is not None:
@@ -1105,19 +1051,17 @@ async def handle_source_cancel_reaction(
         removed_video_ids.append(row.video_id)
 
     if not cancelled_submission and not removed_video_ids:
-        return None, False, []
+        return
 
-    # Find thread_id from SubmissionThread if not already known.
-    if thread_id is None:
-        mapping = await session.scalar(
-            select(SubmissionThread).where(
-                SubmissionThread.board_id == board.id,
-                SubmissionThread.source_discord_message_id == message_id,
-            )
+    # Notify the thread (a no-op if the submission has no resolvable thread).
+    if cancelled_submission:
+        await surface.send(replies.source_cancel_confirmation(event.user_id))
+        await surface.archive(notice=replies.closing_notice("submission cancelled"))
+    for video_id in removed_video_ids:
+        await surface.send(
+            f"<@{event.user_id}> removed https://youtu.be/{video_id} "
+            "from the playlist via ❌ on the source post"
         )
-        thread_id = mapping.thread_id if mapping else None
-
-    return thread_id, cancelled_submission, removed_video_ids
 
 
 async def _auto_add_to_playlist(
@@ -1185,7 +1129,7 @@ async def _auto_add_to_playlist(
 
 async def _do_playlist_remove(
     row: YoutubePlaylistAdd,
-    destination: discord.abc.Messageable,
+    destination: Surface,
     session: AsyncSession,
     yt_client,
 ) -> None:
@@ -1204,17 +1148,14 @@ async def _do_playlist_remove(
 
 async def handle_playlist_opt_out(
     session: AsyncSession,
-    *,
-    message_id: int,
-    user_id: int,
-    member: discord.Member | None,
-    channel: discord.abc.Messageable,
+    event: ReactionEvent,
+    surface: Surface,
     settings: Settings,
-    yt_client,
+    yt_client=None,
 ) -> None:
     """⏹️ reacted on the playlist opt-out prompt: mark skipped and remove if already added."""
     submission = await session.scalar(
-        select(Submission).where(Submission.playlist_opt_out_message_id == message_id)
+        select(Submission).where(Submission.playlist_opt_out_message_id == event.message_id)
     )
     if submission is None:
         return
@@ -1222,12 +1163,12 @@ async def handle_playlist_opt_out(
     board = await session.get(Board, submission.board_id)
     board_cfg = settings.board_for_channel(board.discord_channel_id) if board else None
 
-    is_op = user_id == submission.author_id
-    if not (is_op or _is_curator(member, user_id, board_cfg)):
+    is_op = event.user_id == submission.author_id
+    if not (is_op or _is_curator(event.member, event.user_id, board_cfg)):
         return
 
     submission.playlist_skipped = True
-    log.info("submission %s playlist opted out by user %s", submission.id, user_id)
+    log.info("submission %s playlist opted out by user %s", submission.id, event.user_id)
 
     # Remove from playlist if auto-add already ran.
     playlist_rows = list(await session.scalars(
@@ -1238,24 +1179,23 @@ async def handle_playlist_opt_out(
         )
     ))
     for row in playlist_rows:
-        await _do_playlist_remove(row, channel, session, yt_client)
+        await _do_playlist_remove(row, surface, session, yt_client)
 
     # If submission is QUEUED and thread is still open, it's now safe to archive.
+    # (Re-arming an already-archived thread is a harmless no-op through the port.)
     if submission.state == SubmissionState.QUEUED.value and submission.thread_id:
-        resolved_thread = await _resolve_thread_by_id(channel, submission.thread_id)
-        if resolved_thread is not None and not resolved_thread.archived:
-            queued_at = submission.updated_at
-            if queued_at is not None and queued_at.tzinfo is None:
-                # Unreachable here in practice: playlist_skipped=True above dirties
-                # the row, so autoflush fires onupdate=_utcnow (tz-aware) before this
-                # read. Kept as defense in depth against future reorderings.
-                queued_at = queued_at.replace(tzinfo=timezone.utc)  # pragma: no cover
-            elapsed = (
-                (datetime.now(timezone.utc) - queued_at).total_seconds()
-                if queued_at else _THREAD_CLOSE_DELAY
-            )
-            remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
-            _fire_and_forget(_archive_thread_after_delay_seconds(resolved_thread, remaining))
+        queued_at = submission.updated_at
+        if queued_at is not None and queued_at.tzinfo is None:
+            # Unreachable here in practice: playlist_skipped=True above dirties
+            # the row, so autoflush fires onupdate=_utcnow (tz-aware) before this
+            # read. Kept as defense in depth against future reorderings.
+            queued_at = queued_at.replace(tzinfo=timezone.utc)  # pragma: no cover
+        elapsed = (
+            (datetime.now(timezone.utc) - queued_at).total_seconds()
+            if queued_at else _THREAD_CLOSE_DELAY
+        )
+        remaining = max(0.0, _THREAD_CLOSE_DELAY - elapsed)
+        surface.archive_after_delay(delay=remaining)
 
 
 async def handle_cancel_button(
@@ -1748,22 +1688,6 @@ async def apply_single_alt(
     if att is not None:
         _set_attachment_alt(att, value, edited_by)
         log.info("applied alt-text edit for attachment %s", attachment_id)
-
-
-async def _resolve_thread_by_id(
-    channel: discord.abc.Messageable, thread_id: int
-) -> discord.Thread | None:
-    guild = getattr(channel, "guild", None)
-    if guild is None:
-        return None
-    cached = guild.get_thread(thread_id)
-    if cached is not None:
-        return cached
-    try:
-        resolved = await guild.fetch_channel(thread_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return None
-    return resolved if isinstance(resolved, discord.Thread) else None
 
 
 async def reingest_submission(
@@ -3335,35 +3259,35 @@ async def _build_post_preview(
 
 
 def _is_authorized(
-    author: discord.Member | discord.User,
+    member: object | None,
+    user_id: int,
     submission: Submission,
     board_cfg: BoardConfig | None,
 ) -> bool:
-    if author.id == submission.author_id:
+    if user_id == submission.author_id:
         return True
     if board_cfg is None:
         return False
-    role_ids = {r.id for r in getattr(author, "roles", [])}
+    role_ids = {r.id for r in getattr(member, "roles", [])}
     return any(rid in role_ids for rid in board_cfg.curator_role_ids)
 
 
 async def handle_reply(
     session: AsyncSession,
-    *,
+    event: ReplyEvent,
+    surface: Surface,
     settings: Settings,
-    message: discord.Message,
     http_client: httpx.AsyncClient,
     yt_client=None,
 ) -> bool:
-    """If ``message`` answers one of our open requests, apply it. Returns handled?"""
-    ref = message.reference
-    if ref is None or ref.message_id is None:
-        return False
-    bot_msg_id = ref.message_id
+    """If ``event`` answers one of our open requests, apply it. Returns handled?
 
+    ``event`` carries the answered request's ``bot_message_id``, the replier
+    (``author_id``/``member``), and the reply content/attachments as an
+    ``InboundMessage``. All outbound nudges/notices go through ``surface``."""
     req = None
     for model in (SourceRequest, AttachmentAltTextRequest, ImageRequest, MetadataRequest, SupplementalImageRequest, SupplementalLinkRequest):
-        req = await session.scalar(select(model).where(model.bot_message_id == bot_msg_id))
+        req = await session.scalar(select(model).where(model.bot_message_id == event.bot_message_id))
         if req is not None:
             break
     if req is None:
@@ -3373,7 +3297,7 @@ async def handle_reply(
     if submission is None:
         return False
     board_cfg = settings.board_for_channel(submission.channel_id)
-    if not _is_authorized(message.author, submission, board_cfg):
+    if not _is_authorized(event.member, event.author_id, submission, board_cfg):
         return False  # silently ignore non-curators
 
     # Alt-text replies may overwrite a previous answer (fix a typo, rewrite); other
@@ -3381,12 +3305,12 @@ async def handle_reply(
     if req.answered_at is not None and not isinstance(req, AttachmentAltTextRequest):
         return True  # already satisfied; ignore duplicate
 
-    handled = await _apply_answer(session, req, submission, message, settings, http_client)
+    handled = await _apply_answer(session, req, submission, event, surface, settings, http_client)
     if not handled:
         return True  # we replied with a nudge; leave request open
 
     # Replies arrive in the submission's thread, so post follow-ups right there.
-    await recompute_and_request(submission.id, settings=settings, destination=message.channel, yt_client=yt_client, from_reply=True, ambient_session=session)
+    await recompute_and_request(submission.id, settings=settings, destination=surface, yt_client=yt_client, from_reply=True, ambient_session=session)
     return True
 
 
@@ -3394,39 +3318,39 @@ async def _apply_answer(
     session: AsyncSession,
     req,
     submission: Submission,
-    message: discord.Message,
+    event: ReplyEvent,
+    surface: Surface,
     settings: Settings,
     http_client: httpx.AsyncClient,
 ) -> bool:
     """Apply a single reply. Returns False if the answer was unusable (nudged)."""
     if isinstance(req, (ImageRequest, SupplementalImageRequest)):
         image_atts = [
-            a for a in message.attachments
+            a for a in event.message.attachments
             if is_image_attachment(a.content_type, a.filename)
             or is_video_attachment(a.content_type, a.filename)
         ]
         if not image_atts:
-            await message.reply(replies.media_not_found(), mention_author=False)
+            await surface.send(replies.media_not_found())
             return False
         for att in image_atts:
-            await _ingest_attachment_in_session(session, submission, discord_attachment_to_inbound(att), settings, http_client)
+            await _ingest_attachment_in_session(session, submission, att, settings, http_client)
 
     elif isinstance(req, SourceRequest):
-        urls = extract_urls(message.content)
+        urls = extract_urls(event.message.content)
         if not urls:
             # No URL in the reply. It might be a genuine non-URL source (an old magazine,
             # a historical document, etc.). Stash it as a candidate note and ask for
             # confirmation, so ordinary thread chatter is never silently taken as a source.
-            candidate = (message.content or "").strip()
+            candidate = (event.message.content or "").strip()
             if not candidate:
-                await message.reply(replies.source_not_found(), mention_author=False)
+                await surface.send(replies.source_not_found())
                 return False
             submission.source_note = candidate[:_SOURCE_NOTE_MAX]
             submission.source_note_confirmed = False
-            await message.reply(
+            await surface.send(
                 replies.source_note_confirm(submission.source_note),
-                view=render.render_components(prompts.source_note_confirm_components(submission.id)),
-                mention_author=False,
+                components=prompts.source_note_confirm_components(submission.id),
             )
             return False
         start = await session.scalar(
@@ -3450,9 +3374,9 @@ async def _apply_answer(
         await _resolve_links_in_session(session, submission, settings, http_client)
 
     elif isinstance(req, SupplementalLinkRequest):
-        urls = extract_urls(message.content)
+        urls = extract_urls(event.message.content)
         if not urls:
-            await message.reply(replies.supplemental_link_not_found(), mention_author=False)
+            await surface.send(replies.supplemental_link_not_found())
             return False
         start = await session.scalar(
             select(SubmissionLink.order_index)
@@ -3475,7 +3399,7 @@ async def _apply_answer(
         await _resolve_links_in_session(session, submission, settings, http_client)
 
     elif isinstance(req, AttachmentAltTextRequest):
-        body = (message.content or "").strip()
+        body = (event.message.content or "").strip()
         if not body:
             return False
         att = await session.get(Attachment, req.attachment_id)
@@ -3487,17 +3411,14 @@ async def _apply_answer(
             previous = att.alt_text_body
             att.alt_text_body = body
             att.alt_text_status = AltTextStatus.PROVIDED.value
-            att.alt_text_author = message.author.id
+            att.alt_text_author = event.author_id
             if overwrote:
-                try:
-                    await message.channel.send(replies.alt_text_overwritten(att.filename, previous))
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    log.warning("could not post alt-overwrite notice for att %s: %s", att.id, exc)
+                await surface.send(replies.alt_text_overwritten(att.filename, previous))
 
     elif isinstance(req, MetadataRequest):
-        urls = extract_urls(message.content)
+        urls = extract_urls(event.message.content)
         if not urls:
-            await message.reply(replies.metadata_url_not_found(), mention_author=False)
+            await surface.send(replies.metadata_url_not_found())
             return False
         new_raw = urls[0]
         canon = canonicalize(new_raw)
@@ -3517,10 +3438,10 @@ async def _apply_answer(
             primary.resolved_image_url = None
             primary.resolved_image_path = None
             primary.resolved_via = None
-        await message.reply(replies.metadata_link_updated(canon.canonical_url), mention_author=False)
+        await surface.send(replies.metadata_link_updated(canon.canonical_url))
         await _resolve_links_in_session(session, submission, settings, http_client)
 
-    req.answer = message.content
-    req.answered_by = message.author.id
+    req.answer = event.message.content
+    req.answered_by = event.author_id
     req.answered_at = _now()
     return True
