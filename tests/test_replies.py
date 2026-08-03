@@ -1,6 +1,6 @@
 """Tests for reply text functions (non-Discord, pure string output)."""
 
-from bot.discord_ingest import replies
+from bot.curation import replies
 
 
 def test_duplicate_warning_includes_url():

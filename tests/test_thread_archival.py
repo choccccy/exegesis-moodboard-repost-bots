@@ -12,13 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 
 import bot.discord_ingest.service as service
-from bot.discord_ingest.service import (
-    _archive_thread,
-    _archive_thread_after_delay_seconds,
-    _clear_trigger_reaction,
-    _fire_and_forget,
-    _unarchive_thread,
-)
+from bot.discord_ingest.service import _archive_thread, _archive_thread_after_delay_seconds, _clear_trigger_reaction, _fire_and_forget, _unarchive_thread
 
 
 def _thread(*, archived=False, thread_id=555) -> MagicMock:

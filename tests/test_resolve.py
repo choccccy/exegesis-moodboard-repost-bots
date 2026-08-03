@@ -827,12 +827,12 @@ async def test_resolve_reddit_regular_video_without_manifest_is_skipped():
 #
 # These live here for topic proximity (how a resolved image_url becomes a
 # downloaded thumbnail). The code under test is the lockless
-# bot.discord_ingest.service._download_thumb; download_attachment is patched at
+# bot.curation.core._download_thumb; download_attachment is patched at
 # the service module level. It returns the local path (no DB writes).
 
 import httpx
 
-from bot.discord_ingest.service import _IngestPlan, _LinkPlan, _download_thumb
+from bot.curation.core import _IngestPlan, _LinkPlan, _download_thumb
 from bot.resolve.fetch import _UA
 
 
@@ -863,7 +863,7 @@ async def test_download_thumb_wikimedia_image_gets_referer_and_ua(tmp_path):
     (their CDN 403s bare requests).
     """
     image_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/USPS.jpg"
-    with patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_1")) as dl:
+    with patch("bot.curation.core.download_attachment", new=AsyncMock(return_value="/vol/thumb_1")) as dl:
         path = await _download_thumb(_plan(), _lp(), image_url, str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     dl.assert_called_once()
@@ -875,7 +875,7 @@ async def test_download_thumb_wikimedia_image_gets_referer_and_ua(tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_thumb_non_wikimedia_image_gets_no_extra_headers(tmp_path):
-    with patch("bot.discord_ingest.service.download_attachment", new=AsyncMock(return_value="/vol/thumb_2")) as dl:
+    with patch("bot.curation.core.download_attachment", new=AsyncMock(return_value="/vol/thumb_2")) as dl:
         path = await _download_thumb(_plan(), _lp(), "https://cdn.example.com/img.jpg", str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     dl.assert_called_once()
@@ -892,7 +892,7 @@ async def test_download_thumb_falls_back_to_discord_proxy(tmp_path):
     proxy = "https://media.discordapp.net/external/proxy.png"
 
     dl = AsyncMock(side_effect=[httpx.HTTPError("403 blocked"), "/vol/thumb_proxy"])
-    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+    with patch("bot.curation.core.download_attachment", new=dl):
         path = await _download_thumb(_plan(thumb_proxy_url=proxy), _lp(), image_url, str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     assert dl.call_count == 2
@@ -905,7 +905,7 @@ async def test_download_thumb_falls_back_to_discord_proxy(tmp_path):
 async def test_download_thumb_proxy_failure_swallowed(tmp_path):
     """Both the source CDN and the Discord proxy failing is non-fatal: returns None."""
     dl = AsyncMock(side_effect=[httpx.HTTPError("403"), httpx.HTTPError("404")])
-    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+    with patch("bot.curation.core.download_attachment", new=dl):
         path = await _download_thumb(
             _plan(thumb_proxy_url="https://media.discordapp.net/external/other.png"),
             _lp(), "https://d.furaffinity.net/art/y.png", str(tmp_path), _link_settings(tmp_path), MagicMock(),
@@ -919,7 +919,7 @@ async def test_download_thumb_proxy_failure_swallowed(tmp_path):
 async def test_download_thumb_no_proxy_url_single_attempt(tmp_path):
     """Download failure with no Discord proxy available: exactly one attempt."""
     dl = AsyncMock(side_effect=httpx.HTTPError("boom"))
-    with patch("bot.discord_ingest.service.download_attachment", new=dl):
+    with patch("bot.curation.core.download_attachment", new=dl):
         path = await _download_thumb(_plan(), _lp(), "https://cdn.example.com/z.jpg", str(tmp_path), _link_settings(tmp_path), MagicMock())
 
     assert dl.call_count == 1

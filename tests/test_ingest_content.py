@@ -13,12 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select
 
-from bot.discord_ingest.service import (
-    _AttachmentPlan,
-    _capture_embed,
-    _download_attachment_file,
-    _persist_ingest_skeletons,
-)
+from bot.curation.core import _AttachmentPlan, _capture_embed, _download_attachment_file, _persist_ingest_skeletons
 from bot.curation.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Attachment, SubmissionLink
 from bot.state import SubmissionState
@@ -299,7 +294,7 @@ def _att_plan(row_id=1, url="https://cdn.discord.com/att.jpg", filename="att.jpg
 
 @pytest.mark.asyncio
 async def test_download_attachment_file_returns_path():
-    with patch("bot.discord_ingest.service.download_attachment",
+    with patch("bot.curation.core.download_attachment",
                new_callable=AsyncMock, return_value="/tmp/dest/1_att.jpg") as dl:
         path = await _download_attachment_file(_att_plan(), "/tmp/dest", _settings(), AsyncMock())
     assert path == "/tmp/dest/1_att.jpg"
@@ -308,9 +303,9 @@ async def test_download_attachment_file_returns_path():
 
 @pytest.mark.asyncio
 async def test_download_attachment_file_transcodes_video():
-    with patch("bot.discord_ingest.service.download_attachment",
+    with patch("bot.curation.core.download_attachment",
                new_callable=AsyncMock, return_value="/tmp/dest/1_clip.mp4"), \
-         patch("bot.discord_ingest.service._transcode_video",
+         patch("bot.curation.core._transcode_video",
                new_callable=AsyncMock, return_value="/tmp/dest/1_clip_t.mp4") as tc:
         path = await _download_attachment_file(
             _att_plan(filename="clip.mp4", is_video=True), "/tmp/dest", _settings(), AsyncMock()
@@ -322,7 +317,7 @@ async def test_download_attachment_file_transcodes_video():
 @pytest.mark.asyncio
 async def test_download_attachment_file_failure_returns_none():
     import httpx
-    with patch("bot.discord_ingest.service.download_attachment",
+    with patch("bot.curation.core.download_attachment",
                new_callable=AsyncMock, side_effect=httpx.HTTPError("network failure")):
         path = await _download_attachment_file(_att_plan(), "/tmp/dest", _settings(), AsyncMock())
     assert path is None

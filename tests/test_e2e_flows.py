@@ -26,12 +26,8 @@ import pytest
 from sqlalchemy import select
 
 from bot.config import BoardConfig
-from bot.discord_ingest.service import (
-    handle_confirm_button,
-    handle_reaction,
-    handle_reply,
-    publish_queued_submission,
-)
+from bot.discord_ingest.service import handle_reaction, publish_queued_submission
+from bot.curation.core import handle_confirm_button, handle_reply
 from bot.models import (
     Attachment,
     MetadataRequest,
@@ -141,8 +137,8 @@ def _source_message(board, *, msg_id=None, content="https://example.com/robot", 
 async def _ingest(session, settings, msg):
     """Run handle_reaction with link metadata resolution stubbed to empty."""
     from bot.resolve import ResolvedMetadata
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
-         patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value=None):
+    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
+         patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=None):
         await handle_reaction(
             settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,
@@ -197,7 +193,7 @@ async def test_e2e_prompt_answer_metadata_to_queue(session, board, bind_db_scope
         message=InboundMessage(content="https://example.com/better-link"),
     )
 
-    with patch("bot.discord_ingest.service._resolve_links_in_session", AsyncMock(side_effect=_resolve_ok)):
+    with patch("bot.curation.core._resolve_links_in_session", AsyncMock(side_effect=_resolve_ok)):
         handled = await handle_reply(
             session, reply_event, MockDest(), settings, AsyncMock(),
         )

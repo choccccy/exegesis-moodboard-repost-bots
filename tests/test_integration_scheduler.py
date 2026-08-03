@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from bot.config import BoardConfig, Settings
-from bot.discord_ingest.discord_notifier import DiscordNotifier
+from bot.discord_ingest.discord_notifier import DiscordSurface
 from bot.discord_ingest.service import publish_queued_submission
 from bot.models import PublishAttempt, SubmissionLink, SubmissionThread
 from bot.publish import PublishResult
@@ -103,7 +103,7 @@ async def test_fire_board_with_thread_fetches_channel(session, board, bind_db_sc
 
     bot.fetch_channel.assert_awaited_once_with(9999)
     _, _, destination = mock_pub.await_args.args
-    assert isinstance(destination, DiscordNotifier)
+    assert isinstance(destination, DiscordSurface)
     assert destination._channel is fake_channel
 
 

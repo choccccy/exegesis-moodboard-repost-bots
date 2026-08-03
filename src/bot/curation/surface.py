@@ -15,6 +15,12 @@ from typing import Protocol, runtime_checkable
 from .components import Component, PreviewImage
 
 
+class SurfaceError(Exception):
+    """A `Surface` outbound op failed transiently (e.g. a post was forbidden or the
+    platform errored). Concrete adapters raise this instead of leaking platform-specific
+    exceptions, so the surface-agnostic core can catch failures without importing an SDK."""
+
+
 class SentMessage(Protocol):
     id: int
 

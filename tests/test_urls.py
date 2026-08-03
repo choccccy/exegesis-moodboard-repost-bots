@@ -1,6 +1,6 @@
 import pytest
 
-from bot.discord_ingest.urls import extract_urls, is_discord_internal_url
+from bot.curation.urls import extract_urls, is_discord_internal_url
 
 
 def test_plain_url():

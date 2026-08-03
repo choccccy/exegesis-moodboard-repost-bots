@@ -1,4 +1,4 @@
-"""Conformance tests for the DiscordSurface / DiscordNotifier outbound adapters
+"""Conformance tests for the DiscordSurface outbound adapter
 (surface-agnostic core, issue #50 Phase B). Each Surface method must translate to the
 right Discord call and map Discord's exceptions to the port's documented return values.
 """
@@ -11,8 +11,8 @@ import discord
 import pytest
 
 from bot.curation.components import Button, PreviewImage
-from bot.discord_ingest.discord_notifier import DiscordNotifier, DiscordSurface
-from bot.curation.surface import NullSurface
+from bot.discord_ingest.discord_notifier import DiscordSurface
+from bot.curation.surface import NullSurface, SurfaceError
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,6 +68,15 @@ async def test_send_with_preview_attaches_rendered_file():
         await surface.send("look", preview=PreviewImage(local_path="/x.png", filename="x.png"))
     rp.assert_called_once()
     assert channel.send.await_args.kwargs["file"] is sentinel
+
+
+async def test_send_wraps_discord_failure_in_surface_error():
+    # A forbidden/failed post surfaces as the port-level SurfaceError, so the
+    # surface-agnostic core can catch it without importing discord.
+    channel = _thread()
+    channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "no"))
+    with pytest.raises(SurfaceError):
+        await DiscordSurface(channel).send("hi")
 
 
 # --- edit -------------------------------------------------------------------
@@ -229,28 +238,6 @@ async def test_clear_trigger_gives_up_when_channel_unreachable():
     with patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock) as clr:
         await DiscordSurface(_thread(), client=client).clear_trigger(10, 20, "🦋")
     clr.assert_not_awaited()
-
-
-# --- DiscordNotifier (legacy narrow adapter) --------------------------------
-
-async def test_discord_notifier_send_delegates_to_channel():
-    channel = _thread()
-    await DiscordNotifier(channel).send("hi", view=None)
-    channel.send.assert_awaited_once()
-
-
-async def test_discord_notifier_archive_schedules_for_thread():
-    thread = _thread()
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as arch:
-        await DiscordNotifier(thread).archive("bye")
-    arch.assert_called_once()
-
-
-async def test_discord_notifier_archive_noop_for_non_thread():
-    channel = MagicMock(spec=discord.TextChannel)
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as arch:
-        await DiscordNotifier(channel).archive("bye")
-    arch.assert_not_called()
 
 
 # --- NullSurface (scheduler fallback when there's no channel to post into) ---

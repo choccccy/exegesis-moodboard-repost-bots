@@ -8,30 +8,10 @@ from collections.abc import Sequence
 import discord
 
 from ..curation.components import Button, ButtonStyle, Component, PreviewImage
-from ..curation.surface import SentMessage
+from ..curation.surface import SentMessage, SurfaceError
 from .render import render_components, render_preview
 
 log = logging.getLogger(__name__)
-
-
-class DiscordNotifier:
-    """Legacy narrow adapter (send + archive) still used by the scheduler/publish path.
-
-    The lazy import of _archive_thread_after_delay inside archive() breaks the
-    circular import that would arise if service.py imported this module at the
-    top level while this module imported from service.py.
-    """
-
-    def __init__(self, channel: discord.abc.Messageable) -> None:
-        self._channel = channel
-
-    async def send(self, content: str | None = None, **kwargs) -> SentMessage:
-        return await self._channel.send(content, **kwargs)
-
-    async def archive(self, notice: str) -> None:
-        if isinstance(self._channel, discord.Thread):
-            from .service import _archive_thread_after_delay
-            _archive_thread_after_delay(self._channel, notice=notice)
 
 
 class DiscordSurface:
@@ -65,7 +45,10 @@ class DiscordSurface:
             kwargs["view"] = view
         if preview is not None:
             kwargs["file"] = render_preview(preview)
-        return await self._channel.send(content, **kwargs)
+        try:
+            return await self._channel.send(content, **kwargs)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            raise SurfaceError(str(exc)) from exc
 
     async def edit(
         self,

@@ -18,10 +18,12 @@ from ..db import session_scope
 from ..models import ConfirmationRequest, Submission, SubmissionThread
 from ..moderation import GRAPHIC_YES_EMOJI
 from ..state import SubmissionState
-from . import gateway, replies, service
+from . import gateway, service
+from ..curation import core
+from ..curation import replies
 from ..curation.events import ReactionEvent
 from ..curation.surface import NullSurface
-from .replies import CANCEL_EMOJI
+from ..curation.replies import CANCEL_EMOJI
 
 log = logging.getLogger(__name__)
 
@@ -145,7 +147,7 @@ class RepostBot(discord.Client):
     async def setup_hook(self) -> None:
         self._http = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         async with session_scope() as session:
-            await service.sync_boards(session, self.settings)
+            await core.sync_boards(session, self.settings)
 
         # Register slash commands and sync to every configured guild.
         bot_ref = self
@@ -229,7 +231,7 @@ class RepostBot(discord.Client):
         if custom_id.startswith("edit:"):
             event = gateway.to_event(interaction, int(custom_id.removeprefix("edit:")))
             async with session_scope() as session:
-                outcome = await service.handle_edit_button(session, event, self.settings)
+                outcome = await core.handle_edit_button(session, event, self.settings)
             await gateway.perform(interaction, outcome)
             return
 
@@ -237,13 +239,13 @@ class RepostBot(discord.Client):
         if custom_id.startswith("alt_edit:"):
             event = gateway.to_event(interaction, int(custom_id.removeprefix("alt_edit:")))
             async with session_scope() as session:
-                outcome = await service.handle_alt_edit_button(session, event, self.settings, self._yt_client)
+                outcome = await core.handle_alt_edit_button(session, event, self.settings, self._yt_client)
             await gateway.perform(interaction, outcome)
             return
         if custom_id.startswith("alt_pick:"):
             event = gateway.to_event(interaction, int(custom_id.removeprefix("alt_pick:")))
             async with session_scope() as session:
-                outcome = await service.handle_alt_pick(session, event, self.settings, self._yt_client)
+                outcome = await core.handle_alt_pick(session, event, self.settings, self._yt_client)
             await gateway.perform(interaction, outcome)
             return
 
@@ -269,37 +271,37 @@ class RepostBot(discord.Client):
         outcome = None
         async with session_scope() as session:
             if custom_id.startswith("cancel:"):
-                outcome = await service.handle_cancel_button(
+                outcome = await core.handle_cancel_button(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("cancel:"))),
                     gateway.surface_for(interaction), self.settings,
                 )
             elif custom_id.startswith("confirm:"):
-                outcome = await service.handle_confirm_button(
+                outcome = await core.handle_confirm_button(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("confirm:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("meta_ok:"):
-                outcome = await service.handle_metadata_confirm_button(
+                outcome = await core.handle_metadata_confirm_button(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("meta_ok:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("graphic:"):
-                outcome = await service.handle_graphic_button(
+                outcome = await core.handle_graphic_button(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("graphic:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("pl_skip:"):
-                outcome = await service.handle_playlist_skip_button(
+                outcome = await core.handle_playlist_skip_button(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("pl_skip:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("srcnote_ok:"):
-                outcome = await service.handle_source_note_confirm(
+                outcome = await core.handle_source_note_confirm(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("srcnote_ok:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
             elif custom_id.startswith("srcnote_no:"):
-                outcome = await service.handle_source_note_reject(
+                outcome = await core.handle_source_note_reject(
                     session, gateway.to_event(interaction, int(custom_id.removeprefix("srcnote_no:"))),
                     gateway.surface_for(interaction), self.settings, self._yt_client,
                 )
@@ -333,7 +335,7 @@ class RepostBot(discord.Client):
                 return
             surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
-                await service.handle_label_reaction(
+                await core.handle_label_reaction(
                     session, gateway.to_reaction_event(payload), surface,
                     self.settings, yt_client=self._yt_client,
                 )
@@ -344,7 +346,7 @@ class RepostBot(discord.Client):
                 return
             surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
-                await service.handle_metadata_reaction(
+                await core.handle_metadata_reaction(
                     session, gateway.to_reaction_event(payload), surface,
                     self.settings, yt_client=self._yt_client,
                 )
@@ -359,7 +361,7 @@ class RepostBot(discord.Client):
                 # outbound work through the port.
                 surface = await self._thread_surface_for_source(payload.channel_id, payload.message_id)
                 async with session_scope() as session:
-                    await service.handle_source_cancel_reaction(
+                    await core.handle_source_cancel_reaction(
                         session, gateway.to_reaction_event(payload), surface,
                         self.settings, yt_client=self._yt_client,
                     )
@@ -367,7 +369,7 @@ class RepostBot(discord.Client):
                 # ❌ on a bot message inside a thread - submission cancel button
                 surface = gateway.surface_for_channel(channel, self)
                 async with session_scope() as session:
-                    await service.handle_cancel_reaction(
+                    await core.handle_cancel_reaction(
                         session, gateway.to_reaction_event(payload), surface, self.settings,
                     )
 
@@ -377,7 +379,7 @@ class RepostBot(discord.Client):
                 return
             surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
-                await service.handle_playlist_opt_out(
+                await core.handle_playlist_opt_out(
                     session, gateway.to_reaction_event(payload), surface,
                     self.settings, yt_client=self._yt_client,
                 )
@@ -388,7 +390,7 @@ class RepostBot(discord.Client):
                 return
             surface = gateway.surface_for_channel(channel, self)
             async with session_scope() as session:
-                await service.handle_confirmation_reaction(
+                await core.handle_confirmation_reaction(
                     session, gateway.to_reaction_event(payload), surface,
                     self.settings, yt_client=self._yt_client,
                 )
@@ -410,7 +412,7 @@ class RepostBot(discord.Client):
             channel_id=payload.channel_id, emoji=str(payload.emoji), member=member,
         )
         async with session_scope() as session:
-            await service.handle_reaction_removed(session, event, surface, self.settings)
+            await core.handle_reaction_removed(session, event, surface, self.settings)
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
         """A submission thread was deleted - purge the orphaned open submission so it
@@ -433,7 +435,7 @@ class RepostBot(discord.Client):
             return
         surface = gateway.surface_for_channel(message.channel, self)
         async with session_scope() as session:
-            await service.handle_reply(
+            await core.handle_reply(
                 session, gateway.to_reply_event(message), surface, self.settings, self.httpx_client,
             )
 
@@ -448,7 +450,7 @@ class RepostBot(discord.Client):
 
         board_cfg = self.settings.board_for_channel(channel.id)
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if not service._is_curator(member, interaction.user.id, board_cfg):
+        if not core._is_curator(member, interaction.user.id, board_cfg):
             await interaction.response.send_message(
                 "You're not a curator for this board.", ephemeral=True
             )
@@ -482,7 +484,7 @@ class RepostBot(discord.Client):
 
         board_cfg = self.settings.board_for_channel(channel.id)
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if not service._is_curator(member, interaction.user.id, board_cfg):
+        if not core._is_curator(member, interaction.user.id, board_cfg):
             await interaction.response.send_message(
                 "You're not a curator for this board.", ephemeral=True
             )
@@ -490,11 +492,11 @@ class RepostBot(discord.Client):
 
         await interaction.response.defer(ephemeral=True)
         async with session_scope() as session:
-            board = await service._board_for_channel(session, channel.id)
+            board = await core._board_for_channel(session, channel.id)
             if board is None:
                 await interaction.followup.send("Board not found.", ephemeral=True)
                 return
-            items = await service.fetch_triage_items(
+            items = await core.fetch_triage_items(
                 session,
                 board_id=board.id,
                 guild_id=board_cfg.discord_guild_id,
@@ -539,13 +541,13 @@ class RepostBot(discord.Client):
 
             board_cfg = self.settings.board_for_channel(submission.channel_id)
             member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+            if not core._reaction_authorized(member, interaction.user.id, submission, board_cfg):
                 await interaction.response.send_message(
                     "You're not authorised to view this submission.", ephemeral=True
                 )
                 return
 
-            content = await service.render_submission_status(session, submission)
+            content = await core.render_submission_status(session, submission)
         await interaction.response.send_message(content, ephemeral=True)
 
     async def _handle_reingest_slash(self, interaction: discord.Interaction) -> None:
@@ -561,10 +563,10 @@ class RepostBot(discord.Client):
                 return
             board_cfg = self.settings.board_for_channel(submission.channel_id)
             member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+            if not core._reaction_authorized(member, interaction.user.id, submission, board_cfg):
                 await interaction.followup.send("You're not authorised to reingest this submission.", ephemeral=True)
                 return
-            if submission.state in service._QUEUE_TERMINAL:
+            if submission.state in core._QUEUE_TERMINAL:
                 await interaction.followup.send(
                     "This submission is already queued or published - reingest isn't available.", ephemeral=True
                 )
@@ -594,8 +596,9 @@ class RepostBot(discord.Client):
             async with session_scope() as session:
                 submission = await session.get(Submission, submission_id)
                 if submission is not None:
-                    await service.recompute_and_request(
-                        submission.id, settings=self.settings, destination=channel,
+                    await core.recompute_and_request(
+                        submission.id, settings=self.settings,
+                        destination=gateway.surface_for_channel(channel, self),
                         yt_client=self._yt_client, bot_id=getattr(self.user, "id", None),
                         ambient_session=session,
                     )
@@ -615,10 +618,10 @@ class RepostBot(discord.Client):
                 return
             board_cfg = self.settings.board_for_channel(submission.channel_id)
             member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+            if not core._reaction_authorized(member, interaction.user.id, submission, board_cfg):
                 await interaction.followup.send("You're not authorised to mark this.", ephemeral=True)
                 return
-            waived = await service.waive_source(
+            waived = await core.waive_source(
                 session, submission, settings=self.settings, user_id=interaction.user.id,
                 destination=channel, yt_client=self._yt_client,
             )
@@ -638,10 +641,10 @@ class RepostBot(discord.Client):
                 return
             board_cfg = self.settings.board_for_channel(submission.channel_id)
             member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if not service._reaction_authorized(member, interaction.user.id, submission, board_cfg):
+            if not core._reaction_authorized(member, interaction.user.id, submission, board_cfg):
                 await interaction.followup.send("You're not authorised to skip alt text here.", ephemeral=True)
                 return
-            count = await service.skip_all_alt_text(
+            count = await core.skip_all_alt_text(
                 session, submission, settings=self.settings, user_id=interaction.user.id,
                 destination=channel, yt_client=self._yt_client,
             )
@@ -745,7 +748,7 @@ class RepostBot(discord.Client):
         so the react-on-source handlers post/archive through the port. NullSurface if the
         source has no (resolvable) thread."""
         async with session_scope() as session:
-            board = await service._board_for_channel(session, source_channel_id)
+            board = await core._board_for_channel(session, source_channel_id)
             if board is None:
                 return NullSurface()
             mapping = await session.scalar(
@@ -938,7 +941,7 @@ class RepostBot(discord.Client):
                                         channel_id=thread.id, emoji=emoji, member=None,
                                     )
                                     async with session_scope() as session:
-                                        await service.handle_label_reaction(
+                                        await core.handle_label_reaction(
                                             session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
@@ -951,7 +954,7 @@ class RepostBot(discord.Client):
                                         channel_id=thread.id, emoji=emoji, member=None,
                                     )
                                     async with session_scope() as session:
-                                        await service.handle_metadata_reaction(
+                                        await core.handle_metadata_reaction(
                                             session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
@@ -964,14 +967,14 @@ class RepostBot(discord.Client):
                                         channel_id=thread.id, emoji=emoji, member=None,
                                     )
                                     async with session_scope() as session:
-                                        await service.handle_cancel_reaction(
+                                        await core.handle_cancel_reaction(
                                             session, event, replay_surface, self.settings,
                                         )
                                     replayed += 1
                     elif message.reference is not None:
                         # Replay human replies (alt text, source, etc.).
                         async with session_scope() as session:
-                            await service.handle_reply(
+                            await core.handle_reply(
                                 session, gateway.to_reply_event(message), replay_surface,
                                 self.settings, self.httpx_client,
                             )
@@ -991,8 +994,9 @@ class RepostBot(discord.Client):
                 async with session_scope() as session:
                     submission = await session.get(Submission, submission_id)
                     if submission is not None:
-                        await service.recompute_and_request(
-                            submission.id, settings=self.settings, destination=thread,
+                        await core.recompute_and_request(
+                            submission.id, settings=self.settings,
+                            destination=gateway.surface_for_channel(thread, self),
                             bot_id=getattr(self.user, "id", None),
                             ambient_session=session,
                         )
@@ -1055,7 +1059,7 @@ class RepostBot(discord.Client):
             if state == SubmissionState.QUEUED.value:
                 async with session_scope() as session:
                     board_cfg = self.settings.board_for_channel(channel_id)
-                    if not await service._playlist_close_ready(
+                    if not await core._playlist_close_ready(
                         session, board_id, source_msg_id, board_cfg,
                         playlist_skipped=playlist_skipped,
                     ):
@@ -1066,7 +1070,7 @@ class RepostBot(discord.Client):
                 if queued_at.tzinfo is None:
                     queued_at = queued_at.replace(tzinfo=timezone.utc)
                 elapsed = (now - queued_at).total_seconds()
-                remaining = max(0.0, service._THREAD_CLOSE_DELAY - elapsed)
+                remaining = max(0.0, core._THREAD_CLOSE_DELAY - elapsed)
             else:
                 remaining = 0.0
 
@@ -1182,7 +1186,7 @@ class RepostBot(discord.Client):
                             async with session_scope() as session:
                                 fresh = await session.get(Submission, sub.id)
                                 if fresh is not None:
-                                    await service.recompute_and_request(fresh.id, settings=self.settings, destination=thread, bot_id=getattr(self.user, "id", None), ambient_session=session)
+                                    await core.recompute_and_request(fresh.id, settings=self.settings, destination=gateway.surface_for_channel(thread, self), bot_id=getattr(self.user, "id", None), ambient_session=session)
                             log.info("threadless retry: created thread for submission %s", sub.id)
                         else:
                             log.warning("threadless retry: thread creation still failing for submission %s (will retry)", sub.id)

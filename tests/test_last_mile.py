@@ -16,8 +16,8 @@ from sqlalchemy import select
 from bot.admin.backfill_videos import amain, find_candidates
 from bot.canonicalize import canonicalize
 from bot.dashboard.queries import board_queue, board_stats, recent_publishes
-from bot.discord_ingest import replies
-from bot.discord_ingest.service import handle_playlist_opt_out, handle_playlist_skip_button
+from bot.curation import replies
+from bot.curation.core import handle_playlist_opt_out, handle_playlist_skip_button
 from bot.models import PublishAttempt, Submission, SubmissionLink
 from bot.state import SubmissionState
 

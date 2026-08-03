@@ -184,7 +184,7 @@ async def test_handle_reaction_ingests_url(session, board, bind_db_scopes):
     new_thread = _thread(thread_id=700)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
+    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
         await handle_reaction(
             settings=_settings(),
             message=msg,
@@ -218,7 +218,7 @@ async def test_handle_reaction_embed_url_ingested_when_no_text(session, board, b
     new_thread = _thread(thread_id=701)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
+    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")):
         await handle_reaction(
             settings=_settings(),
             message=msg,
@@ -270,7 +270,7 @@ async def _run_duplicate_reaction(session, board, *, existing_state, existing_th
     new_thread = _thread(thread_id=800)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
+    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
          patch("bot.discord_ingest.service.remove_submission_dir"), \
          patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock), \
          patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:

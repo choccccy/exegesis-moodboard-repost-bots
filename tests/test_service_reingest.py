@@ -57,9 +57,10 @@ async def _seed(session, board, *, links=None, atts=None, **sub_kw):
 async def _reingest(session, sub, inbound, meta=None):
     with (
         patch("bot.discord_ingest.service.discord_message_to_inbound", return_value=inbound),
-        patch("bot.discord_ingest.service.resolve", new_callable=AsyncMock, return_value=meta or _meta()),
-        patch("bot.discord_ingest.service.download_attachment", new_callable=AsyncMock, return_value="/fake/f.jpg"),
+        patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=meta or _meta()),
+        patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value="/fake/f.jpg"),
         patch("bot.discord_ingest.service.session_scope", bound_session_scope(session)),
+        patch("bot.curation.core.session_scope", bound_session_scope(session)),
     ):
         await service.reingest_submission(
             sub.id, message=MagicMock(), settings=_settings(), http_client=MagicMock()

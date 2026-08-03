@@ -6,7 +6,7 @@ adapter renders these to native widgets (Discord: see `discord_ingest/render.py`
 
 `action_id` is the stable routing key. For Discord it is copied verbatim into a
 button/select `custom_id`, so the existing `{prefix}:{id}` scheme (see the docstring in
-`discord_ingest/prompts.py`) and every persisted button keep working unchanged.
+`curation/prompts.py`) and every persisted button keep working unchanged.
 """
 
 from __future__ import annotations

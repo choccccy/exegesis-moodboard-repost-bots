@@ -27,7 +27,7 @@ def _http_error(exc_cls, message: str):
 async def test_setup_hook_syncs_boards_and_commands(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock) as sync_boards,
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock) as sync_boards,
         patch.object(repost_bot.tree, "sync", new_callable=AsyncMock, return_value=[]) as tree_sync,
     ):
         await repost_bot.setup_hook()
@@ -44,7 +44,7 @@ async def test_setup_hook_syncs_boards_and_commands(repost_bot, session):
 async def test_setup_hook_registered_closures_delegate_to_handlers(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock),
         patch.object(repost_bot.tree, "sync", new_callable=AsyncMock, return_value=[]),
     ):
         await repost_bot.setup_hook()
@@ -67,7 +67,7 @@ async def test_setup_hook_registered_closures_delegate_to_handlers(repost_bot, s
 async def test_setup_hook_logs_forbidden_sync_error(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock),
         patch.object(
             repost_bot.tree, "sync", new_callable=AsyncMock,
             side_effect=_http_error(discord.Forbidden, "missing scope"),
@@ -84,7 +84,7 @@ async def test_setup_hook_logs_forbidden_sync_error(repost_bot, session):
 async def test_setup_hook_logs_http_sync_error(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock),
         patch.object(
             repost_bot.tree, "sync", new_callable=AsyncMock,
             side_effect=_http_error(discord.HTTPException, "rate limited"),
@@ -114,7 +114,7 @@ async def test_scan_slash_refuses_unwatched_channel(repost_bot):
 async def test_scan_slash_refuses_non_curator(repost_bot):
     interaction = make_interaction(channel_id=100)
     interaction.response.send_message = AsyncMock()
-    with patch("bot.discord_ingest.client.service._is_curator", return_value=False):
+    with patch("bot.curation.core._is_curator", return_value=False):
         await repost_bot._handle_scan_slash(interaction, 30)
     interaction.response.send_message.assert_awaited_once()
     assert "curator" in interaction.response.send_message.await_args.args[0]
@@ -125,7 +125,7 @@ async def test_scan_slash_defers_and_starts_scan_task(repost_bot):
     status_message = MagicMock()
     interaction.followup.send = AsyncMock(return_value=status_message)
     repost_bot._run_channel_scan = AsyncMock()
-    with patch("bot.discord_ingest.client.service._is_curator", return_value=True):
+    with patch("bot.curation.core._is_curator", return_value=True):
         await repost_bot._handle_scan_slash(interaction, 30)
         await asyncio.sleep(0)  # let the created task run
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
@@ -148,13 +148,13 @@ async def test_triage_slash_with_filter_sends_filtered_list(repost_bot, session)
     choice.name = "queued"
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service._is_curator", return_value=True),
+        patch("bot.curation.core._is_curator", return_value=True),
         patch(
-            "bot.discord_ingest.client.service._board_for_channel",
+            "bot.curation.core._board_for_channel",
             new_callable=AsyncMock, return_value=SimpleNamespace(id=1),
         ),
         patch(
-            "bot.discord_ingest.client.service.fetch_triage_items",
+            "bot.curation.core.fetch_triage_items",
             new_callable=AsyncMock, return_value=[],
         ) as fetch_items,
     ):
@@ -176,13 +176,13 @@ async def test_triage_slash_without_filter_groups_all_items(repost_bot, session)
     ]
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service._is_curator", return_value=True),
+        patch("bot.curation.core._is_curator", return_value=True),
         patch(
-            "bot.discord_ingest.client.service._board_for_channel",
+            "bot.curation.core._board_for_channel",
             new_callable=AsyncMock, return_value=SimpleNamespace(id=1),
         ),
         patch(
-            "bot.discord_ingest.client.service.fetch_triage_items",
+            "bot.curation.core.fetch_triage_items",
             new_callable=AsyncMock, return_value=items,
         ) as fetch_items,
     ):
@@ -201,13 +201,13 @@ async def test_triage_slash_with_user_filter_threads_user_id(repost_bot, session
     user.display_name = "osi"
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service._is_curator", return_value=True),
+        patch("bot.curation.core._is_curator", return_value=True),
         patch(
-            "bot.discord_ingest.client.service._board_for_channel",
+            "bot.curation.core._board_for_channel",
             new_callable=AsyncMock, return_value=SimpleNamespace(id=1),
         ),
         patch(
-            "bot.discord_ingest.client.service.fetch_triage_items",
+            "bot.curation.core.fetch_triage_items",
             new_callable=AsyncMock, return_value=[],
         ) as fetch_items,
     ):
@@ -234,13 +234,13 @@ async def test_triage_slash_combines_state_and_user_filters(repost_bot, session)
     ]
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service._is_curator", return_value=True),
+        patch("bot.curation.core._is_curator", return_value=True),
         patch(
-            "bot.discord_ingest.client.service._board_for_channel",
+            "bot.curation.core._board_for_channel",
             new_callable=AsyncMock, return_value=SimpleNamespace(id=1),
         ),
         patch(
-            "bot.discord_ingest.client.service.fetch_triage_items",
+            "bot.curation.core.fetch_triage_items",
             new_callable=AsyncMock, return_value=items,
         ) as fetch_items,
     ):
@@ -256,9 +256,9 @@ async def test_triage_slash_board_missing_reports_error(repost_bot, session):
     interaction = make_interaction(channel_id=100)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service._is_curator", return_value=True),
+        patch("bot.curation.core._is_curator", return_value=True),
         patch(
-            "bot.discord_ingest.client.service._board_for_channel",
+            "bot.curation.core._board_for_channel",
             new_callable=AsyncMock, return_value=None,
         ),
     ):
@@ -269,7 +269,7 @@ async def test_triage_slash_board_missing_reports_error(repost_bot, session):
 async def test_triage_slash_refuses_non_curator(repost_bot):
     interaction = make_interaction(channel_id=100)
     interaction.response.send_message = AsyncMock()
-    with patch("bot.discord_ingest.client.service._is_curator", return_value=False):
+    with patch("bot.curation.core._is_curator", return_value=False):
         await repost_bot._handle_triage_slash(interaction, None)
     assert "curator" in interaction.response.send_message.await_args.args[0]
 
@@ -406,7 +406,7 @@ async def test_status_slash_no_channel(repost_bot, session, board):
 async def test_status_command_closure_delegates(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock),
         patch.object(repost_bot.tree, "sync", new_callable=AsyncMock, return_value=[]),
     ):
         await repost_bot.setup_hook()
@@ -446,7 +446,7 @@ async def test_reingest_slash_happy_path(repost_bot, session, board):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
-        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
     ):
         await repost_bot._handle_reingest_slash(interaction)
     # Public, not ephemeral (issue #55): the refresh confirmation stays visible in
@@ -513,7 +513,7 @@ async def test_no_source_slash_waives(repost_bot, session, board):
     interaction = _thread_interaction(user_id=999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock, return_value=True) as waive,
+        patch("bot.curation.core.waive_source", new_callable=AsyncMock, return_value=True) as waive,
     ):
         await repost_bot._handle_nosource_slash(interaction)
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
@@ -527,7 +527,7 @@ async def test_no_source_slash_already_waived(repost_bot, session, board):
     interaction = _thread_interaction(user_id=999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock, return_value=False),
+        patch("bot.curation.core.waive_source", new_callable=AsyncMock, return_value=False),
     ):
         await repost_bot._handle_nosource_slash(interaction)
     assert "Already marked" in interaction.followup.send.await_args.args[0]
@@ -537,7 +537,7 @@ async def test_no_source_slash_not_in_thread(repost_bot, session, board):
     interaction = _thread_interaction(channel_id=999999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock) as waive,
+        patch("bot.curation.core.waive_source", new_callable=AsyncMock) as waive,
     ):
         await repost_bot._handle_nosource_slash(interaction)
     waive.assert_not_awaited()
@@ -549,7 +549,7 @@ async def test_no_source_slash_unauthorized(repost_bot, session, board):
     interaction = _thread_interaction(user_id=555)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.waive_source", new_callable=AsyncMock) as waive,
+        patch("bot.curation.core.waive_source", new_callable=AsyncMock) as waive,
     ):
         await repost_bot._handle_nosource_slash(interaction)
     waive.assert_not_awaited()
@@ -561,7 +561,7 @@ async def test_skip_alt_slash_skips(repost_bot, session, board):
     interaction = _thread_interaction(user_id=999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock, return_value=2) as skip,
+        patch("bot.curation.core.skip_all_alt_text", new_callable=AsyncMock, return_value=2) as skip,
     ):
         await repost_bot._handle_skipalt_slash(interaction)
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
@@ -574,7 +574,7 @@ async def test_skip_alt_slash_nothing_pending(repost_bot, session, board):
     interaction = _thread_interaction(user_id=999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock, return_value=0),
+        patch("bot.curation.core.skip_all_alt_text", new_callable=AsyncMock, return_value=0),
     ):
         await repost_bot._handle_skipalt_slash(interaction)
     assert "No images are waiting" in interaction.followup.send.await_args.args[0]
@@ -584,7 +584,7 @@ async def test_skip_alt_slash_not_in_thread(repost_bot, session, board):
     interaction = _thread_interaction(channel_id=999999)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock) as skip,
+        patch("bot.curation.core.skip_all_alt_text", new_callable=AsyncMock) as skip,
     ):
         await repost_bot._handle_skipalt_slash(interaction)
     skip.assert_not_awaited()
@@ -601,7 +601,7 @@ async def test_reingest_slash_submission_vanished_after_fetch(repost_bot, sessio
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.service.reingest_submission", new_callable=AsyncMock) as reingest,
-        patch("bot.discord_ingest.client.service.recompute_and_request", new_callable=AsyncMock),
+        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock),
     ):
         await repost_bot._handle_reingest_slash(interaction)
     reingest.assert_not_awaited()
@@ -613,7 +613,7 @@ async def test_skip_alt_slash_unauthorized(repost_bot, session, board):
     interaction = _thread_interaction(user_id=555)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.skip_all_alt_text", new_callable=AsyncMock) as skip,
+        patch("bot.curation.core.skip_all_alt_text", new_callable=AsyncMock) as skip,
     ):
         await repost_bot._handle_skipalt_slash(interaction)
     skip.assert_not_awaited()
@@ -623,7 +623,7 @@ async def test_skip_alt_slash_unauthorized(repost_bot, session, board):
 async def test_new_command_closures_delegate(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.sync_boards", new_callable=AsyncMock),
+        patch("bot.curation.core.sync_boards", new_callable=AsyncMock),
         patch.object(repost_bot.tree, "sync", new_callable=AsyncMock, return_value=[]),
     ):
         await repost_bot.setup_hook()

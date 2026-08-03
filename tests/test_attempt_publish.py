@@ -12,12 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select
 
 from bot.config import BoardConfig
-from bot.discord_ingest import replies
-from bot.discord_ingest.service import (
-    _build_post_preview,
-    _transcode_video,
-    publish_queued_submission,
-)
+from bot.curation import replies
+from bot.discord_ingest.service import publish_queued_submission
+from bot.curation.core import _build_post_preview, _transcode_video
 from bot.models import Attachment, PublishAttempt, SubmissionLink
 from bot.publish import PublishResult
 from bot.state import GraphicStatus, PublishOutcome, SubmissionState
@@ -51,6 +48,9 @@ class _RaisingDest:
         raise RuntimeError("discord send failed")
 
     async def archive(self, notice: str) -> None:
+        self.archived.append(notice)
+
+    def archive_after_delay(self, notice=None, *, delay=None) -> None:
         self.archived.append(notice)
 
 

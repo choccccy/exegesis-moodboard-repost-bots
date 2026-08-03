@@ -1,6 +1,6 @@
 """Tests for the known-good mirror cheat-sheet + in-thread nag (#61)."""
 
-from bot.discord_ingest import replies
+from bot.curation import replies
 from bot.mirrors import KNOWN_GOOD_MIRRORS, mirror_hint_for_url
 
 

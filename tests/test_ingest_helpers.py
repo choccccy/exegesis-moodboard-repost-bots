@@ -11,12 +11,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.config import BoardConfig
-from bot.discord_ingest.service import (
-    _derive_thread_title,
-    _extract_raw_urls,
-    _is_curator,
-    _post_thread_anchor,
-)
+from bot.discord_ingest.service import _derive_thread_title, _post_thread_anchor
+from bot.curation.core import _extract_raw_urls, _is_curator
 from bot.curation.types import InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import Submission, SubmissionLink
 from bot.state import SubmissionState, GraphicStatus

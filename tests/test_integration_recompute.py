@@ -22,8 +22,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 
-from bot.discord_ingest import replies
-from bot.discord_ingest.service import recompute_and_request
+from bot.curation import replies
+from bot.curation.core import recompute_and_request
 from bot.models import (
     Attachment,
     Board,

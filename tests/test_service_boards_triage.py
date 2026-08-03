@@ -11,12 +11,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 
 from bot.config import BoardConfig
-from bot.discord_ingest.service import (
-    _board_for_channel,
-    _triage_relative,
-    fetch_triage_items,
-    sync_boards,
-)
+from bot.curation.core import _board_for_channel, _triage_relative, fetch_triage_items, sync_boards
 from bot.models import Board, SubmissionLink
 from bot.state import SubmissionState
 

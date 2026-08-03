@@ -14,7 +14,7 @@ import discord
 import pytest
 
 from bot.discord_ingest.client import RepostBot
-from bot.discord_ingest.replies import (
+from bot.curation.replies import (
     CONFIRMATION_EMOJI,
     METADATA_CONFIRM_EMOJI,
     PLAYLIST_OPT_OUT_EMOJI,
@@ -46,7 +46,7 @@ def _patch_user(uid: int = 42):
 async def test_on_interaction_ignores_non_component(repost_bot):
     interaction = make_interaction()
     interaction.type = discord.InteractionType.application_command
-    with patch("bot.discord_ingest.client.service.handle_confirm_button", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_confirm_button", new_callable=AsyncMock) as handler:
         await repost_bot.on_interaction(interaction)
     handler.assert_not_awaited()
     interaction.response.defer.assert_not_awaited()
@@ -58,7 +58,7 @@ async def test_on_interaction_edit_prefix_routes_without_defer(repost_bot, sessi
     interaction = make_interaction(custom_id="edit:7")
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.handle_edit_button", new_callable=AsyncMock) as handler,
+        patch("bot.curation.core.handle_edit_button", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_interaction(interaction)
     handler.assert_awaited_once()
@@ -80,7 +80,7 @@ async def test_on_interaction_alt_prefixes_route_without_defer(
     interaction = make_interaction(custom_id=custom_id)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(f"bot.discord_ingest.client.service.{handler_name}", new_callable=AsyncMock) as handler,
+        patch(f"bot.curation.core.{handler_name}", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_interaction(interaction)
     handler.assert_awaited_once()
@@ -92,7 +92,7 @@ async def test_on_interaction_expired_defer_falls_back_to_channel_message(repost
     interaction = make_interaction(custom_id="confirm:3")
     interaction.response.defer = AsyncMock(side_effect=_not_found())
     interaction.user.mention = "<@999>"
-    with patch("bot.discord_ingest.client.service.handle_confirm_button", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_confirm_button", new_callable=AsyncMock) as handler:
         await repost_bot.on_interaction(interaction)
     handler.assert_not_awaited()
     interaction.channel.send.assert_awaited_once()
@@ -131,7 +131,7 @@ async def test_on_interaction_routes_prefix_to_handler(
     interaction = make_interaction(custom_id=custom_id)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(f"bot.discord_ingest.client.service.{handler_name}", new_callable=AsyncMock) as handler,
+        patch(f"bot.curation.core.{handler_name}", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_interaction(interaction)
     interaction.response.defer.assert_awaited_once()
@@ -151,11 +151,11 @@ async def test_on_interaction_unknown_custom_id_is_ignored(repost_bot, session):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch.multiple(
-            "bot.discord_ingest.client.service",
+            "bot.curation.core",
             **{name: AsyncMock() for name in handler_names},
         ),
     ):
-        import bot.discord_ingest.service as service_mod
+        import bot.curation.core as service_mod
 
         await repost_bot.on_interaction(interaction)
         for name in handler_names:
@@ -240,7 +240,7 @@ async def test_reaction_add_routes_special_emoji(repost_bot, session, emoji, han
     repost_bot._resolve_channel = AsyncMock(return_value=channel)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch(f"bot.discord_ingest.client.service.{handler_name}", new_callable=AsyncMock) as handler,
+        patch(f"bot.curation.core.{handler_name}", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_add(payload)
     handler.assert_awaited_once()
@@ -267,7 +267,7 @@ async def test_reaction_add_special_emoji_unresolvable_channel_skips(
 ):
     payload = make_reaction_payload(emoji=emoji, channel_id=200)
     repost_bot._resolve_channel = AsyncMock(return_value=None)
-    with patch(f"bot.discord_ingest.client.service.{handler_name}", new_callable=AsyncMock) as handler:
+    with patch(f"bot.curation.core.{handler_name}", new_callable=AsyncMock) as handler:
         await repost_bot.on_raw_reaction_add(payload)
     handler.assert_not_awaited()
 
@@ -280,7 +280,7 @@ async def test_reaction_add_source_cancel_invokes_handler(repost_bot, session):
     repost_bot._resolve_channel = AsyncMock(return_value=MagicMock())
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.handle_source_cancel_reaction",
+        patch("bot.curation.core.handle_source_cancel_reaction",
               new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_add(payload)
@@ -296,7 +296,7 @@ async def test_reaction_add_cancel_in_thread_invokes_handler(repost_bot, session
     repost_bot._resolve_channel = AsyncMock(return_value=MagicMock())
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.handle_cancel_reaction", new_callable=AsyncMock) as handler,
+        patch("bot.curation.core.handle_cancel_reaction", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_add(payload)
     handler.assert_awaited_once()
@@ -382,7 +382,7 @@ async def test_reaction_remove_trigger_routes_to_cleanup(repost_bot, session):
     repost_bot._resolve_channel = AsyncMock(return_value=channel)
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.handle_reaction_removed", new_callable=AsyncMock) as handler,
+        patch("bot.curation.core.handle_reaction_removed", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_raw_reaction_remove(payload)
     handler.assert_awaited_once()
@@ -392,7 +392,7 @@ async def test_reaction_remove_trigger_routes_to_cleanup(repost_bot, session):
 async def test_reaction_remove_unresolvable_channel_skips(repost_bot):
     payload = make_reaction_payload(channel_id=100)
     repost_bot._resolve_channel = AsyncMock(return_value=None)
-    with patch("bot.discord_ingest.client.service.handle_reaction_removed", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_reaction_removed", new_callable=AsyncMock) as handler:
         await repost_bot.on_raw_reaction_remove(payload)
     handler.assert_not_awaited()
 
@@ -400,7 +400,7 @@ async def test_reaction_remove_unresolvable_channel_skips(repost_bot):
 async def test_reaction_remove_other_emoji_ignored(repost_bot):
     payload = make_reaction_payload(emoji="\N{CROSS MARK}", channel_id=100)
     repost_bot._resolve_channel = AsyncMock()
-    with patch("bot.discord_ingest.client.service.handle_reaction_removed", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_reaction_removed", new_callable=AsyncMock) as handler:
         await repost_bot.on_raw_reaction_remove(payload)
     handler.assert_not_awaited()
     repost_bot._resolve_channel.assert_not_awaited()
@@ -436,7 +436,7 @@ async def test_on_message_ignores_own_messages(repost_bot):
     message = _make_message(author_id=42)
     with (
         _patch_user(42),
-        patch("bot.discord_ingest.client.service.handle_reply", new_callable=AsyncMock) as handler,
+        patch("bot.curation.core.handle_reply", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_message(message)
     handler.assert_not_awaited()
@@ -447,7 +447,7 @@ async def test_on_message_reply_in_watched_channel_routes(repost_bot, session):
     repost_bot._http = MagicMock()
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
-        patch("bot.discord_ingest.client.service.handle_reply", new_callable=AsyncMock) as handler,
+        patch("bot.curation.core.handle_reply", new_callable=AsyncMock) as handler,
     ):
         await repost_bot.on_message(message)
     handler.assert_awaited_once()
@@ -456,13 +456,13 @@ async def test_on_message_reply_in_watched_channel_routes(repost_bot, session):
 
 async def test_on_message_non_reply_ignored(repost_bot):
     message = _make_message(has_reference=False)
-    with patch("bot.discord_ingest.client.service.handle_reply", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_reply", new_callable=AsyncMock) as handler:
         await repost_bot.on_message(message)
     handler.assert_not_awaited()
 
 
 async def test_on_message_unwatched_location_ignored(repost_bot):
     message = _make_message(channel_id=999)
-    with patch("bot.discord_ingest.client.service.handle_reply", new_callable=AsyncMock) as handler:
+    with patch("bot.curation.core.handle_reply", new_callable=AsyncMock) as handler:
         await repost_bot.on_message(message)
     handler.assert_not_awaited()

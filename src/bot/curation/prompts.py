@@ -24,7 +24,7 @@ commands, not buttons.)
 
 from __future__ import annotations
 
-from ..curation.components import (
+from .components import (
     Button,
     ButtonStyle,
     Component,

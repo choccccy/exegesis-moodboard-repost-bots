@@ -1,8 +1,6 @@
-"""Coverage for small glue modules: DiscordNotifier, prompts/render, and stray branches.
+"""Coverage for small glue modules: prompts/render descriptor factories and stray branches.
 
-These are thin but load-bearing: DiscordNotifier is the bridge between the
-service layer and Discord threads, and the view factories carry the custom_id
-contracts that on_interaction routing depends on.
+The view factories carry the custom_id contracts that on_interaction routing depends on.
 """
 
 from __future__ import annotations
@@ -13,46 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 
 from bot.accessibility import AltTextStatus, initial_alt_text
-from bot.discord_ingest.discord_notifier import DiscordNotifier
-from bot.discord_ingest import prompts, render
+from bot.discord_ingest import render
+from bot.curation import prompts
 
 from conftest import bound_session_scope
-
-
-# ---------------------------------------------------------------------------
-# DiscordNotifier
-# ---------------------------------------------------------------------------
-
-
-async def test_notifier_send_passes_through():
-    channel = MagicMock()
-    channel.send = AsyncMock(return_value=MagicMock(id=7))
-    notifier = DiscordNotifier(channel)
-
-    msg = await notifier.send("hello", suppress_embeds=True)
-
-    channel.send.assert_awaited_once_with("hello", suppress_embeds=True)
-    assert msg.id == 7
-
-
-async def test_notifier_archive_schedules_for_thread():
-    thread = MagicMock(spec=discord.Thread)
-    notifier = DiscordNotifier(thread)
-
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as mock_archive:
-        await notifier.archive("done")
-
-    mock_archive.assert_called_once_with(thread, notice="done")
-
-
-async def test_notifier_archive_noop_for_plain_channel():
-    channel = MagicMock()  # not a discord.Thread
-    notifier = DiscordNotifier(channel)
-
-    with patch("bot.discord_ingest.service._archive_thread_after_delay") as mock_archive:
-        await notifier.archive("done")
-
-    mock_archive.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

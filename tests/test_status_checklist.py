@@ -7,7 +7,7 @@ ready/blocked/terminal footers) and the waiver/skip notice copy.
 
 from __future__ import annotations
 
-from bot.discord_ingest import replies
+from bot.curation import replies
 from bot.state import AltTextStatus, GraphicStatus, SubmissionSnapshot
 
 

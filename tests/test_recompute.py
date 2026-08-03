@@ -10,7 +10,7 @@ These cover the invariants that were broken by two related bugs:
 
 import pytest
 
-from bot.discord_ingest.service import _queue_action
+from bot.curation.core import _queue_action
 from bot.state import SubmissionState
 
 
@@ -77,7 +77,8 @@ def test_awaiting_image_to_ready_is_fresh():
 
 from sqlalchemy import select
 
-from bot.discord_ingest.service import cancel_submission_for_deleted_thread, recompute_and_request
+from bot.discord_ingest.service import cancel_submission_for_deleted_thread
+from bot.curation.core import recompute_and_request
 from bot.models import (
     Attachment,
     AttachmentAltTextRequest,

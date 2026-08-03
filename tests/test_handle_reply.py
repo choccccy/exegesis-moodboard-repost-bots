@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from bot.curation.events import ReplyEvent
 from bot.curation.types import InboundAttachment, InboundMessage
-from bot.discord_ingest.service import handle_reply
+from bot.curation.core import handle_reply
 from bot.models import (
     Attachment,
     AttachmentAltTextRequest,
@@ -142,7 +142,7 @@ async def test_handle_reply_op_is_always_authorized(session, board):
     event = _reply_event(reply_to_id=req.bot_message_id, author_id=100, content="https://example.com/post")
     settings = _mock_settings(curator_role_ids=[], curator_user_ids=[])
 
-    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()):
+    with patch("bot.curation.core._resolve_links_in_session", new=AsyncMock()):
         result = await _reply(session, event, MockDest(), settings)
 
     assert result is True
@@ -162,7 +162,7 @@ async def test_handle_reply_curator_by_role_is_authorized(session, board):
     )
     settings = _mock_settings(curator_role_ids=[555], curator_user_ids=[])
 
-    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()):
+    with patch("bot.curation.core._resolve_links_in_session", new=AsyncMock()):
         result = await _reply(session, event, MockDest(), settings)
 
     assert result is True
@@ -213,7 +213,7 @@ async def test_handle_reply_alt_text_stored(session, board):
         content="a chrome robot arm reaching toward the camera",
     )
     dest = MockDest()
-    with patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, dest, _mock_settings())
 
     assert result is True
@@ -245,7 +245,7 @@ async def test_handle_reply_alt_text_overwrite_posts_notice(session, board):
         reply_to_id=req.bot_message_id, author_id=sub.author_id, content="a much better description",
     )
     dest = MockDest()
-    with patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, dest, _mock_settings())
 
     assert result is True
@@ -278,7 +278,7 @@ async def test_handle_reply_alt_text_same_value_no_notice(session, board):
         reply_to_id=req.bot_message_id, author_id=sub.author_id, content="existing alt text",
     )
     dest = MockDest()
-    with patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, dest, _mock_settings())
 
     assert result is True
@@ -299,8 +299,8 @@ async def test_handle_reply_source_url_creates_link(session, board):
         reply_to_id=req.bot_message_id, author_id=sub.author_id,
         content="https://www.artstation.com/artwork/cool-robot",
     )
-    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()), \
-         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core._resolve_links_in_session", new=AsyncMock()), \
+         patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, MockDest(), _mock_settings())
 
     assert result is True
@@ -365,8 +365,8 @@ async def test_handle_reply_supplemental_image_ingests_images(session, board):
         reply_to_id=req.bot_message_id, author_id=sub.author_id,
         attachments=[_image_attachment("extra_robot.jpg")],
     )
-    with patch("bot.discord_ingest.service._ingest_attachment_in_session", new=AsyncMock()) as mock_ingest, \
-         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core._ingest_attachment_in_session", new=AsyncMock()) as mock_ingest, \
+         patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, MockDest(), _mock_settings())
 
     assert result is True
@@ -488,8 +488,8 @@ async def test_handle_reply_metadata_url_replaces_primary_link(session, board):
         content="https://www.artstation.com/artwork/better-link",
     )
     dest = MockDest()
-    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
-         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
+         patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, dest, _mock_settings())
 
     assert result is True
@@ -543,8 +543,8 @@ async def test_handle_reply_supplemental_link_appends_link(session, board):
         reply_to_id=req.bot_message_id, author_id=sub.author_id,
         content="https://example.org/making-of",
     )
-    with patch("bot.discord_ingest.service._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
-         patch("bot.discord_ingest.service.recompute_and_request", new=AsyncMock()):
+    with patch("bot.curation.core._resolve_links_in_session", new=AsyncMock()) as mock_resolve, \
+         patch("bot.curation.core.recompute_and_request", new=AsyncMock()):
         result = await _reply(session, event, MockDest(), _mock_settings())
 
     assert result is True

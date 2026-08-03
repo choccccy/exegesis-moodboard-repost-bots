@@ -9,18 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from bot.config import BoardConfig
-from bot.discord_ingest.service import (
-    apply_post_edits,
-    handle_cancel_button,
-    handle_confirm_button,
-    handle_confirmation_reaction,
-    handle_edit_button,
-    handle_graphic_button,
-    handle_label_reaction,
-    handle_metadata_confirm_button,
-    handle_metadata_reaction,
-    handle_playlist_skip_button,
-)
+from bot.curation.core import apply_post_edits, handle_cancel_button, handle_confirm_button, handle_confirmation_reaction, handle_edit_button, handle_graphic_button, handle_label_reaction, handle_metadata_confirm_button, handle_metadata_reaction, handle_playlist_skip_button
 from bot.models import (
     Attachment,
     CancellationRequest,
@@ -197,8 +186,8 @@ async def test_cancel_button_not_found(session, board):
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
-@patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
+@patch("bot.curation.core._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
+@patch("bot.curation.core._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirm_button_queues_submission(mock_pclose, mock_playlist, session, board):
     sub = make_submission(
         board, state=SubmissionState.READY_TO_QUEUE.value, author_id=AUTHOR_ID,
@@ -219,7 +208,7 @@ async def test_confirm_button_queues_submission(mock_pclose, mock_playlist, sess
     assert isinstance(outcome, Tombstone)
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_confirm_button_refuses_when_gap_reopened(mock_recompute, session, board):
     """A gap that reopened after the Queue button was posted (e.g. a late-added image needing
     alt text) must block the click: no queue, an ephemeral refusal, and a recompute to refresh."""
@@ -247,8 +236,8 @@ async def test_confirm_button_refuses_when_gap_reopened(mock_recompute, session,
     assert outcome.ephemeral is True
 
 
-@patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
-@patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
+@patch("bot.curation.core._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
+@patch("bot.curation.core._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirm_button_unauthorized_user_rejected(mock_pclose, mock_playlist, session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, author_id=AUTHOR_ID, channel_id=100)
     session.add(sub)
@@ -294,7 +283,7 @@ async def test_confirm_button_already_queued_blocked(session, board):
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_label_reaction_graphic_yes(mock_recompute, session, board):
     """🩸 emoji sets graphic_status to GRAPHIC."""
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
@@ -317,7 +306,7 @@ async def test_label_reaction_graphic_yes(mock_recompute, session, board):
     mock_recompute.assert_called_once()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_label_reaction_graphic_sets_answered_at(mock_recompute, session, board):
     """After a valid label reaction, req.answered_at and req.answered_by are set."""
     from bot.moderation import GRAPHIC_YES_EMOJI
@@ -341,7 +330,7 @@ async def test_label_reaction_graphic_sets_answered_at(mock_recompute, session, 
     assert req.answered_by == CURATOR_ID
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_label_reaction_unknown_emoji_ignored(mock_recompute, session, board):
     """Unrecognised emoji does nothing."""
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
@@ -363,7 +352,7 @@ async def test_label_reaction_unknown_emoji_ignored(mock_recompute, session, boa
     mock_recompute.assert_not_called()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_label_reaction_already_answered_ignored(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100)
     session.add(sub)
@@ -389,7 +378,7 @@ async def test_label_reaction_already_answered_ignored(mock_recompute, session, 
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_reaction_confirms_link(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -413,7 +402,7 @@ async def test_metadata_reaction_confirms_link(mock_recompute, session, board):
     mock_recompute.assert_called_once()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_reaction_unauthorized_ignored(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -439,8 +428,8 @@ async def test_metadata_reaction_unauthorized_ignored(mock_recompute, session, b
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
-@patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
+@patch("bot.curation.core._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
+@patch("bot.curation.core._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirmation_reaction_queues_submission(mock_pclose, mock_playlist, session, board):
     sub = make_submission(
         board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100,
@@ -465,7 +454,7 @@ async def test_confirmation_reaction_queues_submission(mock_pclose, mock_playlis
     assert req.confirmed_by == CURATOR_ID
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_confirmation_reaction_refuses_when_gap_reopened(mock_recompute, session, board):
     """The ✅ reaction path re-validates gaps too: a reopened gap blocks the queue."""
     sub = make_submission(
@@ -495,8 +484,8 @@ async def test_confirmation_reaction_refuses_when_gap_reopened(mock_recompute, s
     assert "alt text" in dest.sent[0]
 
 
-@patch("bot.discord_ingest.service._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
-@patch("bot.discord_ingest.service._playlist_close_ready", new_callable=AsyncMock, return_value=False)
+@patch("bot.curation.core._auto_add_to_playlist", new_callable=AsyncMock, return_value=0)
+@patch("bot.curation.core._playlist_close_ready", new_callable=AsyncMock, return_value=False)
 async def test_confirmation_reaction_unauthorized_returns_false(mock_pclose, mock_playlist, session, board):
     sub = make_submission(board, state=SubmissionState.READY_TO_QUEUE.value, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -532,7 +521,7 @@ async def test_confirmation_reaction_no_req_returns_false(session, board):
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_graphic_button_marks_graphic(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -550,7 +539,7 @@ async def test_graphic_button_marks_graphic(mock_recompute, session, board):
     assert isinstance(outcome, Tombstone)
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_graphic_button_unauthorized_rejected(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -727,7 +716,7 @@ async def test_apply_post_edits_no_link_no_crash(session, board):
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_confirm_button_happy_path(mock_recompute, session, board):
     """Curator clicks 'use link as-is': request marked confirmed, recompute runs."""
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
@@ -749,7 +738,7 @@ async def test_metadata_confirm_button_happy_path(mock_recompute, session, board
     mock_recompute.assert_called_once()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_confirm_button_unauthorized_rejected(mock_recompute, session, board):
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
     session.add(sub)
@@ -767,7 +756,7 @@ async def test_metadata_confirm_button_unauthorized_rejected(mock_recompute, ses
     mock_recompute.assert_not_called()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_confirm_button_already_answered(mock_recompute, session, board):
     """No open MetadataRequest: replies 'Already confirmed.' and stops."""
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)
@@ -786,7 +775,7 @@ async def test_metadata_confirm_button_already_answered(mock_recompute, session,
     mock_recompute.assert_not_called()
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_metadata_confirm_button_missing_submission(mock_recompute, session, board):
     """Open request whose submission row is gone: silent no-op."""
     req = MetadataRequest(submission_id=99999, bot_message_id=6003)
@@ -805,7 +794,7 @@ async def test_metadata_confirm_button_missing_submission(mock_recompute, sessio
 # ---------------------------------------------------------------------------
 
 
-@patch("bot.discord_ingest.service.recompute_and_request", new_callable=AsyncMock)
+@patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock)
 async def test_graphic_button_missing_submission(mock_recompute, session, board):
     """Open request whose submission row is gone: silent no-op."""
     req = ContentLabelRequest(submission_id=99999, bot_message_id=5002)
@@ -829,7 +818,7 @@ async def test_playlist_skip_submission_not_found(session, board):
     assert isinstance(outcome, Ack) and "not found" in outcome.message
 
 
-@patch("bot.discord_ingest.service._do_playlist_remove", new_callable=AsyncMock)
+@patch("bot.curation.core._do_playlist_remove", new_callable=AsyncMock)
 async def test_playlist_skip_removes_existing_playlist_adds(mock_remove, session, board):
     """Opting out after a successful playlist add removes the video."""
     sub = make_submission(board, channel_id=100, author_id=AUTHOR_ID)

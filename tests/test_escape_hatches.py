@@ -14,14 +14,7 @@ from sqlalchemy import select
 from bot.config import BoardConfig
 from bot.discord_ingest import service
 from bot.discord_ingest.discord_notifier import DiscordSurface
-from bot.discord_ingest.service import (
-    handle_source_note_confirm,
-    handle_source_note_reject,
-    recompute_and_request,
-    skip_all_alt_text,
-    waive_source,
-    render_submission_status,
-)
+from bot.curation.core import handle_source_note_confirm, handle_source_note_reject, recompute_and_request, skip_all_alt_text, waive_source, render_submission_status
 from bot.curation.outcomes import Ack, Noop, Tombstone
 from bot.models import Attachment, AttachmentAltTextRequest, SourceRequest, SubmissionLink
 from bot.state import AltTextStatus, SubmissionState

@@ -14,7 +14,7 @@ import discord
 
 from ..curation.events import InteractionEvent, ReactionEvent, ReplyEvent
 from ..curation.outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
-from . import prompts
+from ..curation import prompts
 from .adapters import discord_message_to_inbound
 from .discord_notifier import DiscordSurface
 from .render import render_components, render_modal
