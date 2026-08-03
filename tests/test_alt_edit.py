@@ -14,7 +14,7 @@ from sqlalchemy import select
 from bot.config import BoardConfig
 from bot.discord_ingest import render, service
 from bot.curation import prompts
-from bot.curation.core import apply_post_edits, apply_single_alt, handle_alt_edit_button, handle_alt_pick, handle_edit_button
+from bot.curation.handlers import apply_post_edits, apply_single_alt, handle_alt_edit_button, handle_alt_pick, handle_edit_button
 from bot.curation.events import InteractionEvent
 from bot.curation.outcomes import Ack, Noop, OpenModal
 from bot.models import Attachment, SubmissionLink
@@ -154,7 +154,7 @@ async def test_post_edit_modal_on_submit_applies(session, board):
     inter = _interaction()
     with (
         patch("bot.db.session_scope", bound_session_scope(session)),
-        patch("bot.curation.core.apply_post_edits", new_callable=AsyncMock) as apply,
+        patch("bot.curation.handlers.apply_post_edits", new_callable=AsyncMock) as apply,
     ):
         await render._dispatch_modal_submit(
             "edit_post:7", {"caption": "New", "alt:1": "the alt"}, inter
@@ -311,7 +311,7 @@ async def test_alt_edit_modal_on_submit_applies(session, board):
     inter = _interaction()
     with (
         patch("bot.db.session_scope", bound_session_scope(session)),
-        patch("bot.curation.core.apply_single_alt", new_callable=AsyncMock) as apply,
+        patch("bot.curation.handlers.apply_single_alt", new_callable=AsyncMock) as apply,
     ):
         await render._dispatch_modal_submit("edit_alt:5", {"alt": "brand new alt"}, inter)
     apply.assert_awaited_once()

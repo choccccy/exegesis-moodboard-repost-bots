@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from bot.config import BoardConfig
 from bot.curation.events import ReactionEvent
-from bot.curation.core import handle_reaction_removed
+from bot.curation.handlers import handle_reaction_removed
 from bot.models import PublishAttempt, Submission
 from bot.state import SubmissionState
 

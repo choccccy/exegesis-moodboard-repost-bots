@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..asset_store import submission_dir
 from ..config import get_settings
 from ..db import dispose_engine, init_engine, session_scope
-from ..curation.core import _LinkPlan, _attach_resolved_video, _download_resolved_video
+from ..curation.ingest import _LinkPlan, _attach_resolved_video, _download_resolved_video
 from ..models import Attachment, Submission, SubmissionLink
 from ..resolve import resolve
 from ..state import SubmissionState

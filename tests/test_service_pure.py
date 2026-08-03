@@ -15,7 +15,8 @@ import discord
 from PIL import Image
 
 from bot.discord_ingest.service import _discord_file_for_animated_gif, _discord_file_for_attachment
-from bot.curation.core import _DISCORD_MAX_BYTES, _alt_preview_for, _image_status, _primary_link, _queue_action, _triage_relative
+from bot.curation.statemachine import _DISCORD_MAX_BYTES, _alt_preview_for, _image_status, _primary_link, _queue_action
+from bot.curation.handlers import _triage_relative
 from bot.models import Attachment, SubmissionLink
 from bot.state import SubmissionState
 
@@ -184,7 +185,7 @@ def test_animated_gif_falls_back_to_static_jpeg_when_nothing_fits(tmp_path):
     path = tmp_path / "anim.gif"
     _write_animated_gif(path)
 
-    with patch("bot.curation.core._DISCORD_MAX_BYTES", 1):
+    with patch("bot.curation.statemachine._DISCORD_MAX_BYTES", 1):
         with Image.open(path) as img:
             f = _discord_file_for_animated_gif(img, "anim.gif")
 

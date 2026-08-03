@@ -21,7 +21,9 @@ from bot.asset_store import StorageFullError
 from bot.config import BoardConfig
 from bot.curation import replies
 from bot.discord_ingest.service import _find_publish_time_duplicate, _discord_file_for_attachment, _post_thread_anchor, _resolve_thread, handle_reaction, publish_queued_submission
-from bot.curation.core import _apply_answer, _build_post_preview, _AttachmentPlan, _IngestPlan, _LinkPlan, _attach_resolved_video, _download_attachment_file, _download_resolved_video, _determine_kind, _gather_ingest, _is_authorized, _persist_ingest_outcome, _persist_ingest_skeletons, _resolve_parent_ref, handle_cancel_button, handle_cancel_reaction, handle_confirm_button, handle_confirmation_reaction, handle_label_reaction, handle_metadata_confirm_button, handle_metadata_reaction, handle_playlist_opt_out, handle_playlist_skip_button, handle_reaction_removed, recompute_and_request
+from bot.curation.ingest import _AttachmentPlan, _IngestPlan, _LinkPlan, _attach_resolved_video, _download_attachment_file, _download_resolved_video, _gather_ingest, _persist_ingest_outcome, _persist_ingest_skeletons
+from bot.curation.statemachine import _build_post_preview, _determine_kind, _resolve_parent_ref, recompute_and_request
+from bot.curation.handlers import _apply_answer, _is_authorized, handle_cancel_button, handle_cancel_reaction, handle_confirm_button, handle_confirmation_reaction, handle_label_reaction, handle_metadata_confirm_button, handle_metadata_reaction, handle_playlist_opt_out, handle_playlist_skip_button, handle_reaction_removed
 from bot.curation.types import InboundAttachment, InboundEmbed, InboundMessage, InboundSnapshot
 from bot.models import (
     Attachment,
@@ -206,7 +208,7 @@ async def test_handle_reaction_duplicate_of_published_closes_thread(session, boa
     new_thread = _thread(thread_id=800)
     msg.channel.create_thread.return_value = new_thread
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
          patch("bot.discord_ingest.service.remove_submission_dir"), \
          patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock), \
          patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:
@@ -655,7 +657,7 @@ async def test_gather_no_image_url_skips_download(session, board):
         thumb_proxy_url=None, has_existing_video=False,
     )
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=meta):
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=meta):
         outcome = await _gather_ingest(plan, _svc_settings(board), AsyncMock())
     await _persist_ingest_outcome(session, outcome, sub.id)
 
@@ -672,8 +674,8 @@ async def test_resolved_video_missing_file_size_zero(session, board, tmp_path):
     ghost = str(tmp_path / "never-created.mp4")
     lp = _LinkPlan(link_id=link.id, canonical_url=link.canonical_url, domain_family="other", is_primary=True)
 
-    with patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=ghost), \
-         patch("bot.curation.core._transcode_video", new_callable=AsyncMock, return_value=ghost):
+    with patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=ghost), \
+         patch("bot.curation.ingest._transcode_video", new_callable=AsyncMock, return_value=ghost):
         path = await _download_resolved_video(lp, meta, str(tmp_path), _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock())
 
     # getsize OSError on the never-created file degrades to size 0 -> under limit -> kept.
@@ -691,7 +693,7 @@ async def test_download_attachment_storage_full_returns_none(session, board, tmp
     plan = _AttachmentPlan(row_id=5, url="https://cdn/img.png", filename="img.png", is_video=False)
 
     with patch(
-        "bot.curation.core.download_attachment",
+        "bot.curation.ingest.download_attachment",
         new_callable=AsyncMock, side_effect=StorageFullError("disk full"),
     ):
         path = await _download_attachment_file(plan, str(tmp_path), _svc_settings(board, tmp_dir=str(tmp_path)), AsyncMock())

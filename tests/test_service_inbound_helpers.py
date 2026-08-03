@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select
 
 from bot.discord_ingest import service
-from bot.curation import core
+from bot.curation import handlers, ingest, statemachine
 from bot.curation.surface import NullSurface
 from bot.curation.types import InboundAttachment, InboundMessage
 from bot.models import Attachment, SubmissionLink
@@ -41,10 +41,10 @@ async def test_ingest_attachment_downloads_and_records_path(session, board):
         id=555, url="https://cdn/pic.jpg", filename="pic.jpg", content_type="image/jpeg"
     )
     with patch(
-        "bot.curation.core._download_attachment_file",
+        "bot.curation.ingest._download_attachment_file",
         new=AsyncMock(return_value="/data/attachments/1/1/pic.jpg"),
     ):
-        await core._ingest_attachment_in_session(session, sub, att, _settings(), MagicMock())
+        await ingest._ingest_attachment_in_session(session, sub, att, _settings(), MagicMock())
 
     rows = list(await session.scalars(
         select(Attachment).where(Attachment.submission_id == sub.id)
@@ -67,10 +67,10 @@ async def test_ingest_attachment_no_path_when_download_fails(session, board):
         id=777, url="https://cdn/x.jpg", filename="x.jpg", content_type="image/jpeg"
     )
     with patch(
-        "bot.curation.core._download_attachment_file",
+        "bot.curation.ingest._download_attachment_file",
         new=AsyncMock(return_value=None),
     ):
-        await core._ingest_attachment_in_session(session, sub, att, _settings(), MagicMock())
+        await ingest._ingest_attachment_in_session(session, sub, att, _settings(), MagicMock())
 
     row = (await session.scalars(
         select(Attachment).where(Attachment.submission_id == sub.id)
@@ -96,10 +96,10 @@ async def test_resolve_links_reingests_existing_links(session, board):
     await session.flush()
 
     with (
-        patch("bot.curation.core._gather_ingest", new=AsyncMock(return_value=MagicMock())) as gather,
-        patch("bot.curation.core._persist_ingest_outcome", new=AsyncMock()) as persist,
+        patch("bot.curation.ingest._gather_ingest", new=AsyncMock(return_value=MagicMock())) as gather,
+        patch("bot.curation.ingest._persist_ingest_outcome", new=AsyncMock()) as persist,
     ):
-        await core._resolve_links_in_session(session, sub, _settings(), MagicMock())
+        await ingest._resolve_links_in_session(session, sub, _settings(), MagicMock())
 
     gather.assert_awaited_once()
     plan = gather.await_args.args[0]
@@ -113,8 +113,8 @@ async def test_resolve_links_noop_when_no_links(session, board):
     session.add(sub)
     await session.flush()
 
-    with patch("bot.curation.core._gather_ingest", new=AsyncMock()) as gather:
-        await core._resolve_links_in_session(session, sub, _settings(), MagicMock())
+    with patch("bot.curation.ingest._gather_ingest", new=AsyncMock()) as gather:
+        await ingest._resolve_links_in_session(session, sub, _settings(), MagicMock())
     gather.assert_not_awaited()
 
 
@@ -124,14 +124,14 @@ async def test_persist_ingest_outcome_skips_missing_rows(session, board):
     await session.flush()
     # Outcome references an attachment row and a link that no longer exist -
     # both must be skipped rather than crashing.
-    outcome = core._IngestOutcome(
-        link_outcomes=[core._LinkOutcome(
+    outcome = ingest._IngestOutcome(
+        link_outcomes=[ingest._LinkOutcome(
             link_id=_MISSING_ID, title="t", description="d", image_url=None,
             via="opengraph", source_at_uri=None, image_path=None,
         )],
         att_paths={_MISSING_ID: "/fake/path.jpg"},
     )
-    await core._persist_ingest_outcome(session, outcome, sub.id)  # no error
+    await ingest._persist_ingest_outcome(session, outcome, sub.id)  # no error
 
 
 async def test_attach_resolved_video_skips_when_video_exists(session, board):
@@ -145,7 +145,7 @@ async def test_attach_resolved_video_skips_when_video_exists(session, board):
     ))
     await session.flush()
 
-    created = await core._attach_resolved_video(
+    created = await ingest._attach_resolved_video(
         session, sub.id, link_id=1,
         video_url="https://cdn/v.mp4", video_width=1, video_height=1, video_path="/fake/v.mp4",
     )
@@ -157,9 +157,9 @@ async def test_attach_resolved_video_skips_when_video_exists(session, board):
 # ---------------------------------------------------------------------------
 
 async def test_ingest_message_content_missing_submission(session):
-    with patch("bot.curation.core.session_scope", bound_session_scope(session)):
+    with patch("bot.curation.ingest.session_scope", bound_session_scope(session)):
         # Returns without raising when the submission vanished before ingest.
-        await core.ingest_message_content(_settings(), InboundMessage(content="x"), _MISSING_ID, MagicMock())
+        await ingest.ingest_message_content(_settings(), InboundMessage(content="x"), _MISSING_ID, MagicMock())
 
 
 async def test_reingest_missing_submission(session):
@@ -170,7 +170,7 @@ async def test_reingest_missing_submission(session):
 
 
 async def test_recompute_missing_submission(session):
-    result = await core.recompute_and_request(
+    result = await statemachine.recompute_and_request(
         _MISSING_ID, settings=_settings(), destination=NullSurface(),
         yt_client=None, ambient_session=session,
     )

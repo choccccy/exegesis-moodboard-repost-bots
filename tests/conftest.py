@@ -249,7 +249,8 @@ def bind_db_scopes(session):
     """
     scope = bound_session_scope(session)
     with patch("bot.discord_ingest.service.session_scope", scope), \
-         patch("bot.curation.core.session_scope", scope), \
+         patch("bot.curation.base.session_scope", scope), \
+         patch("bot.curation.ingest.session_scope", scope), \
          patch("bot.scheduler.session_scope", scope):
         yield session
 

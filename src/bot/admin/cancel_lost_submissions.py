@@ -30,7 +30,7 @@ from ..config import get_settings
 from ..db import dispose_engine, init_engine, session_scope
 from ..curation import replies
 from ..discord_ingest.service import _archive_thread
-from ..curation.core import _delete_submission_cascade
+from ..curation.handlers import _delete_submission_cascade
 from ..models import Submission
 from ..state import SubmissionState
 

@@ -14,7 +14,8 @@ from sqlalchemy import select
 from bot.config import BoardConfig
 from bot.curation import replies
 from bot.discord_ingest.service import publish_queued_submission
-from bot.curation.core import _build_post_preview, _transcode_video
+from bot.curation.ingest import _transcode_video
+from bot.curation.statemachine import _build_post_preview
 from bot.models import Attachment, PublishAttempt, SubmissionLink
 from bot.publish import PublishResult
 from bot.state import GraphicStatus, PublishOutcome, SubmissionState

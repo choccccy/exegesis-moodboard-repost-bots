@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 from sqlalchemy import select
 
-from bot.curation.core import handle_cancel_reaction, handle_source_cancel_reaction
+from bot.curation.handlers import handle_cancel_reaction, handle_source_cancel_reaction
 from bot.config import BoardConfig
 from bot.curation.events import ReactionEvent
 from bot.models import (
@@ -141,7 +141,7 @@ async def test_cancel_reaction_op_deletes_and_archives(session, board):
     sub = await _seed_submission(session, board)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_cancel_reaction(
             session, _reaction_event(OP_ID, CANCEL_MSG_ID), dest, _settings(),
         )
@@ -159,7 +159,7 @@ async def test_cancel_reaction_explicit_curator_authorized(session, board):
     sub = await _seed_submission(session, board)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir"):
+    with patch("bot.curation.handlers.remove_submission_dir"):
         await handle_cancel_reaction(
             session, _reaction_event(CURATOR_ID, CANCEL_MSG_ID), dest, _settings(),
         )
@@ -174,7 +174,7 @@ async def test_cancel_reaction_role_curator_authorized(session, board):
     member = _member_with_roles(CURATOR_ROLE_ID)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir"):
+    with patch("bot.curation.handlers.remove_submission_dir"):
         await handle_cancel_reaction(
             session, _reaction_event(RANDO_ID, CANCEL_MSG_ID, member=member), dest, _settings(),
         )
@@ -189,7 +189,7 @@ async def test_cancel_reaction_non_curator_ignored(session, board):
     member = _member_with_roles(7)  # unrelated role
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_cancel_reaction(
             session, _reaction_event(RANDO_ID, CANCEL_MSG_ID, member=member), dest, _settings(),
         )
@@ -204,7 +204,7 @@ async def test_cancel_reaction_unknown_message_ignored(session, board):
     await _seed_submission(session, board)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_cancel_reaction(
             session, _reaction_event(OP_ID, 123456), dest, _settings(),
         )
@@ -232,7 +232,7 @@ async def test_cancel_reaction_published_is_terminal(session, board):
     sub = await _seed_submission(session, board, state=SubmissionState.PUBLISHED.value)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_cancel_reaction(
             session, _reaction_event(OP_ID, CANCEL_MSG_ID), dest, _settings(),
         )
@@ -259,7 +259,7 @@ async def test_source_cancel_op_cancels_submission(session, board):
     sub = await _seed_submission(session, board, with_cancel_request=False)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_source_cancel_reaction(session, _src_event(OP_ID), dest, _settings())
 
     assert await session.get(Submission, sub.id) is None
@@ -273,7 +273,7 @@ async def test_source_cancel_explicit_curator_cancels(session, board):
     sub = await _seed_submission(session, board, with_cancel_request=False)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir"):
+    with patch("bot.curation.handlers.remove_submission_dir"):
         await handle_source_cancel_reaction(session, _src_event(CURATOR_ID), dest, _settings())
 
     assert dest.cleared_triggers == [(100, SOURCE_MSG_ID)]
@@ -285,7 +285,7 @@ async def test_source_cancel_role_curator_cancels(session, board):
     member = _member_with_roles(CURATOR_ROLE_ID)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir"):
+    with patch("bot.curation.handlers.remove_submission_dir"):
         await handle_source_cancel_reaction(
             session, _src_event(RANDO_ID, member=member), dest, _settings(),
         )
@@ -299,7 +299,7 @@ async def test_source_cancel_unauthorized_ignored(session, board):
     sub = await _seed_submission(session, board, with_cancel_request=False)
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_source_cancel_reaction(
             session, _src_event(RANDO_ID, member=_member_with_roles(7)), dest, _settings(),
         )
@@ -334,7 +334,7 @@ async def test_source_cancel_published_submission_kept(session, board):
     )
     dest = MockDest()
 
-    with patch("bot.curation.core.remove_submission_dir") as rm:
+    with patch("bot.curation.handlers.remove_submission_dir") as rm:
         await handle_source_cancel_reaction(session, _src_event(OP_ID), dest, _settings())
 
     assert await session.get(Submission, sub.id) is not None

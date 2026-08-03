@@ -160,7 +160,7 @@ async def test_e2e_external_link_published(session, board, bind_db_scopes):
     settings = _settings(board)
     msg, _ = _discord_message(board, content="https://example.com/cool-robot")
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=None), \
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=None), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK_RESULT) as mock_pub:
 
         # Step 1: ingest
@@ -241,9 +241,9 @@ async def test_e2e_image_attachment_published(session, board, bind_db_scopes):
         discord_attachments=[att],
     )
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=None), \
-         patch("bot.curation.core.submission_dir", return_value="/tmp/e2e-atts"), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock,
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=None), \
+         patch("bot.curation.ingest.submission_dir", return_value="/tmp/e2e-atts"), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock,
                return_value="/tmp/e2e-atts/1_robot.jpg"), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_OK_RESULT) as mock_pub:
 
@@ -294,7 +294,7 @@ async def test_e2e_publish_failure_recorded(session, board, bind_db_scopes):
     settings = _settings(board)
     msg, _ = _discord_message(board)
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=None), \
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=None), \
          patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=_FAIL_RESULT):
 
         await handle_reaction(
@@ -346,7 +346,7 @@ async def test_e2e_embed_metadata_captured(session, board, bind_db_scopes):
     msg, _ = _discord_message(board, content="https://example.com/post")
     msg.embeds = [embed]
 
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=None):
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=None):
         await handle_reaction(
             settings=settings, message=msg,
             http_client=AsyncMock(), skip_auth=True,

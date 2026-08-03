@@ -323,11 +323,11 @@ async def test_thread_catchup_replays_reactions_and_replies(repost_bot, session,
         _patch_user(42),
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
-        patch("bot.curation.core.handle_label_reaction", new_callable=AsyncMock) as label,
-        patch("bot.curation.core.handle_metadata_reaction", new_callable=AsyncMock) as meta,
-        patch("bot.curation.core.handle_cancel_reaction", new_callable=AsyncMock) as cancel,
-        patch("bot.curation.core.handle_reply", new_callable=AsyncMock) as reply,
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.handlers.handle_label_reaction", new_callable=AsyncMock) as label,
+        patch("bot.curation.handlers.handle_metadata_reaction", new_callable=AsyncMock) as meta,
+        patch("bot.curation.handlers.handle_cancel_reaction", new_callable=AsyncMock) as cancel,
+        patch("bot.curation.handlers.handle_reply", new_callable=AsyncMock) as reply,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch(
             "bot.discord_ingest.client.service._fire_and_forget",
             side_effect=lambda coro: (fired.append(coro), coro.close()),
@@ -355,7 +355,7 @@ async def test_thread_catchup_skips_missing_thread(repost_bot, session, board):
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch("bot.discord_ingest.client.service.cancel_submission_for_deleted_thread", new_callable=AsyncMock) as purge,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
@@ -433,7 +433,7 @@ async def test_thread_catchup_recompute_failure_is_logged_not_raised(repost_bot,
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
         patch(
-            "bot.curation.core.recompute_and_request",
+            "bot.curation.statemachine.recompute_and_request",
             new_callable=AsyncMock, side_effect=RuntimeError("boom"),
         ) as recompute,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
@@ -451,7 +451,7 @@ async def test_thread_catchup_submission_gone_skips_recompute(repost_bot, sessio
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
         patch.object(session, "get", new=AsyncMock(return_value=None)),
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
@@ -466,7 +466,7 @@ async def test_thread_catchup_survives_history_failure(repost_bot, session, boar
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()  # must not raise
@@ -565,7 +565,7 @@ async def test_thread_catchup_includes_only_collapsed_ready_to_queue(repost_bot,
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
@@ -589,7 +589,7 @@ async def test_thread_catchup_processes_newest_submissions_first(repost_bot, ses
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
         patch(
-            "bot.curation.core.recompute_and_request",
+            "bot.curation.statemachine.recompute_and_request",
             new_callable=AsyncMock,
             side_effect=lambda sub_id, **kw: order.append(sub_id),
         ),
@@ -611,7 +611,7 @@ async def test_thread_catchup_unarchives_thread_before_recompute(repost_bot, ses
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch("bot.discord_ingest.client.asyncio.sleep", new_callable=AsyncMock),
         patch("bot.discord_ingest.client.service._unarchive_thread", new_callable=AsyncMock) as unarchive,
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
@@ -641,7 +641,7 @@ async def test_archive_queued_threads_scheduling(
     with (
         patch("bot.discord_ingest.client.session_scope", bound_session_scope(session)),
         patch(
-            "bot.curation.core._playlist_close_ready",
+            "bot.curation.statemachine._playlist_close_ready",
             new_callable=AsyncMock, return_value=playlist_ready,
         ) as ready_check,
         patch(
@@ -766,7 +766,7 @@ async def test_threadless_retry_creates_missing_thread(repost_bot, session, boar
             "bot.discord_ingest.client.service.ensure_thread_persisted",
             new_callable=AsyncMock, return_value=(thread, False),
         ) as ensure,
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
     ):
         with pytest.raises(_StopLoop):
             await repost_bot._run_threadless_retry_loop()
@@ -814,7 +814,7 @@ async def test_threadless_retry_thread_creation_still_failing(repost_bot, sessio
             "bot.discord_ingest.client.service.ensure_thread_persisted",
             new_callable=AsyncMock, return_value=(None, False),
         ),
-        patch("bot.curation.core.recompute_and_request", new_callable=AsyncMock) as recompute,
+        patch("bot.curation.statemachine.recompute_and_request", new_callable=AsyncMock) as recompute,
     ):
         with pytest.raises(_StopLoop):
             await repost_bot._run_threadless_retry_loop()

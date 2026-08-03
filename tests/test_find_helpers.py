@@ -1,7 +1,7 @@
 """Tests for _find_prior_post and _find_duplicate helper functions."""
 from __future__ import annotations
 
-from bot.curation.core import _find_prior_post, _find_duplicate
+from bot.curation.handlers import _find_prior_post, _find_duplicate
 from bot.models import PublishAttempt, SubmissionLink
 from bot.state import SubmissionState
 

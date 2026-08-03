@@ -14,7 +14,8 @@ from sqlalchemy import select
 
 from bot.config import BoardConfig
 from bot.state import SubmissionState
-from bot.curation.core import _auto_add_to_playlist, _do_playlist_remove, _playlist_close_ready, handle_playlist_opt_out
+from bot.curation.statemachine import _playlist_close_ready
+from bot.curation.handlers import _auto_add_to_playlist, _do_playlist_remove, handle_playlist_opt_out
 from bot.models import SubmissionLink, YoutubePlaylistAdd
 from bot.curation.events import ReactionEvent
 

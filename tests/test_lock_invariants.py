@@ -226,7 +226,7 @@ async def test_submission_lock_serializes_per_submission():
     place of the global lock) blocks a second acquire for the SAME submission while
     letting a DIFFERENT submission proceed - the deterministic mutual-exclusion guard
     the doc's Step 2 prescribes. No flaky race repro needed."""
-    from bot.curation.core import _submission_lock
+    from bot.curation.base import _submission_lock
 
     lock_x = _submission_lock(9001)
     await lock_x.acquire()

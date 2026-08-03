@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from bot.curation.core import _IngestPlan, _LinkPlan, _gather_ingest, _persist_ingest_outcome
+from bot.curation.ingest import _IngestPlan, _LinkPlan, _gather_ingest, _persist_ingest_outcome
 from bot.models import Attachment, SubmissionLink
 from bot.resolve import ResolvedMetadata
 from bot.state import AltTextStatus, SubmissionState
@@ -69,7 +69,7 @@ async def _run_link_ingest(session, sub, link, meta, settings, *, has_existing_v
         att_plans=[], embed_title=None, embed_description=None, embed_thumb_url=None,
         thumb_proxy_url=None, has_existing_video=has_existing_video,
     )
-    with patch("bot.curation.core.resolve", new_callable=AsyncMock, return_value=meta):
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=meta):
         outcome = await _gather_ingest(plan, settings, AsyncMock())
     await _persist_ingest_outcome(session, outcome, sub.id)
 
@@ -87,9 +87,9 @@ async def test_creates_video_attachment_on_success(session, board, tmp_path):
     video_file = tmp_path / "clip.mp4"
     video_file.write_bytes(b"fake-mp4-bytes")
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=str(video_file)) as mock_dl, \
-         patch("bot.curation.core._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=str(video_file)) as mock_dl, \
+         patch("bot.curation.ingest._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
         await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
@@ -108,8 +108,8 @@ async def test_creates_video_attachment_on_success(session, board, tmp_path):
 async def test_download_failure_creates_no_row(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board)
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock,
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock,
                side_effect=httpx.ConnectError("cdn unreachable")):
         await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
@@ -126,7 +126,7 @@ async def test_skips_when_video_attachment_already_exists(session, board, tmp_pa
     ))
     await session.flush()
 
-    with patch("bot.curation.core.download_attachment", new_callable=AsyncMock) as mock_dl:
+    with patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock) as mock_dl:
         # has_existing_video=True is what _persist_ingest_skeletons computes when a
         # video attachment is already present (Discord-uploaded or preserved video).
         await _run_link_ingest(session, sub, link, _video_meta(), _settings(), has_existing_video=True)
@@ -141,10 +141,10 @@ async def test_oversize_video_skipped(session, board, tmp_path):
     video_file = tmp_path / "big.mp4"
     video_file.write_bytes(b"x" * 64)
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
-         patch("bot.curation.core._transcode_video", new_callable=AsyncMock, return_value=str(video_file)), \
-         patch("bot.curation.core._MAX_RESOLVED_VIDEO_BYTES", 32):
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
+         patch("bot.curation.ingest._transcode_video", new_callable=AsyncMock, return_value=str(video_file)), \
+         patch("bot.curation.ingest._MAX_RESOLVED_VIDEO_BYTES", 32):
         await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
@@ -156,9 +156,9 @@ async def test_ingest_video_for_primary_link(session, board, tmp_path):
     video_file = tmp_path / "clip.mp4"
     video_file.write_bytes(b"fake-mp4-bytes")
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
-         patch("bot.curation.core._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=str(video_file)), \
+         patch("bot.curation.ingest._transcode_video", new_callable=AsyncMock, return_value=str(video_file)):
         await _run_link_ingest(session, sub, link, _video_meta(), _settings())
 
     atts = await _video_attachments(session, sub.id)
@@ -170,8 +170,8 @@ async def test_no_video_url_no_attachment(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board)
     meta = ResolvedMetadata(title="pic", image_url="https://pbs.twimg.com/photo.jpg", via="fxtwitter_api")
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock, return_value=str(tmp_path / "thumb")):
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock, return_value=str(tmp_path / "thumb")):
         await _run_link_ingest(session, sub, link, meta, _settings())
 
     atts = await _video_attachments(session, sub.id)
@@ -194,10 +194,10 @@ async def test_stream_video_muxed_and_attached(session, board, tmp_path):
     out = tmp_path / f"linkvid_{link.id}.mp4"
     out.write_bytes(b"muxed-mp4")
 
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core._fetch_stream_video",
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest._fetch_stream_video",
                new_callable=AsyncMock, return_value=str(out)) as mock_mux, \
-         patch("bot.curation.core.download_attachment", new_callable=AsyncMock) as mock_dl:
+         patch("bot.curation.ingest.download_attachment", new_callable=AsyncMock) as mock_dl:
         await _run_link_ingest(session, sub, link, _stream_meta(), _settings())
 
     mock_mux.assert_awaited_once()  # went through the ffmpeg mux path
@@ -208,18 +208,18 @@ async def test_stream_video_muxed_and_attached(session, board, tmp_path):
 
 async def test_stream_video_mux_failure_falls_back(session, board, tmp_path):
     sub, link = await _submission_with_link(session, board, url="https://www.reddit.com/r/x/comments/1/t/")
-    with patch("bot.curation.core.submission_dir", return_value=str(tmp_path)), \
-         patch("bot.curation.core._fetch_stream_video", new_callable=AsyncMock, return_value=None):
+    with patch("bot.curation.ingest.submission_dir", return_value=str(tmp_path)), \
+         patch("bot.curation.ingest._fetch_stream_video", new_callable=AsyncMock, return_value=None):
         await _run_link_ingest(session, sub, link, _stream_meta(), _settings())
     assert await _video_attachments(session, sub.id) == []  # no broken attachment
 
 
 async def test_fetch_stream_video_success(tmp_path):
-    from bot.curation.core import _fetch_stream_video
+    from bot.curation.ingest import _fetch_stream_video
     proc = MagicMock()
     proc.returncode = 0
     proc.communicate = AsyncMock(return_value=(b"", b""))
-    with patch("bot.curation.core.has_free_space", return_value=True), \
+    with patch("bot.curation.ingest.has_free_space", return_value=True), \
          patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
                new_callable=AsyncMock, return_value=proc):
         path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
@@ -227,11 +227,11 @@ async def test_fetch_stream_video_success(tmp_path):
 
 
 async def test_fetch_stream_video_ffmpeg_error(tmp_path):
-    from bot.curation.core import _fetch_stream_video
+    from bot.curation.ingest import _fetch_stream_video
     proc = MagicMock()
     proc.returncode = 1
     proc.communicate = AsyncMock(return_value=(b"", b"boom"))
-    with patch("bot.curation.core.has_free_space", return_value=True), \
+    with patch("bot.curation.ingest.has_free_space", return_value=True), \
          patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
                new_callable=AsyncMock, return_value=proc):
         path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
@@ -239,11 +239,11 @@ async def test_fetch_stream_video_ffmpeg_error(tmp_path):
 
 
 async def test_fetch_stream_video_timeout(tmp_path):
-    from bot.curation.core import _fetch_stream_video
+    from bot.curation.ingest import _fetch_stream_video
     proc = MagicMock()
     proc.kill = MagicMock()
     proc.communicate = AsyncMock(side_effect=__import__("asyncio").TimeoutError)
-    with patch("bot.curation.core.has_free_space", return_value=True), \
+    with patch("bot.curation.ingest.has_free_space", return_value=True), \
          patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
                new_callable=AsyncMock, return_value=proc):
         path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
@@ -252,15 +252,15 @@ async def test_fetch_stream_video_timeout(tmp_path):
 
 
 async def test_fetch_stream_video_no_space(tmp_path):
-    from bot.curation.core import _fetch_stream_video
-    with patch("bot.curation.core.has_free_space", return_value=False):
+    from bot.curation.ingest import _fetch_stream_video
+    with patch("bot.curation.ingest.has_free_space", return_value=False):
         path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())
     assert path is None
 
 
 async def test_fetch_stream_video_ffmpeg_missing(tmp_path):
-    from bot.curation.core import _fetch_stream_video
-    with patch("bot.curation.core.has_free_space", return_value=True), \
+    from bot.curation.ingest import _fetch_stream_video
+    with patch("bot.curation.ingest.has_free_space", return_value=True), \
          patch("bot.discord_ingest.service.asyncio.create_subprocess_exec",
                new_callable=AsyncMock, side_effect=OSError("ffmpeg not found")):
         path = await _fetch_stream_video("https://v.redd.it/a/HLSPlaylist.m3u8", str(tmp_path), "out.mp4", _settings())

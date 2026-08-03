@@ -1,7 +1,7 @@
 """Tests for _snapshot helper function."""
 from __future__ import annotations
 
-from bot.curation.core import _snapshot
+from bot.curation.statemachine import _snapshot
 from bot.models import Attachment, MetadataRequest, SubmissionLink
 from bot.state import AltTextStatus, GraphicStatus
 

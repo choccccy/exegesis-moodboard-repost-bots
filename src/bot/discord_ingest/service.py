@@ -80,7 +80,7 @@ from ..db import session_scope
 
 log = logging.getLogger(__name__)
 
-from ..curation import core  # noqa: E402  (agnostic core; service is the Discord layer)
+from ..curation import base, handlers, ingest, statemachine  # noqa: E402  (agnostic core; service is the Discord layer)
 
 
 # Keyed by Discord message ID. Prevents two concurrent handle_reaction calls for
@@ -112,13 +112,13 @@ async def handle_reaction(
         # Beat 1 (DB): resolve board + authorize, load-or-create the submission and
         # ingest its content, then read the title + existing thread mapping.
         async with session_scope() as session:
-            board = await core._board_for_channel(session, message.channel.id)
+            board = await handlers._board_for_channel(session, message.channel.id)
             if board is None:
                 return False  # not a watched channel
 
             if not skip_auth:
                 board_cfg = settings.board_for_channel(message.channel.id)
-                if not core._is_curator(member, user_id, board_cfg):
+                if not handlers._is_curator(member, user_id, board_cfg):
                     return False
 
             submission = await session.scalar(
@@ -154,7 +154,7 @@ async def handle_reaction(
         # Ingest links/media for a new submission with the lock released (HTTP +
         # downloads run outside any session_scope; self-managing).
         if created:
-            await core.ingest_message_content(
+            await ingest.ingest_message_content(
                 settings, discord_message_to_inbound(message), submission_id, http_client,
             )
 
@@ -193,7 +193,7 @@ async def handle_reaction(
             return False
 
         # Beat 4c (lock released): recompute is self-managing (its sends run off the lock).
-        await core.recompute_and_request(
+        await statemachine.recompute_and_request(
             submission_id, settings=settings, destination=surface, yt_client=yt_client, bot_id=bot_id,
         )
         return new_thread
@@ -213,7 +213,7 @@ async def _detect_and_teardown_duplicate(
         select(SubmissionLink).where(SubmissionLink.submission_id == submission.id)
     ))
     for link in links:
-        dup = await core._find_duplicate(session, link.canonical_url, submission.id, guild_id)
+        dup = await handlers._find_duplicate(session, link.canonical_url, submission.id, guild_id)
         if dup is None:
             continue
         kind, ref_url = dup
@@ -226,7 +226,7 @@ async def _detect_and_teardown_duplicate(
         log.info("submission %s is a duplicate (%s); closing thread", submission.id, kind)
         board = await session.get(Board, submission.board_id)
         remove_submission_dir(settings.attachments_dir, board.id if board else 0, submission.id)
-        await core._delete_submission_cascade(session, submission.id)
+        await handlers._delete_submission_cascade(session, submission.id)
         return notice
     return None
 
@@ -544,7 +544,7 @@ async def reingest_submission(
         submission.embed_thumb_url = None
 
     # Beat 2: re-ingest with the lock released (self-managing).
-    await core.ingest_message_content(
+    await ingest.ingest_message_content(
         settings, discord_message_to_inbound(message), submission_id, http_client,
     )
 
@@ -568,7 +568,7 @@ def _discord_file_for_animated_gif(img: object, filename: str) -> discord.File:
     from PIL import Image, ImageSequence
 
     w, h = img.size
-    scale = min(1.0, core._ALT_PREVIEW_MAX_PX / max(w, h))
+    scale = min(1.0, statemachine._ALT_PREVIEW_MAX_PX / max(w, h))
     new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
 
     frames: list = []
@@ -589,7 +589,7 @@ def _discord_file_for_animated_gif(img: object, filename: str) -> discord.File:
             duration=durations, loop=0, quality=quality,
         )
         buf.seek(0)
-        if buf.getbuffer().nbytes <= core._DISCORD_MAX_BYTES:
+        if buf.getbuffer().nbytes <= statemachine._DISCORD_MAX_BYTES:
             return discord.File(buf, filename=f"{stem}.webp")
 
     # Nothing fit as animated WebP - show first frame only.
@@ -617,13 +617,13 @@ def _discord_file_for_attachment(local_path: str, filename: str) -> discord.File
         if fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
             img = img.convert("RGB")
         w, h = img.size
-        if max(w, h) > core._ALT_PREVIEW_MAX_PX:
-            scale = core._ALT_PREVIEW_MAX_PX / max(w, h)
+        if max(w, h) > statemachine._ALT_PREVIEW_MAX_PX:
+            scale = statemachine._ALT_PREVIEW_MAX_PX / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format=fmt)
         buf.seek(0)
-        if buf.getbuffer().nbytes > core._DISCORD_MAX_BYTES:
+        if buf.getbuffer().nbytes > statemachine._DISCORD_MAX_BYTES:
             # Still too large after resize - re-encode as JPEG at reduced quality
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=70)
@@ -643,12 +643,12 @@ async def cancel_submission_for_deleted_thread(
     submission = await session.scalar(
         select(Submission).where(Submission.thread_id == thread_id)
     )
-    if submission is None or submission.state in core._QUEUE_TERMINAL:
+    if submission is None or submission.state in statemachine._QUEUE_TERMINAL:
         return None
     sub_id = submission.id
     board = await session.get(Board, submission.board_id)
     remove_submission_dir(settings.attachments_dir, board.id if board else 0, sub_id)
-    await core._delete_submission_cascade(session, sub_id)
+    await handlers._delete_submission_cascade(session, sub_id)
     log.info("purged submission %s: its Discord thread %s was deleted", sub_id, thread_id)
     return sub_id
 
@@ -689,7 +689,7 @@ async def _archive_thread_after_delay_seconds(
 
 def _archive_thread_after_delay(thread: discord.Thread, *, notice: str | None = None) -> None:
     """Schedule archival of a thread after the standard close delay."""
-    _fire_and_forget(_archive_thread_after_delay_seconds(thread, core._THREAD_CLOSE_DELAY, notice=notice))
+    _fire_and_forget(_archive_thread_after_delay_seconds(thread, statemachine._THREAD_CLOSE_DELAY, notice=notice))
 
 
 async def _archive_thread(thread: discord.Thread, *, notice: str | None = None) -> None:
@@ -806,7 +806,7 @@ async def publish_queued_submission(
         if submission is None:
             log.warning("publish: submission %s vanished before publish", submission_id)
             return PublishOutcome.FAILED
-        _snap, atts, links = await core._snapshot(session, submission)
+        _snap, atts, links = await statemachine._snapshot(session, submission)
         board_cfg = settings.board_for_channel(submission.channel_id)
 
         if not board_cfg or not board_cfg.bluesky_handle:
@@ -823,8 +823,8 @@ async def publish_queued_submission(
             session.add(PublishAttempt(submission_id=submission_id, success=False, error=err))
             early = ("FAILED", err, board_cfg.curator_user_ids)
         else:
-            parent_ref = await core._resolve_parent_ref(session, submission)
-            if parent_ref is core._DEFERRED:
+            parent_ref = await statemachine._resolve_parent_ref(session, submission)
+            if parent_ref is statemachine._DEFERRED:
                 early = ("DEFERRED",)
             elif (dup := await _find_publish_time_duplicate(session, submission, links)) is not None:
                 bsky_url = dup.bsky_url or dup.at_uri

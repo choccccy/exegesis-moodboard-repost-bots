@@ -84,7 +84,7 @@ async def _dispatch_modal_submit(
 ) -> None:
     """Route a submitted modal to the curation call named by its action_id prefix."""
     from ..db import session_scope
-    from ..curation import core
+    from ..curation import handlers
 
     if action_id.startswith("edit_post:"):
         submission_id = int(action_id.removeprefix("edit_post:"))
@@ -92,7 +92,7 @@ async def _dispatch_modal_submit(
             int(k.removeprefix("alt:")): v for k, v in values.items() if k.startswith("alt:")
         }
         async with session_scope() as session:
-            await core.apply_post_edits(
+            await handlers.apply_post_edits(
                 session,
                 submission_id=submission_id,
                 new_title=values.get("caption", ""),
@@ -103,7 +103,7 @@ async def _dispatch_modal_submit(
     elif action_id.startswith("edit_alt:"):
         attachment_id = int(action_id.removeprefix("edit_alt:"))
         async with session_scope() as session:
-            await core.apply_single_alt(
+            await handlers.apply_single_alt(
                 session,
                 attachment_id=attachment_id,
                 value=values.get("alt", ""),

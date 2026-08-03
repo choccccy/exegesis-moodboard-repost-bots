@@ -23,7 +23,7 @@ import pytest_asyncio
 from sqlalchemy import select
 
 from bot.curation import replies
-from bot.curation.core import recompute_and_request
+from bot.curation.statemachine import recompute_and_request
 from bot.models import (
     Attachment,
     Board,
