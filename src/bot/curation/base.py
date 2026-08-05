@@ -6,66 +6,8 @@ tests/test_curation_boundary.py). Was previously all in curation/core.py.
 from __future__ import annotations
 import asyncio
 import contextlib
-import io
 import logging
-import os
-from dataclasses import dataclass
 from datetime import datetime, timezone
-import httpx
-from sqlalchemy import delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from ..accessibility import initial_alt_text, is_image_attachment, is_video_attachment
-from ..asset_store import (
-    StorageFullError,
-    download_attachment,
-    has_free_space,
-    remove_submission_dir,
-    submission_dir,
-)
-from ..canonicalize import canonicalize, is_bluesky_post_url
-from ..mirrors import mirror_hint_for_url
-from ..config import BoardConfig, Settings
-from ..models import (
-    AttachmentAltTextRequest,
-    Attachment,
-    Board,
-    CancellationRequest,
-    ConfirmationRequest,
-    ContentLabelRequest,
-    ImageRequest,
-    MetadataRequest,
-    PublishAttempt,
-    SourceRequest,
-    Submission,
-    SubmissionLink,
-    SubmissionThread,
-    SupplementalImageRequest,
-    SupplementalLinkRequest,
-    YoutubePlaylistAdd,
-)
-from .. import publish as publisher
-from ..moderation import (
-    GRAPHIC_YES_EMOJI,
-    graphic_from_emoji,
-)
-from ..resolve import ResolvedMetadata, resolve, resolve_bluesky_at_uri
-from ..state import (
-    AltTextStatus,
-    GraphicStatus,
-    Gap,
-    PublishOutcome,
-    SubmissionSnapshot,
-    SubmissionState,
-    evaluate_state,
-    missing_gaps,
-)
-from .surface import NullSurface, Surface, SurfaceError
-from .types import InboundAttachment, InboundMessage
-from . import prompts, replies
-from .events import InteractionEvent, ReactionEvent, ReplyEvent
-from .outcomes import Ack, HandlerOutcome, Noop, OpenModal, Tombstone
-from .urls import extract_urls, is_discord_internal_url
-from .components import PreviewImage
 from ..db import session_scope
 
 log = logging.getLogger(__name__)
