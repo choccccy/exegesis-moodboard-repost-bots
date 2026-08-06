@@ -81,6 +81,12 @@ class Surface(Protocol):
 
     async def unarchive(self) -> None: ...
 
+    async def is_archived(self) -> bool:
+        """Whether the destination thread is currently archived (fetched fresh, since
+        a cached flag is unreliable after edits). False for non-thread channels. Lets
+        background re-renders restore the archived state they had to break to post."""
+        ...
+
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         """Remove the trigger reaction from the original source-channel message."""
         ...
@@ -120,6 +126,9 @@ class NullSurface:
 
     async def unarchive(self) -> None:
         pass
+
+    async def is_archived(self) -> bool:
+        return False
 
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         pass

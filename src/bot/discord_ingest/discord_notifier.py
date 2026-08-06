@@ -121,6 +121,20 @@ class DiscordSurface:
             from .service import _unarchive_thread
             await _unarchive_thread(self._channel)
 
+    async def is_archived(self) -> bool:
+        if not isinstance(self._channel, discord.Thread):
+            return False
+        # The cached ``archived`` flag is unreliable after edits (Thread.edit returns a
+        # fresh object, see service._archive_thread), so refetch when we have a client.
+        if self._client is not None:
+            try:
+                fresh = await self._client.fetch_channel(self._channel.id)
+                if isinstance(fresh, discord.Thread):
+                    return fresh.archived
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                log.debug("is_archived fetch failed for thread %s: %s", self._channel.id, exc)
+        return self._channel.archived
+
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         if self._client is None:
             log.debug("clear_trigger skipped: no client on surface")

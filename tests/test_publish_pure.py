@@ -198,3 +198,22 @@ def test_kind_video_takes_precedence_over_images():
 
 def test_kind_record_takes_precedence_over_video():
     assert _determine_kind([_link(domain_family="bluesky")], True, True) == "record"
+
+
+# _determine_kind - #62: bare bsky *profile* links are ordinary source links, not
+# native reposts (a profile URL has no post to repost - it used to be mis-routed to
+# "record" and then fail at publish with "could not resolve Bluesky post").
+def test_kind_bsky_profile_link_is_external_not_record():
+    profile = _link(
+        domain_family="bluesky",
+        canonical_url="https://bsky.app/profile/lodrawsfilth.bsky.social",
+    )
+    assert _determine_kind([profile], False, False) == "external"
+
+
+def test_kind_bsky_post_link_is_record():
+    post = _link(
+        domain_family="bluesky",
+        canonical_url="https://bsky.app/profile/alice.bsky.social/post/abc123",
+    )
+    assert _determine_kind([post], False, False) == "record"

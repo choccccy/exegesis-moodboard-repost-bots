@@ -28,6 +28,7 @@ from ..models import (
     SourceRequest,
     Submission,
     SubmissionLink,
+    SubmissionThread,
     SupplementalImageRequest,
     SupplementalLinkRequest,
     YoutubePlaylistAdd,
@@ -240,15 +241,37 @@ async def _find_duplicate(
         .limit(1)
     )
     if active is not None:
-        thread_url = (
-            f"https://discord.com/channels/{guild_id}/{active.thread_id}"
-            if active.thread_id and guild_id
-            else None
-        )
+        thread_url = await _thread_link(session, active, guild_id)
         kind = "queued" if active.state == SubmissionState.QUEUED.value else "pending"
         return kind, thread_url
 
     return None
+
+
+async def _thread_link(session: AsyncSession, submission: Submission, guild_id: int) -> str | None:
+    """Build a Discord jump link to a submission's curation thread, or None.
+
+    Prefers the live ``Submission.thread_id`` but falls back to the durable
+    ``SubmissionThread`` mapping (which outlives the submission and survives 🦋 removal),
+    so the "already queued" reply keeps a link even after teardown. Deep-links to the
+    status checklist message when we have one, otherwise to the thread itself.
+    """
+    if not guild_id:
+        return None
+    thread_id = submission.thread_id
+    if thread_id is None:
+        thread_id = await session.scalar(
+            select(SubmissionThread.thread_id).where(
+                SubmissionThread.board_id == submission.board_id,
+                SubmissionThread.source_discord_message_id == submission.source_discord_message_id,
+            )
+        )
+    if thread_id is None:
+        return None
+    base = f"https://discord.com/channels/{guild_id}/{thread_id}"
+    if submission.status_message_id:
+        return f"{base}/{submission.status_message_id}"
+    return base
 
 
 async def handle_reaction_removed(

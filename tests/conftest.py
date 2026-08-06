@@ -148,6 +148,7 @@ class MockDest:
         self.unarchived: int = 0
         self.cleared_triggers: list[tuple[int, int]] = []  # (channel_id, message_id)
         self.missing_message_ids: set[int] = set()
+        self.currently_archived: bool = False  # what is_archived() reports (background re-render)
 
     async def send(self, content=None, *, components=None, preview=None, **kwargs):
         # Mirror render_preview: building a preview for a missing file raises, so the
@@ -193,6 +194,9 @@ class MockDest:
 
     async def unarchive(self) -> None:
         self.unarchived += 1
+
+    async def is_archived(self) -> bool:
+        return self.currently_archived
 
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         self.cleared_triggers.append((source_channel_id, source_message_id))

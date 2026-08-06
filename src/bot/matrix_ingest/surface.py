@@ -66,5 +66,8 @@ class MatrixSurface:
     async def unarchive(self) -> None:
         raise NotImplementedError(_TODO)
 
+    async def is_archived(self) -> bool:
+        raise NotImplementedError(_TODO)
+
     async def clear_trigger(self, source_channel_id: int, source_message_id: int, emoji: str) -> None:
         raise NotImplementedError(_TODO)

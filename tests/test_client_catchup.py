@@ -599,9 +599,10 @@ async def test_thread_catchup_processes_newest_submissions_first(repost_bot, ses
     assert order == [new.id, old.id]  # newest processed before oldest
 
 
-async def test_thread_catchup_unarchives_thread_before_recompute(repost_bot, session, board):
-    """An archived thread must be unarchived before recompute so that sends succeed.
-    Without this, the confirmation button repost silently fails."""
+async def test_thread_catchup_recomputes_in_background(repost_bot, session, board):
+    """The catch-up delegates archive handling to recompute via background=True, which
+    unarchives to post if needed and re-archives after - so an idle-archived thread is
+    not left reopened (issue #65). The catch-up no longer unarchives unconditionally."""
     await _add_pending_thread(session, board, thread_id=889)
     thread = MagicMock(spec=discord.Thread)
     thread.archived = True
@@ -615,8 +616,9 @@ async def test_thread_catchup_unarchives_thread_before_recompute(repost_bot, ses
         patch("bot.discord_ingest.client.service._fire_and_forget", side_effect=lambda coro: coro.close()),
     ):
         await repost_bot._run_thread_catchup()
-    unarchive.assert_awaited_once_with(thread)
+    unarchive.assert_not_awaited()  # no blanket unarchive; recompute owns lifecycle now
     recompute.assert_awaited_once()
+    assert recompute.await_args.kwargs.get("background") is True
 
 
 # ---------------------------------------------------------------------------

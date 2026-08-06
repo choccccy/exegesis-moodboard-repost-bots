@@ -8,10 +8,35 @@ These cover the invariants that were broken by two related bugs:
      to queued on re-evaluation (the "silent" path).
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
-from bot.curation.statemachine import _queue_action
+from bot.curation.statemachine import _determine_kind, _queue_action
+from bot.models import SubmissionLink
 from bot.state import SubmissionState
+
+
+def _link(domain_family: str, canonical_url: str) -> SubmissionLink:
+    link = MagicMock(spec=SubmissionLink)
+    link.domain_family = domain_family
+    link.canonical_url = canonical_url
+    return link
+
+
+# ---------------------------------------------------------------------------
+# _determine_kind - the preview/checklist classification (#62): only real bsky
+# *post* links become native reposts; a bare profile link is an external source link.
+# ---------------------------------------------------------------------------
+
+def test_preview_kind_bsky_profile_link_is_external():
+    profile = _link("bluesky", "https://bsky.app/profile/lodrawsfilth.bsky.social")
+    assert _determine_kind([profile], False, False) == "external"
+
+
+def test_preview_kind_bsky_post_link_is_record():
+    post = _link("bluesky", "https://bsky.app/profile/alice.bsky.social/post/abc123")
+    assert _determine_kind([post], False, False) == "record"
 
 
 # Shorthand for state values

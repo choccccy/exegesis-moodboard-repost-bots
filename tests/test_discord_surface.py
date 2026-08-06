@@ -204,6 +204,39 @@ async def test_unarchive_noop_for_non_thread():
     un.assert_not_awaited()
 
 
+async def test_is_archived_false_for_non_thread():
+    channel = MagicMock(spec=discord.TextChannel)
+    assert await DiscordSurface(channel).is_archived() is False
+
+
+async def test_is_archived_refetches_thread_when_client_present():
+    # The cached flag is stale (False); a fresh fetch reveals the thread is archived.
+    thread = MagicMock(spec=discord.Thread)
+    thread.archived = False
+    thread.id = 77
+    fresh = MagicMock(spec=discord.Thread)
+    fresh.archived = True
+    client = MagicMock()
+    client.fetch_channel = AsyncMock(return_value=fresh)
+    assert await DiscordSurface(thread, client=client).is_archived() is True
+    client.fetch_channel.assert_awaited_once_with(77)
+
+
+async def test_is_archived_falls_back_to_cached_flag_on_fetch_failure():
+    thread = MagicMock(spec=discord.Thread)
+    thread.archived = True
+    thread.id = 88
+    client = MagicMock()
+    client.fetch_channel = AsyncMock(side_effect=_http_exc(discord.Forbidden))
+    assert await DiscordSurface(thread, client=client).is_archived() is True
+
+
+async def test_is_archived_uses_cached_flag_without_client():
+    thread = MagicMock(spec=discord.Thread)
+    thread.archived = True
+    assert await DiscordSurface(thread).is_archived() is True
+
+
 # --- clear_trigger (acts on the *source* channel via the client) ------------
 
 async def test_clear_trigger_skipped_without_client():
@@ -249,6 +282,7 @@ async def test_null_surface_swallows_every_operation():
     assert await s.disable_components(1, "l") is False
     assert await s.edit_or_none(1, "c") is False
     assert await s.message_exists(1) is True  # can't disprove existence -> assume yes
+    assert await s.is_archived() is False
     # lifecycle + clear_trigger are silent no-ops
     await s.archive()
     s.archive_after_delay()

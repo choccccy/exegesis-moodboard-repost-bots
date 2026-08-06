@@ -293,6 +293,7 @@ async def recompute_and_request(
     yt_client=None,
     bot_id: int | None = None,
     from_reply: bool = False,
+    background: bool = False,
     ambient_session: AsyncSession | None = None,
 ) -> SubmissionState:
     """Re-evaluate state and post any still-missing requests (idempotently).
@@ -308,6 +309,14 @@ async def recompute_and_request(
     lock, sends included) instead of opening its own scopes. New/de-scoped callers pass
     nothing and must NOT hold a session_scope. ``destination`` is a ``Surface`` (callers
     wrap a raw channel at the Discord boundary before calling in).
+
+    ``background`` marks a sweep that is not driven by a human acting in the thread
+    (startup catch-up, on-edit re-render). An archived thread rejects new sends, so we
+    must unarchive to post - but a background re-render must not leave a thread reopened
+    that was archived (e.g. auto-archived for inactivity). When set, we snapshot the
+    archived state, unarchive if needed, and re-archive at the end. Human-triggered
+    recomputes leave ``background`` False: their thread is already open (Discord
+    unarchives it the moment the human posts), so nothing changes for them.
     """
     async with base._maybe_submission_lock(ambient_session, submission_id):
         # --- Decide (short DB scope): read state + open-request flags, set state. ---
@@ -405,6 +414,13 @@ async def recompute_and_request(
         to_add: list = []
         to_delete_conf_ids: list[int] = []
         new_status_id: int | None = None
+
+        # A background sweep must not leave an archived thread reopened. Snapshot the
+        # state and unarchive only if needed to post; we restore it after the sends.
+        restore_archived = False
+        if background and await destination.is_archived():
+            restore_archived = True
+            await destination.unarchive()
 
         # Cancel button: posted once, before any other requests.
         if not has_cancel:
@@ -550,6 +566,11 @@ async def recompute_and_request(
             except SurfaceError as exc:
                 log.warning("could not post updated notice for submission %s: %s", submission_id, exc)
             await destination.archive(replies.closing_notice("updated"))
+
+        # Restore the archived state a background re-render had to break to post
+        # (silent - no closing notice, since nothing user-facing changed).
+        if restore_archived:
+            await destination.archive()
 
         # --- Persist (short DB scope): tracking rows + checklist id + deletions. ---
         async with base._scope(ambient_session) as session:

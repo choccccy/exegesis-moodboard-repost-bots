@@ -9,6 +9,8 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
+from ..canonicalize import is_bluesky_post_url
+
 log = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (compatible; ExegesisRepostBot/0.1; +https://bsky.app)"
@@ -621,10 +623,10 @@ async def resolve_bluesky_at_uri(
     post URL or the handle can't be resolved - callers fall back to resolving the
     handle live at publish. Only authoritative resolution is used; no fuzzy search.
     """
-    parts = urlsplit(canonical_url).path.strip("/").split("/")
     # Expect: profile/<handle-or-did>/post/<rkey>
-    if len(parts) < 4 or parts[0] != "profile" or parts[2] != "post":
+    if not is_bluesky_post_url(canonical_url):
         return None
+    parts = urlsplit(canonical_url).path.strip("/").split("/")
     handle_or_did, rkey = parts[1], parts[3]
     if handle_or_did.startswith("did:"):
         did = handle_or_did

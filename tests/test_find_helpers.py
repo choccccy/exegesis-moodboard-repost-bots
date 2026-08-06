@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from bot.curation.handlers import _find_prior_post, _find_duplicate
-from bot.models import PublishAttempt, SubmissionLink
+from bot.models import PublishAttempt, SubmissionLink, SubmissionThread
 from bot.state import SubmissionState
 
 from conftest import make_submission
@@ -175,3 +175,61 @@ async def test_find_duplicate_excludes_self(session, board):
 
     result = await _find_duplicate(session, "https://example.com/self", sub.id, guild_id=1)
     assert result is None
+
+
+# --- #63: the "already queued" link is deep + resilient ----------------------
+
+
+async def test_find_duplicate_deep_links_to_status_message(session, board):
+    queued = make_submission(
+        board, state=SubmissionState.QUEUED.value, thread_id=888, status_message_id=999,
+    )
+    session.add(queued)
+    await session.flush()
+    await _add_link(session, queued, "https://example.com/deep")
+
+    new_sub = make_submission(board, source_discord_message_id=2)
+    session.add(new_sub)
+    await session.flush()
+
+    result = await _find_duplicate(session, "https://example.com/deep", new_sub.id, guild_id=5)
+    assert result == ("queued", "https://discord.com/channels/5/888/999")
+
+
+async def test_find_duplicate_falls_back_to_submission_thread_mapping(session, board):
+    # thread_id was cleared on the submission (e.g. teardown), but the durable
+    # SubmissionThread mapping still knows where the thread lives.
+    queued = make_submission(
+        board, state=SubmissionState.QUEUED.value, source_discord_message_id=42, thread_id=None,
+    )
+    session.add(queued)
+    await session.flush()
+    await _add_link(session, queued, "https://example.com/durable")
+    session.add(SubmissionThread(
+        board_id=board.id, source_discord_message_id=42, thread_id=1234,
+    ))
+    await session.flush()
+
+    new_sub = make_submission(board, source_discord_message_id=2)
+    session.add(new_sub)
+    await session.flush()
+
+    result = await _find_duplicate(session, "https://example.com/durable", new_sub.id, guild_id=5)
+    assert result == ("queued", "https://discord.com/channels/5/1234")
+
+
+async def test_find_duplicate_no_link_without_thread(session, board):
+    # No live thread_id and no durable mapping -> reply degrades to linkless text.
+    queued = make_submission(
+        board, state=SubmissionState.QUEUED.value, source_discord_message_id=77, thread_id=None,
+    )
+    session.add(queued)
+    await session.flush()
+    await _add_link(session, queued, "https://example.com/nothread")
+
+    new_sub = make_submission(board, source_discord_message_id=2)
+    session.add(new_sub)
+    await session.flush()
+
+    result = await _find_duplicate(session, "https://example.com/nothread", new_sub.id, guild_id=5)
+    assert result == ("queued", None)

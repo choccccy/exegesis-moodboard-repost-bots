@@ -398,14 +398,13 @@ async def _resolve_bluesky_post(client: AsyncClient, canonical_url: str) -> tupl
     captured before we pinned the DID (``source_at_uri``); it fails if the author
     has since renamed or deactivated the handle in the URL.
     """
-    parsed = urlparse(canonical_url)
-    # path: /profile/{handle_or_did}/post/{rkey}
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) < 4 or parts[0] != "profile" or parts[2] != "post":
+    if not is_bluesky_post_url(canonical_url):
         # A bare profile link or otherwise malformed bsky URL - not a repostable
         # post. Raise a clear error instead of an IndexError so the publish-failure
         # report is legible (was: "list index out of range").
         raise ValueError(f"not a Bluesky post URL: {canonical_url}")
+    # path: /profile/{handle_or_did}/post/{rkey}
+    parts = urlparse(canonical_url).path.strip("/").split("/")
     handle_or_did = parts[1]
     rkey = parts[3]
 

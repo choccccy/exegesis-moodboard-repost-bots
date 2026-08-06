@@ -390,3 +390,59 @@ async def test_alt_text_request_not_duplicated(session, board):
     alt_text_msgs2 = [m for m in dest2.sent if "alt text for" in m]
     assert len(alt_text_msgs1) == 1
     assert len(alt_text_msgs2) == 0  # already open, not re-posted
+
+
+# ---------------------------------------------------------------------------
+# #65: background re-renders must not leave archived threads reopened
+# ---------------------------------------------------------------------------
+
+async def test_background_recompute_restores_archived_thread(session, board):
+    # A non-terminal submission whose thread Discord auto-archived for inactivity.
+    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value, status_message_id=555)
+    session.add(sub)
+    await session.flush()  # no link -> stays blocked on source, non-terminal
+
+    dest = MockDest()
+    dest.currently_archived = True
+    await recompute_and_request(
+        sub.id, settings=_mock_settings(), destination=dest,
+        background=True, ambient_session=session,
+    )
+    await session.flush()
+
+    assert dest.unarchived == 1          # unarchived once so its sends could land
+    assert dest.archived == [None]       # then restored the archived state (silent)
+    assert dest.sent                     # it still (re)rendered the requests/checklist
+
+
+async def test_background_recompute_leaves_open_thread_open(session, board):
+    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value, status_message_id=555)
+    session.add(sub)
+    await session.flush()
+
+    dest = MockDest()
+    dest.currently_archived = False
+    await recompute_and_request(
+        sub.id, settings=_mock_settings(), destination=dest,
+        background=True, ambient_session=session,
+    )
+
+    assert dest.unarchived == 0
+    assert dest.archived == []           # an already-open thread is never archived
+
+
+async def test_foreground_recompute_never_touches_archive(session, board):
+    # A human-triggered (non-background) recompute never queries or restores archived
+    # state, even if the thread happens to report archived.
+    sub = make_submission(board, state=SubmissionState.INTENT_SUBMITTED.value, status_message_id=555)
+    session.add(sub)
+    await session.flush()
+
+    dest = MockDest()
+    dest.currently_archived = True
+    await recompute_and_request(
+        sub.id, settings=_mock_settings(), destination=dest, ambient_session=session,
+    )
+
+    assert dest.unarchived == 0
+    assert dest.archived == []

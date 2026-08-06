@@ -986,10 +986,8 @@ class RepostBot(discord.Client):
             # Ensure all missing request messages (including the cancel button and the
             # live status checklist) are present. This is what backfills the checklist
             # onto idle open submissions from before the feature existed.
-            # Unarchive first: an archived thread rejects new sends, which would
-            # silently swallow the confirmation-button repost and leave it missing.
-            if isinstance(thread, discord.Thread):
-                await service._unarchive_thread(thread)
+            # background=True: recompute unarchives to post if needed, then restores the
+            # archived state, so this sweep never leaves an idle-archived thread reopened.
             try:
                 async with session_scope() as session:
                     submission = await session.get(Submission, submission_id)
@@ -998,6 +996,7 @@ class RepostBot(discord.Client):
                             submission.id, settings=self.settings,
                             destination=gateway.surface_for_channel(thread, self),
                             bot_id=getattr(self.user, "id", None),
+                            background=True,
                             ambient_session=session,
                         )
             except Exception:
