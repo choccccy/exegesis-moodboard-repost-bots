@@ -218,6 +218,23 @@ async def test_find_duplicate_falls_back_to_submission_thread_mapping(session, b
     assert result == ("queued", "https://discord.com/channels/5/1234")
 
 
+async def test_find_duplicate_no_link_without_guild(session, board):
+    # guild_id 0 (DM / unknown guild) -> no jump link can be built.
+    queued = make_submission(
+        board, state=SubmissionState.QUEUED.value, thread_id=888, status_message_id=999,
+    )
+    session.add(queued)
+    await session.flush()
+    await _add_link(session, queued, "https://example.com/noguild")
+
+    new_sub = make_submission(board, source_discord_message_id=2)
+    session.add(new_sub)
+    await session.flush()
+
+    result = await _find_duplicate(session, "https://example.com/noguild", new_sub.id, guild_id=0)
+    assert result == ("queued", None)
+
+
 async def test_find_duplicate_no_link_without_thread(session, board):
     # No live thread_id and no durable mapping -> reply degrades to linkless text.
     queued = make_submission(

@@ -81,4 +81,6 @@ async def test_matrix_surface_methods_raise_until_wired():
     with pytest.raises(NotImplementedError):
         await s.unarchive()
     with pytest.raises(NotImplementedError):
+        await s.is_archived()
+    with pytest.raises(NotImplementedError):
         await s.clear_trigger(1, 2, "x")
