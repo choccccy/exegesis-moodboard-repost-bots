@@ -249,16 +249,42 @@ def queue_blocked_notice(gaps: str) -> str:
     )
 
 
+def _fenced(error: str | None) -> str:
+    """Error in a fenced code block so it's easy to select and copy, and so any
+    backticks/markdown in the message render literally rather than as formatting."""
+    return (error or "unknown error").replace("```", "``​`")
+
+
 def publish_failed_notice(error: str | None, mention_user_ids: list[int] | None = None) -> str:
     mentions = " ".join(f"<@{uid}>" for uid in (mention_user_ids or []))
     prefix = f"{mentions} " if mentions else ""
-    # Error in a fenced code block so it's easy to select and copy, and so any
-    # backticks/markdown in the message render literally rather than as formatting.
-    detail = (error or "unknown error").replace("```", "``​`")
     return (
         f"{prefix}⚠️ publish failed:\n"
-        f"```\n{detail}\n```\n"
+        f"```\n{_fenced(error)}\n```\n"
         "will retry automatically at the next available queue slot"
+    )
+
+
+def bsky_unavailable_notice(error: str | None) -> str:
+    """Bluesky is down/overloaded - out of our hands. No @-mention: there's
+    nothing a curator can do, and it retries on its own at the next slot."""
+    return (
+        "⚠️ Bluesky isn't responding right now:\n"
+        f"```\n{_fenced(error)}\n```\n"
+        "This submission will retry automatically at the next queue slot - no action needed."
+    )
+
+
+def publish_blocked_notice(error: str | None, mention_user_ids: list[int] | None = None) -> str:
+    """A permanent, our-side failure (bad credentials, invalid content). This does
+    NOT retry automatically - a curator must fix the cause and re-queue."""
+    mentions = " ".join(f"<@{uid}>" for uid in (mention_user_ids or []))
+    prefix = f"{mentions} " if mentions else ""
+    return (
+        f"{prefix}⛔ publish blocked - needs a fix:\n"
+        f"```\n{_fenced(error)}\n```\n"
+        "This won't retry automatically. Resolve the issue, then re-queue "
+        "(admin: `python -m bot.admin.requeue_blocked`)."
     )
 
 

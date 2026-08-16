@@ -928,8 +928,9 @@ async def test_attempt_publish_no_board_handle_fails(session, board, bind_db_sco
 
     result = await publish_queued_submission(settings, sub.id, RaisingDest())
 
-    assert result is PublishOutcome.FAILED
-    assert sub.state == SubmissionState.PUBLISH_FAILED.value
+    # Board-wide config gap: block (no auto-retry) and abandon the tick.
+    assert result is PublishOutcome.UNAVAILABLE
+    assert sub.state == SubmissionState.PUBLISH_BLOCKED.value
     attempt = await session.scalar(select(PublishAttempt).where(PublishAttempt.submission_id == sub.id))
     assert "no Bluesky handle" in attempt.error
 
@@ -943,7 +944,7 @@ async def test_attempt_publish_no_password_notice_failure_swallowed(session, boa
         _svc_settings(board, password=None), sub.id, RaisingDest()
     )
 
-    assert result is PublishOutcome.FAILED
+    assert result is PublishOutcome.UNAVAILABLE
     attempt = await session.scalar(select(PublishAttempt).where(PublishAttempt.submission_id == sub.id))
     assert "no app password" in attempt.error
 

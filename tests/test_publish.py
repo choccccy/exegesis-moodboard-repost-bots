@@ -33,7 +33,7 @@ from bot.publish import (
     at_uri_to_url,
     publish_submission,
 )
-from bot.state import GraphicStatus
+from bot.state import FailureKind, GraphicStatus
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ async def test_publish_external_uploads_thumbnail_when_path_present():
     client = _mock_client()
     link = _link(resolved_image_path="/data/thumb.jpg")
 
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))) as mock_upload:
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))) as mock_upload:
         result = await _publish_external(client, [link], labels=None, tags=[])
 
     assert result.success
@@ -380,7 +380,7 @@ async def test_publish_images_uploads_each_image():
         _attachment(local_path="/data/a.jpg", alt_text_body="first image"),
         _attachment(local_path="/data/b.jpg", alt_text_body="second image"),
     ]
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))) as mock_upload:
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))) as mock_upload:
         result = await _publish_images(client, [_link()], atts, labels=None, tags=[])
 
     assert result.success
@@ -391,7 +391,7 @@ async def test_publish_images_uploads_each_image():
 async def test_publish_images_preserves_alt_text():
     client = _mock_client()
     atts = [_attachment(alt_text_body="a cute robot")]
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))):
         await _publish_images(client, [_link()], atts, labels=None, tags=[])
 
     images = client.com.atproto.repo.create_record.call_args[0][0].record.embed.images
@@ -405,7 +405,7 @@ async def test_publish_images_skips_non_image_attachments():
         _attachment(is_image=False, local_path="/data/doc.pdf"),
         _attachment(is_image=True, local_path="/data/img.jpg", alt_text_body="photo"),
     ]
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))) as mock_upload:
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))) as mock_upload:
         result = await _publish_images(client, [_link()], atts, labels=None, tags=[])
 
     assert result.success
@@ -425,7 +425,7 @@ async def test_publish_images_fails_when_no_local_path():
 async def test_publish_images_text_contains_source_url():
     client = _mock_client()
     atts = [_attachment()]
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))):
         await _publish_images(
             client,
             [_link(canonical_url="https://www.artstation.com/artwork/BmBmAA")],
@@ -480,7 +480,7 @@ async def test_upload_video_blob_uses_pds_upload_blob_not_video_service(tmp_path
     video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42fake-video-bytes")
     client = _client_with_upload_blob()
 
-    blob, err = await _upload_video_blob(client, _video_attachment(str(video_file)))
+    blob, err, _kind = await _upload_video_blob(client, _video_attachment(str(video_file)))
 
     assert blob is client.upload_blob.return_value.blob
     assert err is None
@@ -491,7 +491,7 @@ async def test_upload_video_blob_uses_pds_upload_blob_not_video_service(tmp_path
 @pytest.mark.asyncio
 async def test_upload_video_blob_no_local_path_returns_none():
     client = _client_with_upload_blob()
-    blob, err = await _upload_video_blob(client, _video_attachment(None))
+    blob, err, _kind = await _upload_video_blob(client, _video_attachment(None))
     assert blob is None
     assert err is not None and "no local file" in err
     client.upload_blob.assert_not_awaited()
@@ -504,7 +504,7 @@ async def test_upload_video_blob_oversize_returns_none_without_upload(tmp_path):
     client = _client_with_upload_blob()
 
     with patch("bot.publish._BSKY_MAX_VIDEO", 16):
-        blob, err = await _upload_video_blob(client, _video_attachment(str(video_file)))
+        blob, err, _kind = await _upload_video_blob(client, _video_attachment(str(video_file)))
 
     assert blob is None
     assert err is not None and "32 bytes" in err
@@ -518,7 +518,7 @@ async def test_upload_video_blob_upload_error_returns_detail(tmp_path):
     client = _client_with_upload_blob()
     client.upload_blob = AsyncMock(side_effect=Exception("boom"))
 
-    blob, err = await _upload_video_blob(client, _video_attachment(str(video_file)))
+    blob, err, _kind = await _upload_video_blob(client, _video_attachment(str(video_file)))
     assert blob is None
     assert err is not None and "boom" in err
 
@@ -564,13 +564,15 @@ async def test_publish_images_error_includes_underlying_cause():
     client = _mock_client()
     atts = [_attachment(local_path="/data/img.jpg")]
 
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(None, "Exception: disk on fire"))):
+    with patch("bot.publish._upload_blob",
+               new=AsyncMock(return_value=(None, "Exception: disk on fire", FailureKind.UNKNOWN))):
         result = await _publish_images(client, [_link()], atts, labels=None, tags=[])
 
     assert not result.success
     assert result.error is not None
     assert "no images could be uploaded" in result.error
     assert "disk on fire" in result.error
+    assert result.failure_kind is FailureKind.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +628,7 @@ async def test_publish_submission_likes_own_post():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -647,7 +649,7 @@ async def test_publish_submission_like_failure_does_not_fail_publish():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -667,7 +669,7 @@ async def test_publish_submission_bsky_url_uses_handle():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -689,7 +691,7 @@ async def test_publish_submission_nsfw_board_adds_nsfw_tag():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -710,7 +712,7 @@ async def test_publish_submission_board_tags_appended():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -908,7 +910,7 @@ async def test_publish_submission_multi_link_creates_reply_posts():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -933,7 +935,7 @@ async def test_publish_submission_single_link_no_reply_posts():
 
     with (
         patch("bot.publish.AsyncClient") as MockClient,
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         client = _mock_client()
         client.login = AsyncMock()
@@ -993,7 +995,7 @@ async def test_login_returns_last_exception_after_exhausting_retries():
 
 
 @pytest.mark.asyncio
-async def test_publish_submission_reports_exception_type_on_login_failure():
+async def test_publish_submission_reports_timeout_on_login_failure():
     board = _board()
     sub = _submission()
     link = _link(canonical_url="https://example.com/x", domain_family="generic")
@@ -1004,5 +1006,8 @@ async def test_publish_submission_reports_exception_type_on_login_failure():
         MockClient.return_value = client
         result = await publish_submission(sub, [link], [], board, "pw")
     assert result.success is False
-    # The empty str(exc) would have left a bare "login failed:"; the type name fills it in.
-    assert "TimeoutError" in result.error
+    # A timeout has no message; classification renders a legible, upstream detail
+    # instead of the old bare "login failed:" / "TimeoutError:".
+    assert result.error == "login failed: timeout contacting Bluesky"
+    assert result.failure_kind is FailureKind.UPSTREAM
+    assert result.board_wide is True

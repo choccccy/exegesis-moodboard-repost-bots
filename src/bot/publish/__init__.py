@@ -16,11 +16,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from atproto import AsyncClient, models
+from atproto_client.exceptions import (
+    BadRequestError,
+    NetworkError,
+    UnauthorizedError,
+)
 
 from ..canonicalize import is_bluesky_post_url
 from ..config import BoardConfig
 from ..models import Attachment, Submission, SubmissionLink
-from ..state import GraphicStatus
+from ..state import FailureKind, GraphicStatus
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +55,11 @@ class PublishResult:
     is_repost: bool = False
     bsky_root_uri: str | None = None
     bsky_root_cid: str | None = None
+    # How the failure was classified (None on success). Drives retry + notification.
+    failure_kind: FailureKind | None = None
+    # True when the failure was board-wide (login), so every submission for the
+    # board would fail identically this tick.
+    board_wide: bool = False
 
 
 # createSession occasionally drops the connection or times out on Bluesky's side.
@@ -72,7 +82,7 @@ async def _login_with_retries(client: AsyncClient, handle: str, password: str) -
             if attempt < _LOGIN_ATTEMPTS - 1:
                 log.warning(
                     "Bluesky login attempt %d/%d failed (%s), retrying",
-                    attempt + 1, _LOGIN_ATTEMPTS, _error_detail(exc),
+                    attempt + 1, _LOGIN_ATTEMPTS, _classify_failure(exc)[1],
                 )
                 await asyncio.sleep(_LOGIN_BACKOFF_SECONDS[attempt])
     return last_exc
@@ -97,8 +107,14 @@ async def publish_submission(
     client = AsyncClient()
     login_exc = await _login_with_retries(client, board_cfg.bluesky_handle, password)
     if login_exc is not None:
-        log.error("Bluesky login failed for board %s: %s", board_cfg.name, _error_detail(login_exc))
-        return PublishResult(success=False, error=f"login failed: {_error_detail(login_exc)}")
+        kind, detail = _classify_failure(login_exc)
+        log.error("Bluesky login failed for board %s: %s", board_cfg.name, detail)
+        # Login failure is board-wide: every submission for this board fails the
+        # same way, so mark board_wide so the scheduler can abandon the tick.
+        return PublishResult(
+            success=False, error=f"login failed: {detail}",
+            failure_kind=kind, board_wide=True,
+        )
 
     has_uploaded_images = any(a.is_image for a in attachments)
     has_uploaded_video = any(a.is_video for a in attachments)
@@ -128,8 +144,9 @@ async def publish_submission(
         else:
             return PublishResult(success=False, error=f"unsupported embed kind: {kind}")
     except Exception as exc:
-        log.error("publish failed for submission %s: %s", submission.id, exc)
-        return PublishResult(success=False, error=str(exc))
+        kind, detail = _classify_failure(exc)
+        log.error("publish failed for submission %s: %s", submission.id, detail)
+        return PublishResult(success=False, error=detail, failure_kind=kind)
 
     if result.success and result.at_uri:
         result.bsky_root_uri = reply_root_uri or result.at_uri
@@ -167,6 +184,11 @@ async def publish_submission(
                     result.at_uri, result.at_cid, submission.id,
                     parent_uri=reply_uri, parent_cid=reply_cid,
                 )
+
+    # Any failure that reached here via a returned PublishResult (rather than a
+    # caught exception) still needs a classification for the caller to route on.
+    if not result.success and result.failure_kind is None:
+        result.failure_kind = FailureKind.UNKNOWN
 
     return result
 
@@ -312,18 +334,91 @@ def _error_detail(exc: Exception, limit: int = 300) -> str:
     return detail if len(detail) <= limit else detail[:limit] + "..."
 
 
-async def _upload_blob(client: AsyncClient, path: str) -> tuple[object | None, str | None]:
-    """Read a local file and upload it as a blob. Returns (blob_ref, error_detail)."""
+# XrpcError.error values that mean "Bluesky is overloaded/degraded", not our fault.
+_UPSTREAM_XRPC_ERRORS = frozenset(
+    {"NotEnoughResources", "UpstreamFailure", "UpstreamTimeout", "ConsumerTooSlow"}
+)
+
+
+def _http_detail(status: int, response: object) -> str:
+    """Compact detail for an atproto HTTP error, e.g. "503 NotEnoughResources".
+
+    Pulls the status code and XrpcError name off the response instead of dumping
+    the whole Response repr (headers and all) into the message.
+    """
+    content = getattr(response, "content", None)
+    err = getattr(content, "error", None)
+    msg = getattr(content, "message", None)
+    parts = [str(status)]
+    if err:
+        parts.append(str(err))
+    if msg and msg != err:
+        parts.append(f"- {msg}")
+    detail = " ".join(parts)
+    return detail if len(detail) <= 300 else detail[:300] + "..."
+
+
+def _classify_failure(exc: Exception) -> tuple[FailureKind, str]:
+    """Classify a login/publish exception and return (kind, compact detail).
+
+    UPSTREAM - Bluesky unreachable/overloaded (timeout, 5xx, NotEnoughResources);
+               out of our control, so retry automatically and notify quietly.
+    LOCAL    - permanent, our-side problem (bad credentials, invalid content,
+               malformed URL); retrying won't help, so block and ask a human.
+    UNKNOWN  - anything unrecognised; behaves like today (retry + notify curators).
+    """
+    # Transport-level timeout/network error. atproto raises these as the class
+    # (no instance args, no response), so str(exc) is empty - describe it ourselves.
+    if isinstance(exc, NetworkError):
+        if "Timeout" in type(exc).__name__:
+            return FailureKind.UPSTREAM, "timeout contacting Bluesky"
+        return FailureKind.UPSTREAM, "network error contacting Bluesky"
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return FailureKind.UPSTREAM, "timeout contacting Bluesky"
+
+    # HTTP error carrying an atproto Response (status code + XrpcError).
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        detail = _http_detail(status, response)
+        xrpc_error = getattr(getattr(response, "content", None), "error", None)
+        if status >= 500 or status == 429 or xrpc_error in _UPSTREAM_XRPC_ERRORS:
+            return FailureKind.UPSTREAM, detail
+        # 4xx (bad credentials, bad request, etc.) - our side, needs a human.
+        return FailureKind.LOCAL, detail
+
+    # Typed atproto errors raised without a response, plus our own guardrails.
+    if isinstance(exc, (UnauthorizedError, BadRequestError, ValueError)):
+        return FailureKind.LOCAL, _error_detail(exc)
+
+    return FailureKind.UNKNOWN, _error_detail(exc)
+
+
+def _worst_kind(kinds: list[FailureKind]) -> FailureKind:
+    """Reduce several upload failures to one classification. Prefer UPSTREAM (an
+    outage should retry rather than permanently block the submission)."""
+    if FailureKind.UPSTREAM in kinds:
+        return FailureKind.UPSTREAM
+    if FailureKind.UNKNOWN in kinds:
+        return FailureKind.UNKNOWN
+    return kinds[-1] if kinds else FailureKind.UNKNOWN
+
+
+async def _upload_blob(
+    client: AsyncClient, path: str
+) -> tuple[object | None, str | None, FailureKind | None]:
+    """Read a local file and upload it as a blob. Returns (blob_ref, detail, kind)."""
     try:
         data = Path(path).read_bytes()
         if len(data) > _BSKY_MAX_BLOB:
             log.warning("image %s is %d bytes, compressing before upload", path, len(data))
             data = _compress_for_bsky(data)
         response = await client.upload_blob(data)
-        return response.blob, None
+        return response.blob, None, None
     except Exception as exc:
-        log.warning("blob upload failed for %s: %s", path, exc)
-        return None, _error_detail(exc)
+        kind, detail = _classify_failure(exc)
+        log.warning("blob upload failed for %s: %s", path, detail)
+        return None, detail, kind
 
 
 async def _like_quietly(client: AsyncClient, uri: str, cid: str) -> None:
@@ -341,7 +436,7 @@ async def _external_embed(client: AsyncClient, link: SubmissionLink):
     link-reply posts so replies get the same card as the root."""
     thumb_blob = None
     if link.resolved_image_path:
-        thumb_blob, _ = await _upload_blob(client, link.resolved_image_path)  # thumb is optional
+        thumb_blob, _, _ = await _upload_blob(client, link.resolved_image_path)  # thumb is optional
     return models.AppBskyEmbedExternal.Main(
         external=models.AppBskyEmbedExternal.External(
             uri=link.canonical_url,
@@ -430,7 +525,11 @@ async def _publish_record(client: AsyncClient, links: list[SubmissionLink]) -> P
         else:
             at_uri, cid = await _resolve_bluesky_post(client, link.canonical_url)
     except Exception as exc:
-        return PublishResult(success=False, error=f"could not resolve Bluesky post: {exc}")
+        kind, detail = _classify_failure(exc)
+        return PublishResult(
+            success=False, error=f"could not resolve Bluesky post: {detail}",
+            failure_kind=kind,
+        )
 
     response = await client.repost(at_uri, cid)
     try:
@@ -534,15 +633,19 @@ async def _publish_images(
 ) -> PublishResult:
     images = []
     upload_errors: list[str] = []
+    upload_kinds: list[FailureKind] = []
     for att in (a for a in attachments if a.is_image):
         if not att.local_path:
             log.warning("image attachment %s has no local_path, skipping", att.id)
             upload_errors.append(f"attachment {att.id} has no local file")
+            upload_kinds.append(FailureKind.LOCAL)
             continue
-        blob, err = await _upload_blob(client, att.local_path)
+        blob, err, kind = await _upload_blob(client, att.local_path)
         if blob is None:
             if err:
                 upload_errors.append(err)
+            if kind:
+                upload_kinds.append(kind)
             continue
         images.append(
             models.AppBskyEmbedImages.Image(
@@ -553,7 +656,10 @@ async def _publish_images(
 
     if not images:
         detail = f": {upload_errors[-1]}" if upload_errors else ""
-        return PublishResult(success=False, error=f"no images could be uploaded{detail}")
+        return PublishResult(
+            success=False, error=f"no images could be uploaded{detail}",
+            failure_kind=_worst_kind(upload_kinds),
+        )
 
     embed = models.AppBskyEmbedImages.Main(images=images)
     primary = links[0] if links else None
@@ -573,8 +679,10 @@ async def _publish_images(
 _BSKY_MAX_VIDEO = 95 * 1024 * 1024  # 95 MB - headroom under Bluesky's 100 MB limit
 
 
-async def _upload_video_blob(client: AsyncClient, att: Attachment) -> tuple[object | None, str | None]:
-    """Upload a local video file as a regular blob. Returns (blob_ref, error_detail).
+async def _upload_video_blob(
+    client: AsyncClient, att: Attachment
+) -> tuple[object | None, str | None, FailureKind | None]:
+    """Upload a local video file as a regular blob. Returns (blob_ref, detail, kind).
 
     Videos go through the same uploadBlob endpoint as images (the path the SDK's
     own send_video uses); the AppView transcodes them after the record is created.
@@ -584,23 +692,24 @@ async def _upload_video_blob(client: AsyncClient, att: Attachment) -> tuple[obje
     """
     if not att.local_path:
         log.warning("video attachment %s has no local_path, skipping", att.id)
-        return None, f"video attachment {att.id} has no local file"
+        return None, f"video attachment {att.id} has no local file", FailureKind.LOCAL
     try:
         data = Path(att.local_path).read_bytes()
     except OSError as exc:
         log.warning("could not read video file %s: %s", att.local_path, exc)
-        return None, _error_detail(exc)
+        return None, _error_detail(exc), FailureKind.LOCAL
 
     if len(data) > _BSKY_MAX_VIDEO:
         log.warning("video %s is %d bytes (exceeds %d limit), skipping", att.local_path, len(data), _BSKY_MAX_VIDEO)
-        return None, f"video is {len(data)} bytes (limit {_BSKY_MAX_VIDEO})"
+        return None, f"video is {len(data)} bytes (limit {_BSKY_MAX_VIDEO})", FailureKind.LOCAL
 
     try:
         response = await client.upload_blob(data)
-        return response.blob, None
+        return response.blob, None, None
     except Exception as exc:
-        log.warning("video upload failed for %s: %s", att.local_path, exc)
-        return None, _error_detail(exc)
+        kind, detail = _classify_failure(exc)
+        log.warning("video upload failed for %s: %s", att.local_path, detail)
+        return None, detail, kind
 
 
 async def _publish_video(
@@ -618,10 +727,13 @@ async def _publish_video(
     if first_video is None:
         return PublishResult(success=False, error="no video attachment found")
 
-    blob, err = await _upload_video_blob(client, first_video)
+    blob, err, kind = await _upload_video_blob(client, first_video)
     if blob is None:
         detail = f": {err}" if err else ""
-        return PublishResult(success=False, error=f"video upload failed{detail}")
+        return PublishResult(
+            success=False, error=f"video upload failed{detail}",
+            failure_kind=kind or FailureKind.UNKNOWN,
+        )
 
     aspect_ratio = None
     if first_video.width and first_video.height:
@@ -659,7 +771,7 @@ async def _publish_video_reply(
     parent_cid: str,
 ) -> tuple[str, str]:
     """Post a single video attachment as a reply in the thread. Returns (at_uri, cid)."""
-    blob, err = await _upload_video_blob(client, att)
+    blob, err, _kind = await _upload_video_blob(client, att)
     if blob is None:
         detail = f": {err}" if err else ""
         raise RuntimeError(f"video upload failed for attachment {att.id}{detail}")
@@ -715,7 +827,7 @@ async def _publish_image_reply(
             log.warning("image attachment %s has no local_path, skipping", att.id)
             upload_errors.append(f"attachment {att.id} has no local file")
             continue
-        blob, err = await _upload_blob(client, att.local_path)
+        blob, err, _kind = await _upload_blob(client, att.local_path)
         if blob is None:
             if err:
                 upload_errors.append(err)

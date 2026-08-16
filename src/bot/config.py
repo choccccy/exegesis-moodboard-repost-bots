@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     queue_target_days: int = Field(90, alias="QUEUE_TARGET_DAYS")
     queue_min_daily: int = Field(1, alias="QUEUE_MIN_DAILY")
     queue_max_daily: int = Field(6, alias="QUEUE_MAX_DAILY")
+    # Pre-flight gate: before a queue tick attempts any publishes, check Bluesky's
+    # atproto health endpoint. If it's down, skip the whole tick silently (no failed
+    # submissions, no curator pings) and try again next hour. Disable if the
+    # endpoint ever becomes unreliable.
+    bsky_health_check_enabled: bool = Field(True, alias="BSKY_HEALTH_CHECK_ENABLED")
 
     # Per-board Bluesky app passwords. Named BSKY_APP_PASSWORD_<BOARD_NAME_UPPER>
     # where BOARD_NAME_UPPER is the board name uppercased with hyphens replaced by underscores.

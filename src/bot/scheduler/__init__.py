@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import discord
+import httpx
 from sqlalchemy import select
 
 from ..asset_store import has_free_space
@@ -236,7 +237,32 @@ async def run_queue_dispatcher(bot, settings: Settings, stop: asyncio.Event) -> 
         await _fire_all_boards(bot, settings, tz)
 
 
+# atproto health endpoint on the entryway we log into. Returns 200 + {"version": ...}
+# when up; anything else (or a timeout) means Bluesky can't take our publishes.
+_BSKY_HEALTH_URL = "https://bsky.social/xrpc/_health"
+_BSKY_HEALTH_TIMEOUT = 5.0
+
+
+async def _bluesky_healthy() -> bool:
+    """One short probe of Bluesky's health endpoint. False on non-200 or timeout.
+
+    A cheap first gate that catches a full outage (the login-timeout case) before
+    we attempt any publishes. It checks the entryway, not the AppView, so partial
+    degradation can still slip through - per-attempt classification handles that."""
+    try:
+        async with httpx.AsyncClient(timeout=_BSKY_HEALTH_TIMEOUT) as client:
+            resp = await client.get(_BSKY_HEALTH_URL)
+        return resp.status_code == 200
+    except Exception as exc:
+        log.warning("queue: Bluesky health probe failed: %s", exc)
+        return False
+
+
 async def _fire_all_boards(bot, settings: Settings, tz: ZoneInfo) -> None:
+    if settings.bsky_health_check_enabled and not await _bluesky_healthy():
+        log.warning("queue: Bluesky health check failing - skipping this tick (no publishes attempted)")
+        return
+
     now_utc = datetime.now(timezone.utc)
     fresh_cutoff = now_utc - timedelta(hours=settings.queue_fresh_window_hours)
     mt_midnight = _mt_midnight(now_utc, tz)
@@ -319,12 +345,21 @@ async def _fire_board(
         if outcome is PublishOutcome.PUBLISHED:
             return  # posted - the tick is spent
 
+        if outcome is PublishOutcome.UNAVAILABLE:
+            # Bluesky is down, or the failure was board-wide (login/config): every
+            # remaining submission would fail identically, so abandon the tick now
+            # instead of marking a pile of them failed and pinging curators N times.
+            log.warning(
+                "queue: board %s abandoning tick - Bluesky unavailable or board-wide failure (submission %s)",
+                board_cfg.name, submission_id,
+            )
+            return
+
         skip_ids.add(submission_id)
-        if outcome is PublishOutcome.FAILED:
-            # Fall through to the next item so one permanently-failing submission
-            # can't starve the board, but bound the damage: a systemic failure
-            # (bad credentials, network down) shouldn't burn through the queue
-            # marking everything PUBLISH_FAILED in a single tick.
+        if outcome in (PublishOutcome.FAILED, PublishOutcome.BLOCKED):
+            # Fall through to the next item so one failing submission can't starve
+            # the board, but bound the damage: a systemic failure shouldn't burn
+            # through the whole queue in a single tick.
             failed_attempts += 1
             if failed_attempts >= _MAX_FAILED_ATTEMPTS_PER_TICK:
                 log.warning(
@@ -333,8 +368,8 @@ async def _fire_board(
                 )
                 return
             log.info(
-                "queue: board %s submission %s failed to publish, trying next in queue (%d/%d failures this tick)",
-                board_cfg.name, submission_id, failed_attempts, _MAX_FAILED_ATTEMPTS_PER_TICK,
+                "queue: board %s submission %s %s, trying next in queue (%d/%d failures this tick)",
+                board_cfg.name, submission_id, outcome.value, failed_attempts, _MAX_FAILED_ATTEMPTS_PER_TICK,
             )
         elif outcome is PublishOutcome.DUPLICATE:
             log.info(

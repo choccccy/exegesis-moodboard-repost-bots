@@ -129,6 +129,77 @@ def test_error_detail_truncates_long_messages():
 
 
 # ---------------------------------------------------------------------------
+# _classify_failure
+# ---------------------------------------------------------------------------
+
+def _fake_http_error(status: int, error_name: str, message: str | None = None):
+    """Build a real atproto request-error carrying a Response, the way
+    atproto_client.request._handle_response constructs them."""
+    from atproto_client.exceptions import RequestException
+    from atproto_client.models.common import XrpcError
+    from atproto_client.request import Response
+
+    resp = Response(
+        success=False, status_code=status,
+        content=XrpcError(error=error_name, message=message), headers={},
+    )
+    return RequestException(resp)
+
+
+def test_classify_timeout_is_upstream_with_legible_detail():
+    from atproto_client.exceptions import InvokeTimeoutError
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    # Raised as the class (no args) - the real outage signature.
+    kind, detail = _classify_failure(InvokeTimeoutError())
+    assert kind is FailureKind.UPSTREAM
+    assert detail == "timeout contacting Bluesky"
+
+
+def test_classify_503_not_enough_resources_is_upstream():
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    kind, detail = _classify_failure(
+        _fake_http_error(503, "NotEnoughResources", "Not Enough Resources")
+    )
+    assert kind is FailureKind.UPSTREAM
+    assert detail.startswith("503 NotEnoughResources")
+    # The giant Response repr (headers and all) must NOT leak into the detail.
+    assert "headers" not in detail
+
+
+def test_classify_auth_failure_is_local():
+    from atproto_client.exceptions import UnauthorizedError
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    from atproto_client.models.common import XrpcError
+    from atproto_client.request import Response
+    resp = Response(success=False, status_code=401,
+                    content=XrpcError(error="AuthenticationRequired",
+                                      message="Invalid identifier or password"),
+                    headers={})
+    kind, detail = _classify_failure(UnauthorizedError(resp))
+    assert kind is FailureKind.LOCAL
+    assert detail.startswith("401 AuthenticationRequired")
+
+
+def test_classify_bad_request_and_value_error_are_local():
+    from atproto_client.exceptions import BadRequestError
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    assert _classify_failure(BadRequestError())[0] is FailureKind.LOCAL
+    assert _classify_failure(ValueError("not a Bluesky post URL: x"))[0] is FailureKind.LOCAL
+
+
+def test_classify_unknown_exception_falls_back():
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    kind, detail = _classify_failure(Exception("boom 500"))
+    assert kind is FailureKind.UNKNOWN
+    assert detail == "Exception: boom 500"
+
+
+# ---------------------------------------------------------------------------
 # _append_tags - budget exhaustion mid-list
 # ---------------------------------------------------------------------------
 

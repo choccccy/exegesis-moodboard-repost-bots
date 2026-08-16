@@ -32,7 +32,7 @@ from bot.publish import (
     _upload_video_blob,
     publish_submission,
 )
-from bot.state import GraphicStatus
+from bot.state import FailureKind, GraphicStatus
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +237,7 @@ async def test_publish_submission_images_kind_creates_images_embed():
     client = _fake_client()
     with (
         _patched_client(client),
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         result = await publish_submission(
             _submission(), [_link()], [_image_attachment()], _board(), "pw"
@@ -251,7 +251,7 @@ async def test_publish_submission_video_kind_creates_video_embed():
     client = _fake_client()
     with (
         _patched_client(client),
-        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None))),
+        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None, None))),
     ):
         result = await publish_submission(
             _submission(), [_link()], [_video_attachment()], _board(), "pw"
@@ -275,7 +275,10 @@ async def test_publish_submission_publisher_exception_returns_failure():
     with _patched_client(client):
         result = await publish_submission(_submission(), [_link()], [], _board(), "pw")
     assert not result.success
-    assert result.error == "boom 500"
+    # A bare Exception is unclassified: reported via _error_detail (type + message)
+    # and treated as retriable/unknown.
+    assert result.error == "Exception: boom 500"
+    assert result.failure_kind is FailureKind.UNKNOWN
     client.like.assert_not_awaited()
 
 
@@ -371,8 +374,8 @@ async def test_publish_submission_video_chain_threads_replies_in_order():
     ]
     with (
         _patched_client(client),
-        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None))),
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None, None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         result = await publish_submission(_submission(), [_link()], atts, _board(), "pw")
 
@@ -420,12 +423,12 @@ async def test_publish_submission_video_reply_failure_keeps_main_success():
         _image_attachment(),
     ]
     upload_video = AsyncMock(
-        side_effect=[(_fake_video_blob(), None), (None, "Exception: upload broke")]
+        side_effect=[(_fake_video_blob(), None, None), (None, "Exception: upload broke", None)]
     )
     with (
         _patched_client(client),
         patch("bot.publish._upload_video_blob", new=upload_video),
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))),
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))),
     ):
         result = await publish_submission(_submission(), [_link()], atts, _board(), "pw")
 
@@ -446,7 +449,7 @@ async def test_publish_submission_image_reply_failure_keeps_main_success():
     atts = [_video_attachment(), _image_attachment(local_path=None)]
     with (
         _patched_client(client),
-        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None))),
+        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None, None))),
     ):
         result = await publish_submission(_submission(), [_link()], atts, _board(), "pw")
     assert result.success
@@ -466,7 +469,7 @@ async def test_publish_submission_link_replies_chain_after_media_replies():
     atts = [_video_attachment(att_id=1), _video_attachment(att_id=2)]
     with (
         _patched_client(client),
-        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None))),
+        patch("bot.publish._upload_video_blob", new=AsyncMock(return_value=(_fake_video_blob(), None, None))),
     ):
         result = await publish_submission(_submission(), links, atts, _board(), "pw")
 
@@ -495,7 +498,7 @@ async def test_reply_post_builds_external_card_with_thumbnail():
     )
     with (
         _patched_client(client),
-        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))) as mock_upload,
+        patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))) as mock_upload,
     ):
         uri, cid = await _publish_reply_post(
             client, link, labels=None, tags=[],
@@ -649,7 +652,7 @@ async def test_upload_blob_small_file_uploads_raw_bytes(tmp_path):
     f = tmp_path / "img.jpg"
     f.write_bytes(b"tiny-jpeg-bytes")
     client = _fake_client()
-    blob, err = await _upload_blob(client, str(f))
+    blob, err, _kind = await _upload_blob(client, str(f))
     assert blob is client.upload_blob.return_value.blob
     assert err is None
     client.upload_blob.assert_awaited_once_with(b"tiny-jpeg-bytes")
@@ -663,7 +666,7 @@ async def test_upload_blob_compresses_oversize_file(tmp_path):
         patch("bot.publish._BSKY_MAX_BLOB", 32),
         patch("bot.publish._compress_for_bsky", return_value=b"small") as compress,
     ):
-        blob, err = await _upload_blob(client, str(f))
+        blob, err, _kind = await _upload_blob(client, str(f))
     assert blob is not None
     assert err is None
     compress.assert_called_once_with(b"x" * 64)
@@ -672,7 +675,7 @@ async def test_upload_blob_compresses_oversize_file(tmp_path):
 
 async def test_upload_blob_missing_file_returns_error_detail():
     client = _fake_client()
-    blob, err = await _upload_blob(client, "/nope/does-not-exist.jpg")
+    blob, err, _kind = await _upload_blob(client, "/nope/does-not-exist.jpg")
     assert blob is None
     assert err is not None and "FileNotFoundError" in err
     client.upload_blob.assert_not_awaited()
@@ -683,7 +686,7 @@ async def test_upload_blob_upload_exception_returns_error_detail(tmp_path):
     f.write_bytes(b"bytes")
     client = _fake_client()
     client.upload_blob = AsyncMock(side_effect=Exception("status_code=502"))
-    blob, err = await _upload_blob(client, str(f))
+    blob, err, _kind = await _upload_blob(client, str(f))
     assert blob is None
     assert err is not None and "status_code=502" in err
 
@@ -721,7 +724,7 @@ def test_compress_for_bsky_halves_resolution_when_quality_not_enough():
 async def test_upload_video_blob_unreadable_file_returns_error():
     client = _fake_client()
     att = _video_attachment(local_path="/nope/missing.mp4")
-    blob, err = await _upload_video_blob(client, att)
+    blob, err, _kind = await _upload_video_blob(client, att)
     assert blob is None
     assert err is not None and "FileNotFoundError" in err
     client.upload_blob.assert_not_awaited()
@@ -749,7 +752,7 @@ async def test_publish_video_no_links_and_no_dimensions(tmp_path):
 
 async def test_publish_images_no_links_notes_source_unknown():
     client = _fake_client()
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))):
         result = await _publish_images(client, [], [_image_attachment()], labels=None, tags=[])
     assert result.success
     record = _record_of(client.com.atproto.repo.create_record.call_args)
@@ -759,7 +762,7 @@ async def test_publish_images_no_links_notes_source_unknown():
 
 async def test_publish_images_with_source_note():
     client = _fake_client()
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))):
         result = await _publish_images(
             client, [], [_image_attachment()], labels=None, tags=["robots"],
             source_note="Popular Mechanics, March 1965",
@@ -831,7 +834,7 @@ async def test_publish_image_reply_no_uploadable_images_raises():
 async def test_publish_image_reply_caps_at_four_images():
     client = _fake_client()
     atts = [_image_attachment(alt_text_body=f"img {i}") for i in range(6)]
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))) as upload:
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))) as upload:
         await _publish_image_reply(
             client, atts, [], labels=None, tags=[],
             root_uri="at://x/app.bsky.feed.post/r", root_cid="c",
@@ -866,7 +869,7 @@ async def test_publish_image_reply_no_uri_raises():
     bad_resp.uri = None
     bad_resp.cid = None
     client.com.atproto.repo.create_record = AsyncMock(return_value=bad_resp)
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(_fake_blob(), None, None))):
         with pytest.raises(RuntimeError, match="image reply post returned no URI/CID"):
             await _publish_image_reply(
                 client, [_image_attachment()], [_link()], labels=None, tags=[],
@@ -877,7 +880,7 @@ async def test_publish_image_reply_no_uri_raises():
 
 async def test_publish_image_reply_collects_upload_error_detail():
     client = _fake_client()
-    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(None, "Exception: cdn down"))):
+    with patch("bot.publish._upload_blob", new=AsyncMock(return_value=(None, "Exception: cdn down", None))):
         with pytest.raises(RuntimeError) as excinfo:
             await _publish_image_reply(
                 client, [_image_attachment()], [_link()], labels=None, tags=[],

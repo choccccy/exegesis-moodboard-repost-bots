@@ -18,20 +18,21 @@ from bot.curation.ingest import _transcode_video
 from bot.curation.statemachine import _build_post_preview
 from bot.models import Attachment, PublishAttempt, SubmissionLink
 from bot.publish import PublishResult
-from bot.state import GraphicStatus, PublishOutcome, SubmissionState
+from bot.state import FailureKind, GraphicStatus, PublishOutcome, SubmissionState
 
 from conftest import MockDest, make_submission
 
 QUEUED = SubmissionState.QUEUED.value
 
 
-def _settings(board, *, password="app-password"):
+def _settings(board, *, password="app-password", curator_user_ids=None):
     cfg = BoardConfig(
         name=board.name,
         discord_guild_id=board.discord_guild_id,
         discord_channel_id=board.discord_channel_id,
         bluesky_handle=f"{board.name}.exegesis.space",
         tags=[],
+        curator_user_ids=curator_user_ids or [],
     )
     s = MagicMock()
     s.board_for_channel.return_value = cfg
@@ -81,7 +82,7 @@ _OK = PublishResult(
 # ---------------------------------------------------------------------------
 
 
-async def test_no_password_configured_fails(session, board, bind_db_scopes):
+async def test_no_password_configured_blocks(session, board, bind_db_scopes):
     settings = _settings(board, password=None)
     sub = make_submission(board, state=QUEUED)
     session.add(sub)
@@ -91,13 +92,15 @@ async def test_no_password_configured_fails(session, board, bind_db_scopes):
     with patch("bot.publish.publish_submission", new_callable=AsyncMock) as mock_pub:
         result = await publish_queued_submission(settings, sub.id, dest)
 
-    assert result is PublishOutcome.FAILED
+    # Missing config is board-wide and permanent: block (no auto-retry) and
+    # abandon the tick rather than churning the whole queue.
+    assert result is PublishOutcome.UNAVAILABLE
     mock_pub.assert_not_awaited()
-    assert sub.state == SubmissionState.PUBLISH_FAILED.value
+    assert sub.state == SubmissionState.PUBLISH_BLOCKED.value
     attempt = await session.scalar(select(PublishAttempt).where(PublishAttempt.submission_id == sub.id))
     assert attempt.success is False
     assert "no app password" in attempt.error
-    assert any("failed" in m.lower() for m in dest.sent)
+    assert any("blocked" in m.lower() for m in dest.sent)
 
 
 async def test_deferred_when_parent_butterflied_but_unpublished(session, board, bind_db_scopes):
@@ -228,6 +231,76 @@ async def test_failed_notice_send_failure_swallowed(session, board, bind_db_scop
 
     assert result is PublishOutcome.FAILED
     assert sub.state == SubmissionState.PUBLISH_FAILED.value
+
+
+# ---------------------------------------------------------------------------
+# Failure-kind routing: state + notice + outcome per classification
+# ---------------------------------------------------------------------------
+
+
+async def test_upstream_failure_retries_quietly_and_abandons_tick(session, board, bind_db_scopes):
+    settings = _settings(board, curator_user_ids=[42])
+    sub = make_submission(board, state=QUEUED)
+    session.add(sub)
+    await session.flush()
+
+    fail = PublishResult(
+        success=False, error="timeout contacting Bluesky",
+        failure_kind=FailureKind.UPSTREAM,
+    )
+    dest = MockDest()
+    with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=fail):
+        result = await publish_queued_submission(settings, sub.id, dest)
+
+    # Retriable (stays queue-eligible) but abandons the tick, and never pings curators.
+    assert result is PublishOutcome.UNAVAILABLE
+    assert sub.state == SubmissionState.PUBLISH_FAILED.value
+    notice = "\n".join(dest.sent)
+    assert "isn't responding" in notice
+    assert "<@42>" not in notice, "an outage must not @-mention curators"
+
+
+async def test_local_failure_blocks_and_pings_curators(session, board, bind_db_scopes):
+    settings = _settings(board, curator_user_ids=[42])
+    sub = make_submission(board, state=QUEUED)
+    session.add(sub)
+    await session.flush()
+
+    fail = PublishResult(
+        success=False, error="400 InvalidRequest - bad post",
+        failure_kind=FailureKind.LOCAL,
+    )
+    dest = MockDest()
+    with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=fail):
+        result = await publish_queued_submission(settings, sub.id, dest)
+
+    # Submission-specific permanent failure: block (no auto-retry) and let the
+    # board move on to the next queued item. Curators are pinged to fix it.
+    assert result is PublishOutcome.BLOCKED
+    assert sub.state == SubmissionState.PUBLISH_BLOCKED.value
+    notice = "\n".join(dest.sent)
+    assert "blocked" in notice.lower()
+    assert "<@42>" in notice, "a fixable failure should @-mention curators"
+
+
+async def test_board_wide_local_failure_abandons_tick(session, board, bind_db_scopes):
+    settings = _settings(board, curator_user_ids=[42])
+    sub = make_submission(board, state=QUEUED)
+    session.add(sub)
+    await session.flush()
+
+    fail = PublishResult(
+        success=False, error="login failed: 401 AuthenticationRequired",
+        failure_kind=FailureKind.LOCAL, board_wide=True,
+    )
+    dest = MockDest()
+    with patch("bot.publish.publish_submission", new_callable=AsyncMock, return_value=fail):
+        result = await publish_queued_submission(settings, sub.id, dest)
+
+    # Board-wide (bad app password): block AND abandon the tick so we don't burn
+    # the queue blocking every submission on the same broken credential.
+    assert result is PublishOutcome.UNAVAILABLE
+    assert sub.state == SubmissionState.PUBLISH_BLOCKED.value
 
 
 # ---------------------------------------------------------------------------

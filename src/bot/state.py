@@ -22,20 +22,48 @@ class SubmissionState(str, enum.Enum):
     # Present for forward-compatibility; unreachable in Milestone 1.
     QUEUED = "queued"
     PUBLISHED = "published"
+    # Attempt failed for a transient/unknown reason; still eligible for the queue,
+    # so the next slot retries automatically.
     PUBLISH_FAILED = "publish_failed"
+    # Attempt failed for a reason a human must fix (bad app password, invalid
+    # content, malformed URL). Deliberately NOT queue-eligible, so it does not
+    # retry until a curator resolves the issue and re-queues it.
+    PUBLISH_BLOCKED = "publish_blocked"
+
+
+class FailureKind(str, enum.Enum):
+    """Why a publish attempt failed, used to route retry + notification behavior.
+
+    UPSTREAM - Bluesky is unreachable/overloaded (timeout, 5xx, NotEnoughResources).
+               Out of our control; retry automatically and notify quietly.
+    LOCAL    - a permanent, our-side problem (bad credentials, invalid content,
+               malformed URL). Retrying won't help; block and ask a human.
+    UNKNOWN  - unclassified; treated like today (retry + notify curators).
+    """
+
+    UPSTREAM = "upstream"
+    LOCAL = "local"
+    UNKNOWN = "unknown"
 
 
 class PublishOutcome(str, enum.Enum):
     """Result of a scheduler-driven publish attempt, as seen by _fire_board.
 
-    PUBLISHED  - post created on Bluesky; the tick is spent.
-    FAILED     - real attempt made and failed; submission is PUBLISH_FAILED.
-    DUPLICATE  - content already published elsewhere; cleaned up without posting.
-    DEFERRED   - reply-chain parent not yet published; try again later.
+    PUBLISHED   - post created on Bluesky; the tick is spent.
+    FAILED      - transient/unknown failure; submission is PUBLISH_FAILED and will
+                  retry. The board tries the next queued item (bounded per tick).
+    UNAVAILABLE - Bluesky is down or the failure was board-wide (login); abandon
+                  the whole tick immediately - every item would fail identically.
+    BLOCKED     - permanent, submission-specific failure; submission is
+                  PUBLISH_BLOCKED (no auto-retry). The board tries the next item.
+    DUPLICATE   - content already published elsewhere; cleaned up without posting.
+    DEFERRED    - reply-chain parent not yet published; try again later.
     """
 
     PUBLISHED = "published"
     FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+    BLOCKED = "blocked"
     DUPLICATE = "duplicate"
     DEFERRED = "deferred"
 

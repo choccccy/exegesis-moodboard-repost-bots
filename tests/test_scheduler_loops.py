@@ -528,6 +528,7 @@ async def test_fire_all_boards_skips_boards_without_handle(session):
     without_handle = _board_cfg("drafts", None)
     settings = MagicMock(spec=Settings)
     settings.queue_fresh_window_hours = 72
+    settings.bsky_health_check_enabled = False
     settings.boards = [without_handle, with_handle]
 
     with (
@@ -546,6 +547,7 @@ async def test_fire_all_boards_records_error_on_board_failure(session, caplog):
 
     settings = MagicMock(spec=Settings)
     settings.queue_fresh_window_hours = 72
+    settings.bsky_health_check_enabled = False
     settings.boards = [_board_cfg("robots", "robots.exegesis.space")]
 
     with (

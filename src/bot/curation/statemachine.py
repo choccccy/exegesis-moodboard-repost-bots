@@ -139,6 +139,7 @@ _STATUS_TERMINAL_FOOTER = {
     SubmissionState.QUEUED.value: "queued",
     SubmissionState.PUBLISHED.value: "published to Bluesky",
     SubmissionState.PUBLISH_FAILED.value: "publish failed - will retry",
+    SubmissionState.PUBLISH_BLOCKED.value: "publish blocked - needs a fix",
 }
 
 
@@ -197,6 +198,7 @@ _QUEUE_TERMINAL = frozenset({
     SubmissionState.QUEUED.value,
     SubmissionState.PUBLISHED.value,
     SubmissionState.PUBLISH_FAILED.value,
+    SubmissionState.PUBLISH_BLOCKED.value,
 })
 
 

@@ -58,6 +58,7 @@ from ..moderation import (
 from ..resolve import ResolvedMetadata, resolve, resolve_bluesky_at_uri
 from ..state import (
     AltTextStatus,
+    FailureKind,
     GraphicStatus,
     Gap,
     PublishOutcome,
@@ -743,6 +744,45 @@ class _PublishPlan:
     curator_user_ids: list[int] | None
 
 
+@dataclass
+class _FailureRoute:
+    """How a failed publish is handled: which state to persist, which Discord
+    notice to send, and which outcome to report to the scheduler."""
+    state: str
+    notice: str
+    outcome: PublishOutcome
+
+
+def _route_failure(result: publisher.PublishResult, curator_user_ids: list[int] | None) -> _FailureRoute:
+    """Map a failed PublishResult to (state, notice, outcome) by failure kind.
+
+    UPSTREAM - Bluesky is down: retry (PUBLISH_FAILED), quiet notice with no ping,
+               and abandon the board's tick (every submission would fail the same).
+    LOCAL    - permanent, our side: block (PUBLISH_BLOCKED, no auto-retry) and ping
+               curators. Board-wide (login) blocks abandon the tick; submission-
+               specific ones let the board move on to the next queued item.
+    UNKNOWN  - unchanged from before: retry (PUBLISH_FAILED) and ping curators.
+    """
+    kind = result.failure_kind or FailureKind.UNKNOWN
+    if kind is FailureKind.UPSTREAM:
+        return _FailureRoute(
+            state=SubmissionState.PUBLISH_FAILED.value,
+            notice=replies.bsky_unavailable_notice(result.error),
+            outcome=PublishOutcome.UNAVAILABLE,
+        )
+    if kind is FailureKind.LOCAL:
+        return _FailureRoute(
+            state=SubmissionState.PUBLISH_BLOCKED.value,
+            notice=replies.publish_blocked_notice(result.error, mention_user_ids=curator_user_ids),
+            outcome=PublishOutcome.UNAVAILABLE if result.board_wide else PublishOutcome.BLOCKED,
+        )
+    return _FailureRoute(
+        state=SubmissionState.PUBLISH_FAILED.value,
+        notice=replies.publish_failed_notice(result.error, mention_user_ids=curator_user_ids),
+        outcome=PublishOutcome.UNAVAILABLE if result.board_wide else PublishOutcome.FAILED,
+    )
+
+
 async def _safe_send(destination: Surface, content: str, what: str, submission_id: int) -> None:
     """Send a Discord notice, swallowing failures (a publish must never be rolled
     back or a queue tick wasted because a status message couldn't be delivered)."""
@@ -810,18 +850,20 @@ async def publish_queued_submission(
         board_cfg = settings.board_for_channel(submission.channel_id)
 
         if not board_cfg or not board_cfg.bluesky_handle:
+            # Board-wide config problem: needs a human, and every submission for
+            # this board would fail the same way. Block (don't auto-retry).
             err = "board has no Bluesky handle configured"
             log.warning("submission %s: %s", submission_id, err)
-            submission.state = SubmissionState.PUBLISH_FAILED.value
+            submission.state = SubmissionState.PUBLISH_BLOCKED.value
             session.add(PublishAttempt(submission_id=submission_id, success=False, error=err))
             mention = board_cfg.curator_user_ids if board_cfg else None
-            early: tuple = ("FAILED", err, mention)
+            early: tuple = ("BLOCKED", err, mention)
         elif not (password := settings.bsky_password_for(board_cfg.name)):
             err = f"no app password configured for board {board_cfg.name}"
             log.warning("submission %s: %s", submission_id, err)
-            submission.state = SubmissionState.PUBLISH_FAILED.value
+            submission.state = SubmissionState.PUBLISH_BLOCKED.value
             session.add(PublishAttempt(submission_id=submission_id, success=False, error=err))
-            early = ("FAILED", err, board_cfg.curator_user_ids)
+            early = ("BLOCKED", err, board_cfg.curator_user_ids)
         else:
             parent_ref = await statemachine._resolve_parent_ref(session, submission)
             if parent_ref is statemachine._DEFERRED:
@@ -865,6 +907,12 @@ async def publish_queued_submission(
 
     # ---- Beat 1 early exits: perform their I/O with the lock released ----
     if plan is None:
+        if early[0] == "BLOCKED":
+            _, err, mention = early
+            await _safe_send(destination, replies.publish_blocked_notice(err, mention_user_ids=mention),
+                             "publish-blocked notice", submission_id)
+            # Board-wide config failure: abandon the tick, don't churn the queue.
+            return PublishOutcome.UNAVAILABLE
         if early[0] == "FAILED":
             _, err, mention = early
             await _safe_send(destination, replies.publish_failed_notice(err, mention_user_ids=mention),
@@ -890,6 +938,7 @@ async def publish_queued_submission(
 
     # ---- Beat 3: record the result (short DB scope; no I/O) ----
     published = bool(result.success and result.at_uri)
+    failure = None if published else _route_failure(result, plan.curator_user_ids)
     async with session_scope() as session:
         session.add(PublishAttempt(
             submission_id=submission_id,
@@ -904,7 +953,7 @@ async def publish_queued_submission(
         submission = await session.get(Submission, submission_id)
         if submission is not None:
             submission.state = (
-                SubmissionState.PUBLISHED.value if published else SubmissionState.PUBLISH_FAILED.value
+                SubmissionState.PUBLISHED.value if published else failure.state
             )
 
     # ---- Beat 4: Discord status notice (lock released) ----
@@ -917,7 +966,7 @@ async def publish_queued_submission(
         destination.archive_after_delay(replies.closing_notice("published to Bluesky"))
         return PublishOutcome.PUBLISHED
 
-    log.error("submission %s publish failed: %s", submission_id, result.error)
-    await _safe_send(destination, replies.publish_failed_notice(
-        result.error, mention_user_ids=plan.curator_user_ids), "publish-failed notice", submission_id)
-    return PublishOutcome.FAILED
+    log.error("submission %s publish failed [%s]: %s",
+              submission_id, result.failure_kind.value if result.failure_kind else "?", result.error)
+    await _safe_send(destination, failure.notice, "publish-failed notice", submission_id)
+    return failure.outcome

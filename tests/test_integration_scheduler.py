@@ -408,6 +408,45 @@ async def test_fire_board_gives_up_after_failure_budget(session, board, bind_db_
     )
 
 
+async def test_fire_board_unavailable_abandons_tick_immediately(session, board, bind_db_scopes):
+    """An UNAVAILABLE outcome (Bluesky down / board-wide failure) ends the tick on
+    the first attempt - every remaining submission would fail identically."""
+    sub_a = make_submission(board, state=QUEUED, source_discord_message_id=401,
+                            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sub_b = make_submission(board, state=QUEUED, source_discord_message_id=402,
+                            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    session.add_all([sub_a, sub_b])
+    await session.flush()
+
+    with patch(
+        "bot.scheduler.ingest_service.publish_queued_submission",
+        new_callable=AsyncMock, return_value=PublishOutcome.UNAVAILABLE,
+    ) as mock_pub:
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+
+    mock_pub.assert_awaited_once()
+
+
+async def test_fire_board_blocked_falls_through_to_next_item(session, board, bind_db_scopes):
+    """A BLOCKED outcome (submission-specific permanent failure) doesn't spend the
+    tick: the board tries the next queued item."""
+    sub_a = make_submission(board, state=QUEUED, source_discord_message_id=501,
+                            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sub_b = make_submission(board, state=QUEUED, source_discord_message_id=502,
+                            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    session.add_all([sub_a, sub_b])
+    await session.flush()
+
+    outcomes = [PublishOutcome.BLOCKED, PublishOutcome.PUBLISHED]
+    with patch(
+        "bot.scheduler.ingest_service.publish_queued_submission",
+        new_callable=AsyncMock, side_effect=outcomes,
+    ) as mock_pub:
+        await _fire_board(_fake_bot(), _FakeSettings(), _board_cfg(board), _FRESH_CUTOFF, _MT_MIDNIGHT)
+
+    assert mock_pub.await_count == 2
+
+
 async def test_fire_board_publish_success_ends_tick(session, board, bind_db_scopes):
     sub_a = make_submission(board, state=QUEUED, source_discord_message_id=301,
                             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
@@ -482,3 +521,60 @@ async def test_record_discord_thread_count_uses_real_guild_api():
 
     guild.active_threads.assert_awaited_once()
     mock_record.assert_called_once_with(3)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight Bluesky health gate
+# ---------------------------------------------------------------------------
+
+
+def _health_client(status_code=None, raises=None):
+    """Build a mock httpx.AsyncClient usable as an async context manager whose
+    get() returns a response with status_code (or raises)."""
+    client = MagicMock()
+    if raises is not None:
+        client.get = AsyncMock(side_effect=raises)
+    else:
+        client.get = AsyncMock(return_value=MagicMock(status_code=status_code))
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=client)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=ctx)
+
+
+async def test_bluesky_healthy_true_on_200():
+    from bot.scheduler import _bluesky_healthy
+    with patch("bot.scheduler.httpx.AsyncClient", new=_health_client(status_code=200)):
+        assert await _bluesky_healthy() is True
+
+
+async def test_bluesky_healthy_false_on_503():
+    from bot.scheduler import _bluesky_healthy
+    with patch("bot.scheduler.httpx.AsyncClient", new=_health_client(status_code=503)):
+        assert await _bluesky_healthy() is False
+
+
+async def test_bluesky_healthy_false_on_timeout():
+    import httpx
+
+    from bot.scheduler import _bluesky_healthy
+    with patch("bot.scheduler.httpx.AsyncClient",
+               new=_health_client(raises=httpx.ConnectTimeout("slow"))):
+        assert await _bluesky_healthy() is False
+
+
+class _HealthGateSettings:
+    bsky_health_check_enabled = True
+    queue_fresh_window_hours = 72
+    boards = [MagicMock(bluesky_handle="x.bsky.social", name="robots")]
+
+
+async def test_fire_all_boards_skips_tick_when_bluesky_unhealthy():
+    from bot.scheduler import _fire_all_boards
+    from zoneinfo import ZoneInfo
+    with (
+        patch("bot.scheduler._bluesky_healthy", new=AsyncMock(return_value=False)),
+        patch("bot.scheduler._fire_board", new=AsyncMock()) as mock_fire,
+    ):
+        await _fire_all_boards(_fake_bot(), _HealthGateSettings(), ZoneInfo("UTC"))
+    mock_fire.assert_not_awaited()
