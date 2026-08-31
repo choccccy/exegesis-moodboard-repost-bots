@@ -217,9 +217,9 @@ async def _detect_and_teardown_duplicate(
         dup = await handlers._find_duplicate(session, link.canonical_url, submission.id, guild_id)
         if dup is None:
             continue
-        kind, ref_url = dup
+        kind, ref_url, thread_url = dup
         if kind == "published":
-            notice = replies.duplicate_posted(ref_url)
+            notice = replies.duplicate_posted(ref_url, thread_url)
         elif kind == "queued":
             notice = replies.duplicate_queued(ref_url)
         else:
@@ -871,6 +871,13 @@ async def publish_queued_submission(
             elif (dup := await _find_publish_time_duplicate(session, submission, links)) is not None:
                 bsky_url = dup.bsky_url or dup.at_uri
                 log.warning("submission %s skipped at publish time - duplicate of %s", submission_id, bsky_url)
+                board = await session.get(Board, submission.board_id)
+                dup_sub = await session.get(Submission, dup.submission_id)
+                dup_thread_url = (
+                    await handlers._thread_link(session, dup_sub, board.discord_guild_id)
+                    if dup_sub is not None and board is not None
+                    else None
+                )
                 # Mark as PUBLISHED (not PUBLISH_FAILED) so it is not retried.
                 submission.state = SubmissionState.PUBLISHED.value
                 session.add(PublishAttempt(
@@ -883,7 +890,7 @@ async def publish_queued_submission(
                     bsky_url=dup.bsky_url,
                     error="duplicate: content already published by another submission",
                 ))
-                early = ("DUPLICATE", bsky_url)
+                early = ("DUPLICATE", bsky_url, dup_thread_url)
             else:
                 reply_kwargs: dict = {}
                 if parent_ref is not None:
@@ -922,7 +929,7 @@ async def publish_queued_submission(
             log.info("submission %s deferred: parent not yet published", submission_id)
             return PublishOutcome.DEFERRED
         # DUPLICATE
-        await _safe_send(destination, replies.duplicate_posted(early[1]), "duplicate notice", submission_id)
+        await _safe_send(destination, replies.duplicate_posted(early[1], early[2]), "duplicate notice", submission_id)
         destination.archive_after_delay(replies.closing_notice("duplicate"))
         return PublishOutcome.DUPLICATE
 

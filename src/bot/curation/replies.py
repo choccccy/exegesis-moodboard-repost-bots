@@ -295,8 +295,11 @@ def duplicate_warning(bsky_url: str) -> str:
     )
 
 
-def duplicate_posted(bsky_url: str) -> str:
-    return f"this has already been posted: {bsky_url}\nClosing this thread."
+def duplicate_posted(bsky_url: str, thread_url: str | None = None) -> str:
+    msg = f"this has already been posted: {bsky_url}\n"
+    if thread_url:
+        msg += f"previous thread: {thread_url}\n"
+    return msg + "Closing this thread."
 
 
 def duplicate_queued(thread_url: str | None) -> str:

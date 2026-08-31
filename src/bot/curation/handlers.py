@@ -208,11 +208,13 @@ async def _find_duplicate(
     canonical_url: str,
     exclude_submission_id: int,
     guild_id: int,
-) -> tuple[str, str | None] | None:
+) -> tuple[str, str | None, str | None] | None:
     """Check whether another submission with this canonical URL is already active or posted.
 
-    Returns ("published", bsky_url), ("queued", thread_url), ("pending", thread_url), or None.
-    Published takes priority; among active states, queued takes priority over pending.
+    Returns ("published", bsky_url, thread_url), ("queued", thread_url, None),
+    ("pending", thread_url, None), or None. Published takes priority; among active
+    states, queued takes priority over pending. For queued/pending the thread link is
+    the ref itself; the published case carries both the Bluesky post and the old thread.
     """
     attempt = await session.scalar(
         select(PublishAttempt)
@@ -227,7 +229,9 @@ async def _find_duplicate(
         .limit(1)
     )
     if attempt is not None:
-        return "published", attempt.bsky_url or attempt.at_uri
+        dup = await session.get(Submission, attempt.submission_id)
+        thread_url = await _thread_link(session, dup, guild_id) if dup is not None else None
+        return "published", attempt.bsky_url or attempt.at_uri, thread_url
 
     active = await session.scalar(
         select(Submission)
@@ -243,7 +247,7 @@ async def _find_duplicate(
     if active is not None:
         thread_url = await _thread_link(session, active, guild_id)
         kind = "queued" if active.state == SubmissionState.QUEUED.value else "pending"
-        return kind, thread_url
+        return kind, thread_url, None
 
     return None
 

@@ -127,9 +127,27 @@ async def test_find_duplicate_published_takes_priority(session, board):
 
     result = await _find_duplicate(session, "https://example.com/post", new_sub.id, guild_id=1)
     assert result is not None
-    kind, url = result
+    kind, url, _thread = result
     assert kind == "published"
     assert url == "https://bsky.app/x/y"
+
+
+async def test_find_duplicate_published_carries_old_thread(session, board):
+    # #63: a published duplicate links to the old post *and* its curation thread.
+    published = make_submission(
+        board, state=SubmissionState.PUBLISHED.value, thread_id=321, status_message_id=654,
+    )
+    session.add(published)
+    await session.flush()
+    await _add_link(session, published, "https://example.com/pubthread")
+    await _add_attempt(session, published, success=True, bsky_url="https://bsky.app/x/z")
+
+    new_sub = make_submission(board, source_discord_message_id=2)
+    session.add(new_sub)
+    await session.flush()
+
+    result = await _find_duplicate(session, "https://example.com/pubthread", new_sub.id, guild_id=5)
+    assert result == ("published", "https://bsky.app/x/z", "https://discord.com/channels/5/321/654")
 
 
 async def test_find_duplicate_active_pending(session, board):
@@ -145,7 +163,7 @@ async def test_find_duplicate_active_pending(session, board):
 
     result = await _find_duplicate(session, "https://example.com/pending", new_sub.id, guild_id=1)
     assert result is not None
-    kind, thread_url = result
+    kind, thread_url, _ = result
     assert kind == "pending"
     assert thread_url is not None and "777" in thread_url
 
@@ -163,7 +181,7 @@ async def test_find_duplicate_active_queued(session, board):
 
     result = await _find_duplicate(session, "https://example.com/queued", new_sub.id, guild_id=1)
     assert result is not None
-    kind, _url = result
+    kind, _url, _ = result
     assert kind == "queued"
 
 
@@ -193,7 +211,7 @@ async def test_find_duplicate_deep_links_to_status_message(session, board):
     await session.flush()
 
     result = await _find_duplicate(session, "https://example.com/deep", new_sub.id, guild_id=5)
-    assert result == ("queued", "https://discord.com/channels/5/888/999")
+    assert result == ("queued", "https://discord.com/channels/5/888/999", None)
 
 
 async def test_find_duplicate_falls_back_to_submission_thread_mapping(session, board):
@@ -215,7 +233,7 @@ async def test_find_duplicate_falls_back_to_submission_thread_mapping(session, b
     await session.flush()
 
     result = await _find_duplicate(session, "https://example.com/durable", new_sub.id, guild_id=5)
-    assert result == ("queued", "https://discord.com/channels/5/1234")
+    assert result == ("queued", "https://discord.com/channels/5/1234", None)
 
 
 async def test_find_duplicate_no_link_without_guild(session, board):
@@ -232,7 +250,7 @@ async def test_find_duplicate_no_link_without_guild(session, board):
     await session.flush()
 
     result = await _find_duplicate(session, "https://example.com/noguild", new_sub.id, guild_id=0)
-    assert result == ("queued", None)
+    assert result == ("queued", None, None)
 
 
 async def test_find_duplicate_no_link_without_thread(session, board):
@@ -249,4 +267,4 @@ async def test_find_duplicate_no_link_without_thread(session, board):
     await session.flush()
 
     result = await _find_duplicate(session, "https://example.com/nothread", new_sub.id, guild_id=5)
-    assert result == ("queued", None)
+    assert result == ("queued", None, None)
