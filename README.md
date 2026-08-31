@@ -206,6 +206,31 @@ See [Configuration reference](#configuration-reference) below for documentation 
 
 ## Deployment
 
+### Architecture
+
+The production host (a DigitalOcean droplet, reached via the `DigitalOcean-remote` Docker
+context) runs the app as Docker Compose services and terminates TLS with **host-level
+nginx**, not a containerized proxy:
+
+- **Docker Compose** runs the long-running services. `bot` has **no** web port; each web
+  service binds a **loopback host port** (`dashboard` → `127.0.0.1:8080`, `feedgen` →
+  `127.0.0.1:8081`). App changes ship with
+  `op run ... docker --context DigitalOcean-remote compose up -d` (see below).
+- **nginx runs directly on the host** (not in Compose) as the TLS edge. Each public
+  subdomain is a plain vhost file in `/etc/nginx/sites-enabled/` (owned by the `deployer`
+  user, so editable without sudo) that reverse-proxies to the matching service's loopback
+  port. The repo's [`nginx-dashboard.conf`](nginx-dashboard.conf) is the tracked template
+  for that pattern.
+- **TLS certs** are Let's Encrypt via host `certbot`, auto-renewed by the host's
+  `certbot.timer` / `snap.certbot.renew.timer`.
+
+> **Reverse-proxy / TLS changes are host-level and live outside this repo and outside
+> Compose.** Adding or changing a public subdomain means editing the on-host nginx vhost
+> and issuing a cert with certbot - `docker compose` does not touch nginx.
+>
+> (There is no Caddy in production. Any `Caddyfile`/`Dockerfile.caddy` you find in git
+> history was never wired up - nginx has always been the edge.)
+
 ### Build the image
 
 ```bash
@@ -283,7 +308,34 @@ docker compose up dashboard
 # Visit http://localhost:8080
 ```
 
-For production, proxy port 8080 behind nginx or Caddy with TLS.
+In production the dashboard is bound to `127.0.0.1:8080` and served over TLS by host
+nginx (see [Architecture](#architecture)); [`nginx-dashboard.conf`](nginx-dashboard.conf)
+is the vhost template.
+
+---
+
+## Bluesky feeds
+
+The `feedgen` service is a read-only Bluesky **feed generator** (`feed.exegesis.space`,
+a `did:web` service) that surfaces the posts we've already published - no firehose or
+indexer, just a query over `PublishAttempt` rows. Two feeds:
+
+- **Exegesis - Everything** (`exegesis_moodboards`) - every board, including NSFW (posts
+  keep their own content labels, so Bluesky filters them per each viewer's settings).
+- **Exegesis - SFW** (`exegesis_sfw_moodboards`) - safe-for-work boards only.
+
+The service holds no credentials. The `app.bsky.feed.generator` records live in the owner
+account's repo and are published once (idempotently) with
+`python -m bot.admin.publish_feedgen`. Like the dashboard, `feedgen` binds
+`127.0.0.1:8081` behind host nginx ([`nginx-feed.conf`](nginx-feed.conf) is the vhost
+template). It reads `FEEDGEN_SERVICE_HOSTNAME` and `FEEDGEN_OWNER_DID` from the
+environment.
+
+```bash
+# Local
+docker compose up feedgen
+curl "http://localhost:8081/xrpc/app.bsky.feed.describeFeedGenerator"
+```
 
 ---
 

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Deployment docs now describe the real production edge (found while scoping issue #64):
+  TLS is terminated by **host-level nginx + certbot** on the droplet (vhosts in
+  `/etc/nginx/sites-enabled/`, deployer-owned, proxying to each service's loopback host
+  port; Let's Encrypt auto-renewed), and reverse-proxy/cert changes are host-level, not in
+  Compose. README gained a "Deployment > Architecture" section and the dashboard note was
+  corrected. Removed the dead, never-wired-up `Caddyfile` and `Dockerfile.caddy` that had
+  implied Caddy was the proxy.
+- Coverage: added the one-shot `bot.admin.requeue_blocked` to the coverage `omit` list
+  (it was forgotten when added in `f8d3ff4`; its admin-script siblings are all omitted),
+  lifting the repo from a pre-existing 98.53% to 99.33%. Remaining sub-99.5% debt in
+  unrelated tested modules is tracked separately.
 - Curation core split into cohesive submodules (issue #60 follow-up): the single
   `bot/curation/core.py` was broken into `base.py` (submission-lock registry + DB-scope
   context managers + `_now`), `ingest.py` (the download/resolve/persist pipeline),
@@ -28,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Responsiveness under load: the bot no longer stalls (acknowledging interactions but actioning them seconds later) while creating many threads during a butterfly storm. Network and Discord I/O that used to run while holding the global SQLite write lock now runs with the lock released. Specifically: thread creation + anchor posting, link-metadata resolution, thumbnail/attachment/video downloads, and the entire Bluesky publish conversation are all lifted out of the DB lock. `handle_reaction`, `publish_queued_submission`, `reingest_submission`, and the scheduler/threadless-retry paths are now self-managing (they open short DB transactions around lockless I/O). Behaviour is otherwise unchanged; see `docs/db-lock-io-refactor.md`. (Remaining under-lock I/O in the interaction handlers is fast and human-paced; de-locking it was deliberately deferred.)
 
 ### Added
+- Custom Bluesky feeds over what we already publish (issue #64): a new read-only
+  `feedgen` service (`feed.exegesis.space`, a `did:web` feed generator) serves two feeds -
+  **Exegesis - Everything** (`exegesis_moodboards`, every board) and **Exegesis - SFW**
+  (`exegesis_sfw_moodboards`, non-NSFW boards only). No firehose or indexer: it's a thin
+  query over existing `PublishAttempt` rows. Native reposts resolve to the original post
+  via `SubmissionLink.source_at_uri`; results are fairly interleaved across boards so no
+  single busy board floods a stretch. The service holds no credentials - the
+  `app.bsky.feed.generator` records are published once (idempotently) into the owner
+  account's repo with `bot.admin.publish_feedgen`. A companion `bot.admin.backfill_repost_source_uris`
+  one-shot bulk-recovers `source_at_uri` for legacy reposts (pinning ~290 that predate DID
+  pinning) so they enter the feed. Mirrors the read-only `dashboard` module and runs behind
+  host nginx like it.
 - Known-good embed mirrors (issue #61): the dashboard now shows a "Known-good embed mirrors" cheat-sheet (tnktok for TikTok, fxtwitter for X/Twitter, vxreddit for Reddit, kkinstagram for Instagram, fixdeviantart for DeviantArt) so curators do not have to remember which mirror to paste. When an embed fails to resolve, the in-thread "couldn't get metadata" nag now also suggests the platform's good mirror, but only when the submitted link was not already using it.
 - DID pinning for Bluesky sources: the source post's permanent DID is resolved and stored (`source_at_uri` on `submission_links`) at ingest, while the handle is still live, so a later handle rename or deactivation can no longer break the repost
 - `bot.admin.backfill_bsky_did` one-shot to pin DIDs onto submissions ingested before the change

@@ -54,6 +54,22 @@ services:
     volumes:
       - bot-data:/data
 
+  feedgen:
+    build: .
+    container_name: bluesky-feedgen
+    restart: unless-stopped
+    entrypoint: []
+    command: python -m bot.feedgen
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      FEEDGEN_SERVICE_HOSTNAME:
+      FEEDGEN_OWNER_DID:
+      DATA_DIR: /data
+      DATABASE_URL: sqlite+aiosqlite:////data/db/bot.db
+    volumes:
+      - bot-data:/data
+
 volumes:
   # Named volume holds db/, attachments/ and logs/ - survives container rebuilds.
   bot-data:

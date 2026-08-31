@@ -1,3 +1,0 @@
-dashboard.exegesis.space {
-	reverse_proxy dashboard:8080
-}

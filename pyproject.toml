@@ -1,6 +1,6 @@
 [project]
 name = "bluesky-repost-bot"
-version = "1.14.1"  # semantic version
+version = "1.15.0"  # semantic version
 description = "Source-first Discord -> Bluesky moodboard repost bot"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -57,7 +57,11 @@ omit = [
     "*/bot/admin/cancel_lost_submissions.py",# one-shot cleanup
     "*/bot/admin/archive_reopened_threads.py",# one-shot thread re-archive (issue #65)
     "*/bot/admin/repoint_dead_handles.py",   # one-shot handle repoint
+    "*/bot/admin/requeue_blocked.py",        # one-shot blocked-submission requeue
+    "*/bot/admin/publish_feedgen.py",        # one-shot feed-record publisher (needs owner creds)
+    "*/bot/admin/backfill_repost_source_uris.py",  # one-shot repost source_at_uri backfill
     "*/bot/dashboard/__main__.py",           # module-level uvicorn.run()
+    "*/bot/feedgen/__main__.py",             # module-level uvicorn.run()
 ]
 
 [tool.coverage.report]
