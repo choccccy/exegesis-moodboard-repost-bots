@@ -30,6 +30,7 @@ from bot.publish import (
     _resolve_bluesky_post,
     _upload_blob,
     _upload_video_blob,
+    PublishResult,
     publish_submission,
 )
 from bot.state import FailureKind, GraphicStatus
@@ -280,6 +281,18 @@ async def test_publish_submission_publisher_exception_returns_failure():
     assert result.error == "Exception: boom 500"
     assert result.failure_kind is FailureKind.UNKNOWN
     client.like.assert_not_awaited()
+
+
+async def test_publish_submission_unclassified_failure_defaults_to_unknown():
+    """A helper that returns success=False with no failure_kind gets classified
+    UNKNOWN so the caller always has something to route on."""
+    client = _fake_client()
+    unclassified = PublishResult(success=False, error="mystery", failure_kind=None)
+    with _patched_client(client), \
+            patch("bot.publish._publish_external", new=AsyncMock(return_value=unclassified)):
+        result = await publish_submission(_submission(), [_link()], [], _board(), "pw")
+    assert not result.success
+    assert result.failure_kind is FailureKind.UNKNOWN
 
 
 async def test_publish_submission_failed_sub_publish_skips_bookkeeping():

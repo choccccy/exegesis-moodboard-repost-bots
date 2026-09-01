@@ -119,7 +119,9 @@ async def handle_reaction(
 
             if not skip_auth:
                 board_cfg = settings.board_for_channel(message.channel.id)
-                if not handlers._is_curator(member, user_id, board_cfg):
+                # The OP may 🦋 their own post (mirrors handlers._reaction_authorized);
+                # everyone else must be a curator.
+                if user_id != message.author.id and not handlers._is_curator(member, user_id, board_cfg):
                     return False
 
             submission = await session.scalar(
@@ -920,7 +922,7 @@ async def publish_queued_submission(
                              "publish-blocked notice", submission_id)
             # Board-wide config failure: abandon the tick, don't churn the queue.
             return PublishOutcome.UNAVAILABLE
-        if early[0] == "FAILED":
+        if early[0] == "FAILED":  # pragma: no cover - beat 1 never emits FAILED (config errors BLOCK); kept as a defensive twin of the BLOCKED arm
             _, err, mention = early
             await _safe_send(destination, replies.publish_failed_notice(err, mention_user_ids=mention),
                              "publish-failed notice", submission_id)

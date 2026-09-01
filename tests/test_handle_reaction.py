@@ -351,3 +351,50 @@ async def test_duplicate_of_pending_without_thread_omits_url(session, board, bin
     notices = [t for t in _sent_texts(new_thread) if "already being processed" in t]
     assert len(notices) == 1
     assert "discord.com/channels" not in notices[0]
+
+
+async def test_duplicate_notice_send_failure_still_tears_down(session, board, bind_db_scopes):
+    """If posting the duplicate notice raises SurfaceError, the trigger-clear and
+    archive teardown must still run and the new submission is still deleted."""
+    from bot.canonicalize import canonicalize
+
+    canon = canonicalize(DUP_URL)
+    existing = make_submission(board, source_discord_message_id=777, state=SubmissionState.QUEUED.value)
+    existing.thread_id = 888
+    session.add(existing)
+    await session.flush()
+    session.add(SubmissionLink(
+        submission_id=existing.id, order_index=0, raw_url=DUP_URL,
+        canonical_url=canon.canonical_url, domain_family=canon.domain_family,
+    ))
+    await session.flush()
+
+    msg = _message(channel_id=board.discord_channel_id, msg_id=4242)
+    msg.content = DUP_URL
+    new_thread = _thread(thread_id=800)
+    msg.channel.create_thread.return_value = new_thread
+
+    def _send(content=None, **kwargs):
+        text = content or kwargs.get("content") or ""
+        if "already queued" in text:  # the duplicate notice - fail this send
+            raise discord.HTTPException(MagicMock(status=500), "boom")
+        return MagicMock(id=9999, add_reaction=AsyncMock())
+
+    new_thread.send.side_effect = _send
+
+    with patch("bot.curation.ingest.resolve", new_callable=AsyncMock, return_value=ResolvedMetadata(via="none")), \
+         patch("bot.discord_ingest.service.remove_submission_dir"), \
+         patch("bot.discord_ingest.service._clear_trigger_reaction", new_callable=AsyncMock) as mock_clear, \
+         patch("bot.discord_ingest.service._archive_thread", new_callable=AsyncMock) as mock_archive:
+        result = await handle_reaction(
+            settings=_settings(), message=msg, http_client=_http(), skip_auth=True,
+        )
+
+    assert result is False
+    # teardown proceeded despite the notice send raising
+    mock_clear.assert_called_once()
+    mock_archive.assert_called_once()
+    remaining = await session.scalar(
+        select(Submission).where(Submission.source_discord_message_id == msg.id)
+    )
+    assert remaining is None

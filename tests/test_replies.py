@@ -111,6 +111,14 @@ def test_cannot_remove_published_includes_url():
     assert "https://bsky.app/profile/x/post/1" in msg
 
 
+def test_duplicate_posted_with_thread_url_shows_previous_thread():
+    msg = replies.duplicate_posted(
+        "https://bsky.app/profile/x/post/1", "https://discord.com/channels/1/2/3"
+    )
+    assert "https://bsky.app/profile/x/post/1" in msg
+    assert "previous thread: https://discord.com/channels/1/2/3" in msg
+
+
 def test_supplemental_image_request_is_string():
     msg = replies.supplemental_image_request()
     assert isinstance(msg, str)

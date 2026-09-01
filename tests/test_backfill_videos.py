@@ -209,6 +209,26 @@ async def test_amain_no_video_in_source(global_engine, caplog):
     assert await _count_video_attachments(global_engine) == 0
 
 
+async def test_amain_video_already_attached_counts_no_video(global_engine, caplog):
+    """_attach_resolved_video reporting created=False (video already present) is
+    counted as no-video, not attached."""
+    await _seed_candidate(global_engine)
+
+    meta = ResolvedMetadata(video_url="https://video.twimg.com/clip.mp4")
+    p_settings, p_init, p_dispose, p_sleep = _amain_patches()
+    with p_settings, p_init, p_dispose, p_sleep, \
+            patch("bot.admin.backfill_videos.resolve", new=AsyncMock(return_value=meta)), \
+            patch("bot.admin.backfill_videos._download_resolved_video",
+                  new=AsyncMock(return_value="/vol/linkvid_1.mp4")), \
+            patch("bot.admin.backfill_videos._attach_resolved_video",
+                  new=AsyncMock(return_value=False)), \
+            caplog.at_level(logging.INFO):
+        await amain(dry_run=False, limit=1)
+
+    assert "already had a video, skipped" in caplog.text
+    assert "done: 0 attached, 1 had no video, 0 failed" in caplog.text
+
+
 async def test_amain_resolve_failure_counts_failed(global_engine, caplog):
     await _seed_candidate(global_engine)
 

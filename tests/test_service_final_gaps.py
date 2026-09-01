@@ -20,7 +20,7 @@ from sqlalchemy import select
 from bot.asset_store import StorageFullError
 from bot.config import BoardConfig
 from bot.curation import replies
-from bot.discord_ingest.service import _find_publish_time_duplicate, _discord_file_for_attachment, _post_thread_anchor, _resolve_thread, handle_reaction, publish_queued_submission
+from bot.discord_ingest.service import _archive_thread_after_delay, _find_publish_time_duplicate, _discord_file_for_attachment, _post_thread_anchor, _resolve_thread, ensure_thread_persisted, handle_reaction, publish_queued_submission
 from bot.curation.ingest import _AttachmentPlan, _IngestPlan, _LinkPlan, _attach_resolved_video, _download_attachment_file, _download_resolved_video, _gather_ingest, _persist_ingest_outcome, _persist_ingest_skeletons
 from bot.curation.statemachine import _build_post_preview, _determine_kind, _resolve_parent_ref, recompute_and_request
 from bot.curation.handlers import _apply_answer, _is_authorized, handle_cancel_button, handle_cancel_reaction, handle_confirm_button, handle_confirmation_reaction, handle_label_reaction, handle_metadata_confirm_button, handle_metadata_reaction, handle_playlist_opt_out, handle_playlist_skip_button, handle_reaction_removed
@@ -189,6 +189,45 @@ async def test_handle_reaction_rejects_non_curator(session, board, bind_db_scope
     assert result is False
     sub = await session.scalar(select(Submission))
     assert sub is None
+
+
+async def test_ensure_thread_persisted_missing_submission_returns_none(session, board, bind_db_scopes):
+    """The submission vanished between DB scopes → (None, False), no thread work."""
+    msg = _message(channel_id=board.discord_channel_id)
+    thread, is_new = await ensure_thread_persisted(
+        settings=_svc_settings(board), message=msg, submission_id=999_999, post_anchor=False,
+    )
+    assert thread is None
+    assert is_new is False
+    msg.channel.create_thread.assert_not_called()
+
+
+def test_archive_thread_after_delay_schedules_background_task():
+    """The wrapper hands the delayed-archive coroutine to _fire_and_forget."""
+    thread = MagicMock()
+    with patch("bot.discord_ingest.service._archive_thread_after_delay_seconds",
+               new=MagicMock(return_value="CORO")) as mock_coro, \
+         patch("bot.discord_ingest.service._fire_and_forget") as mock_fire:
+        _archive_thread_after_delay(thread, notice="bye")
+    mock_coro.assert_called_once()
+    mock_fire.assert_called_once_with("CORO")
+
+
+async def test_handle_reaction_allows_author_self_react(session, board, bind_db_scopes):
+    """The OP may 🦋 their own post even without curator rights (#66)."""
+    msg = _message(channel_id=board.discord_channel_id)  # author_id=999
+    msg.channel.create_thread.return_value = _thread(thread_id=650)
+    settings = _svc_settings(board)  # empty curator lists
+
+    result = await handle_reaction(
+        settings=settings, message=msg, http_client=AsyncMock(),
+        member=None, user_id=msg.author.id, skip_auth=False,
+    )
+
+    assert result is not False
+    sub = await session.scalar(select(Submission))
+    assert sub is not None
+    assert sub.author_id == msg.author.id
 
 
 async def test_handle_reaction_duplicate_of_published_closes_thread(session, board, bind_db_scopes):

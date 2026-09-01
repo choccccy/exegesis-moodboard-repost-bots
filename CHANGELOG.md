@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Posters may now 🦋-react their own posts to submit them (issue #66). The live trigger
+  previously required curator rights; the message author is now allowed too, mirroring the
+  OP-or-curator rule already used for the secondary reactions (cancel/graphic/metadata).
+  This also brings the live path in line with catch-up/scan, which already honored any 🦋.
+
+### Fixed
+- Coverage: restored the 99.5% gate (issue #67). Closed the remaining sub-99.5% debt by
+  covering 13 previously-untested line paths across `discord_ingest/service.py`,
+  `publish/__init__.py`, `curation/replies.py`, and `admin/backfill_videos.py` with focused
+  unit tests, and marked one genuinely-unreachable defensive branch with a documented
+  `# pragma: no cover`. Total coverage is now 99.63%.
+
 ### Changed
 - Deployment docs now describe the real production edge (found while scoping issue #64):
   TLS is terminated by **host-level nginx + certbot** on the droplet (vhosts in

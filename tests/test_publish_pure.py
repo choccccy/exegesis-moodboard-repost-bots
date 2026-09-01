@@ -199,6 +199,27 @@ def test_classify_unknown_exception_falls_back():
     assert detail == "Exception: boom 500"
 
 
+def test_classify_network_error_without_timeout_is_upstream():
+    """A NetworkError whose type name lacks 'Timeout' → generic network detail."""
+    from atproto_client.exceptions import NetworkError
+    from bot.publish import _classify_failure
+    from bot.state import FailureKind
+    kind, detail = _classify_failure(NetworkError())
+    assert kind is FailureKind.UPSTREAM
+    assert detail == "network error contacting Bluesky"
+
+
+# ---------------------------------------------------------------------------
+# _worst_kind
+# ---------------------------------------------------------------------------
+
+def test_worst_kind_prefers_upstream():
+    """An outage should retry, so UPSTREAM wins over other classifications."""
+    from bot.publish import _worst_kind
+    from bot.state import FailureKind
+    assert _worst_kind([FailureKind.LOCAL, FailureKind.UPSTREAM]) is FailureKind.UPSTREAM
+
+
 # ---------------------------------------------------------------------------
 # _append_tags - budget exhaustion mid-list
 # ---------------------------------------------------------------------------
