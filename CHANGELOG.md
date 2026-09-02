@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Dashboard: the "Known-good embed mirrors" cheat-sheet moved up to sit directly below
+  "Recent publishes" (was at the very bottom under "Recent errors"), making it easier to
+  reach when you're eyeballing recent posts for bad embeds (issue #61).
+
 ### Added
+- Pixiv (`phixiv.net`) and FurAffinity (`fxfuraffinity.net`) join the known-good mirror
+  set (issue #61). `canonicalize` now recognizes their mirror hosts and rewrites them
+  back to the canonical URL, the resolver fetches the mirror's OpenGraph card for a
+  usable preview (FurAffinity's own page is login/age-gated), and both appear on the
+  dashboard cheat-sheet and in the in-thread nag.
 - Posters may now 🦋-react their own posts to submit them (issue #66). The live trigger
   previously required curator rights; the message author is now allowed too, mirroring the
   OP-or-curator rule already used for the secondary reactions (cancel/graphic/metadata).

@@ -23,14 +23,24 @@ class Mirror:
     example: str  # a sample rewritten URL
 
 
-# Ordered for display. Values align with resolve/fetch.py's _MIRROR_URL_FUNCS.
-# Bluesky is intentionally absent - it's a native repost, no mirror needed.
+# Ordered for display. This is the human-paste-facing subset, NOT a mirror of
+# resolve/fetch.py's _MIRROR_URL_FUNCS (they answer a different question - which
+# families get an internal URL-rewrite retry). An entry belongs here when BOTH:
+#   1. the platform embeds poorly on Bluesky/Discord without a community mirror, and
+#   2. canonicalize()'s _DOMAIN_FAMILIES recognizes `host` and rewrites it back to
+#      the canonical URL - otherwise the "bot canonicalizes them back" promise lies.
+# YouTube/Wikipedia/Tumblr/etc. embed fine natively, so they stay off the list even
+# though the bot knows those families. Bluesky is intentionally absent too - it's a
+# native repost, no mirror needed. To add a family here, first teach canonicalize's
+# _DOMAIN_FAMILIES its mirror host(s) (condition 2) or the promise below breaks.
 KNOWN_GOOD_MIRRORS: tuple[Mirror, ...] = (
     Mirror("tiktok", "TikTok", "tnktok.com", "https://tnktok.com/@user/video/123456789"),
     Mirror("twitter", "X / Twitter", "fxtwitter.com", "https://fxtwitter.com/user/status/123456789"),
     Mirror("reddit", "Reddit", "vxreddit.com", "https://vxreddit.com/r/sub/comments/abc123/title"),
     Mirror("instagram", "Instagram", "kkinstagram.com", "https://kkinstagram.com/p/CshORoLs/"),
     Mirror("deviantart", "DeviantArt", "fixdeviantart.com", "https://fixdeviantart.com/user/art/title-123456789"),
+    Mirror("pixiv", "Pixiv", "phixiv.net", "https://phixiv.net/en/artworks/123456789"),
+    Mirror("furaffinity", "FurAffinity", "fxfuraffinity.net", "https://fxfuraffinity.net/view/123456789"),
 )
 
 _BY_FAMILY: dict[str, Mirror] = {m.family: m for m in KNOWN_GOOD_MIRRORS}

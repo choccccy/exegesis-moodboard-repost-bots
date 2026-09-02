@@ -193,6 +193,27 @@ def test_pixiv_known_domain():
     assert fam("https://pixiv.net/artworks/12345678") == "pixiv"
 
 
+def test_phixiv_canonicalizes_to_pixiv():
+    assert c("https://phixiv.net/en/artworks/12345678") == (
+        "https://www.pixiv.net/en/artworks/12345678"
+    )
+    assert fam("https://phixiv.net/en/artworks/12345678") == "pixiv"
+
+
+def test_fxfuraffinity_canonicalizes_to_furaffinity():
+    assert c("https://fxfuraffinity.net/view/12345678?full") == (
+        "https://www.furaffinity.net/view/12345678"
+    )
+    assert fam("https://fxfuraffinity.net/view/12345678") == "furaffinity"
+
+
+def test_furaffinity_known_domain():
+    assert c("https://www.furaffinity.net/view/12345678/") == (
+        "https://www.furaffinity.net/view/12345678"
+    )
+    assert fam("https://furaffinity.net/view/12345678") == "furaffinity"
+
+
 def test_flickr_known_domain():
     assert fam("https://flickr.com/photos/user/12345/") == "flickr"
     assert fam("https://flic.kr/p/ABCDEF") == "flickr"

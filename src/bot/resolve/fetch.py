@@ -560,6 +560,16 @@ def _deviantart_mirror_url(url: str) -> str:
     return url.replace("https://www.deviantart.com", "https://fixdeviantart.com", 1)
 
 
+def _pixiv_mirror_url(url: str) -> str:
+    return url.replace("https://www.pixiv.net", "https://phixiv.net", 1)
+
+
+def _furaffinity_mirror_url(url: str) -> str:
+    # FurAffinity gates artwork behind a login/age wall, so its canonical OG page is
+    # useless to a bot; fxfuraffinity serves a proper OpenGraph card for anyone.
+    return url.replace("https://www.furaffinity.net", "https://fxfuraffinity.net", 1)
+
+
 def _youtube_watch_url(url: str) -> str:
     """Convert youtu.be/ID short URLs to youtube.com/watch?v=ID.
 
@@ -593,6 +603,8 @@ _MIRROR_URL_FUNCS = {
     "instagram": _instagram_mirror_url,
     "deviantart": _deviantart_mirror_url,
     "youtube": _youtube_watch_url,
+    "pixiv": _pixiv_mirror_url,
+    "furaffinity": _furaffinity_mirror_url,
 }
 
 

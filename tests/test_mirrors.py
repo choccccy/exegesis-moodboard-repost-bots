@@ -16,6 +16,13 @@ def test_hint_quiet_when_already_using_mirror():
     assert mirror_hint_for_url("https://fxtwitter.com/user/status/123") is None
 
 
+def test_hint_suggests_mirror_for_pixiv_and_furaffinity():
+    pixiv = mirror_hint_for_url("https://www.pixiv.net/en/artworks/12345678")
+    assert pixiv is not None and "phixiv.net" in pixiv
+    fa = mirror_hint_for_url("https://www.furaffinity.net/view/12345678")
+    assert fa is not None and "fxfuraffinity.net" in fa
+
+
 def test_hint_none_for_unknown_platform():
     assert mirror_hint_for_url("https://example.com/whatever") is None
 

@@ -68,12 +68,12 @@ _DOMAIN_FAMILIES: dict[str, list[str]] = {
     "wikipedia": ["wikipedia.org"],  # mobile (en.m.wikipedia.org) matched via suffix
     "instagram": ["instagram.com", "ddinstagram.com", "instagramez.com", "kkinstagram.com"],
     "youtube": ["youtube.com", "youtu.be", "youtube-nocookie.com"],
-    "pixiv":   ["pixiv.net"],
+    "pixiv":   ["pixiv.net", "phixiv.net", "ppxiv.net"],
     "flickr":  ["flickr.com", "flic.kr"],
     "tumblr":  ["tumblr.com"],
     "tiktok":      ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com",
                     "kktiktok.com", "tnktok.com", "vxtiktok.com"],
-    "furaffinity": ["furaffinity.net"],
+    "furaffinity": ["furaffinity.net", "fxfuraffinity.net", "xfuraffinity.net"],
     "substack": ["substack.com"],
 }
 
